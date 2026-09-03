@@ -1,0 +1,48 @@
+# Default configuration for the trading agent (V0.1).
+# Every value here is declared explicitly so runs are reproducible and auditable.
+# Secrets are NEVER stored here - see .env.example.
+
+mode: backtest  # only "backtest" or "testnet" are valid. There is no "live" mode.
+
+market:
+  symbol: BTCUSDT
+  interval: 4h          # completed candles only
+  timezone_display: Australia/Sydney   # internal storage/logic is always UTC
+
+strategy:
+  name: ema_crossover_trend
+  ema_fast: 20
+  ema_slow: 50
+  # Do not tune these against historical results to chase performance -
+  # see RISK_POLICY.md / STRATEGY.md for the rationale.
+
+sizing:
+  max_allocation_pct: 0.90     # max fraction of quote balance committed to the single position
+  min_quote_buffer: 5.0        # quote-asset amount always left uncommitted
+
+fees:
+  taker_fee_pct: 0.001
+  maker_fee_pct: 0.001
+  slippage_pct: 0.0005
+
+risk:
+  max_position_pct: 0.90           # max fraction of equity in one position
+  max_risk_per_trade_pct: 0.02     # fraction of equity treated as "at risk" per trade
+  max_daily_loss_pct: 0.05         # trading halts for the day if exceeded
+  max_drawdown_pct: 0.15           # trading halts entirely if exceeded (needs manual reset)
+  max_trades_per_day: 4
+  cooldown_bars_after_loss: 2      # completed candles to wait after a losing trade
+  stale_data_max_age_seconds: 21600  # 2 candle-widths at 4h; older data blocks trading
+  min_quote_balance: 5.0           # never trade below this quote balance
+  max_consecutive_api_errors: 3    # shutdown after this many consecutive API errors
+
+backtest:
+  train_fraction: 0.6
+  validation_fraction: 0.2
+  test_fraction: 0.2
+  min_trades_for_significance: 20
+
+paths:
+  data_dir: data
+  logs_dir: logs
+  db_path: data/trading_agent.db
