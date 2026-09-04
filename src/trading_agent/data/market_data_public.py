@@ -53,7 +53,7 @@ class BinancePublicMarketDataClient:
         end_time_ms: int | None = None,
         limit: int = 1000,
     ) -> list[Candle]:
-        params: dict[str, object] = {"symbol": symbol, "interval": interval, "limit": limit}
+        params: dict[str, str | int] = {"symbol": symbol, "interval": interval, "limit": limit}
         if start_time_ms is not None:
             params["startTime"] = start_time_ms
         if end_time_ms is not None:

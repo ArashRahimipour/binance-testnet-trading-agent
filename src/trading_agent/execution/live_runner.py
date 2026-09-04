@@ -23,6 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Literal
 
 import requests
 
@@ -149,6 +150,7 @@ def run_testnet_cycle(
         risk_state_store.save(symbol, risk_state)
         return CycleResult("HOLD", signal.reason_code, {})
 
+    side: Literal["BUY", "SELL"]
     if signal.type == SignalType.BUY:
         sizing = compute_buy_quantity(
             portfolio.quote_balance,

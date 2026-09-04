@@ -1,0 +1,92 @@
+# Baseline Strategy
+
+**This is an intentionally simple, explainable research baseline, not a
+final strategy and not a claim of profitability.** It exists to exercise
+the full pipeline (data -> signal -> sizing -> risk -> execution) with
+something a human can verify by eye, not to be the best possible trading
+idea.
+
+## Rules
+
+Implemented in `src/trading_agent/strategy/trend_baseline.py` as
+`EmaCrossoverTrendStrategy`. Evaluated only on **completed** 4-hour
+candles (never a still-forming candle):
+
+- **BUY** when the fast EMA crosses from at-or-below the slow EMA to
+  strictly above it, and the agent is not already long.
+- **EXIT** when the fast EMA crosses from at-or-above the slow EMA to
+  strictly below it, and the agent currently holds a position.
+- **HOLD** otherwise - including when a crossover condition is met but
+  acting on it would mean buying while already long, or selling while
+  already flat (there is nothing to sell).
+
+Default parameters (`config/default.yaml`, under `strategy:`):
+
+```yaml
+strategy:
+  name: ema_crossover_trend
+  ema_fast: 20
+  ema_slow: 50
+```
+
+Both periods are declared in configuration, not hard-coded, and
+`ema_fast` must be strictly less than `ema_slow` (enforced by
+`config/models.py`).
+
+## Every signal carries a reason and its inputs
+
+`Signal` (`src/trading_agent/strategy/base.py`) always includes a
+`reason_code` (e.g. `BULLISH_EMA_CROSSOVER`, `HOLD_ALREADY_LONG`,
+`HOLD_NO_CROSSOVER`) and the exact numeric inputs behind the decision
+(both EMA values, previous and current, the close price, the position
+state). Nothing about a signal is opaque.
+
+## How look-ahead bias is prevented
+
+Two separate mechanisms, at two different layers:
+
+1. **Data layer**: `data/ingestion.py` filters out any candle whose close
+   time is not strictly before the exchange's own server time. The
+   strategy never receives a still-forming candle in the first place.
+2. **Indicator layer**: EMA is computed with `adjust=False`
+   (`indicators/moving_averages.py`), making it a strictly causal
+   recursive filter - `EMA[k]` is a function only of `price[0..k]`,
+   never of anything later. `tests/unit/test_indicators.py::test_ema_is_causal`
+   and `tests/unit/test_strategy_trend_baseline.py::test_no_lookahead_*`
+   verify this directly: computing a signal on a truncated series and on
+   the full series truncated to the same point produces identical results.
+
+The backtest engine (`backtest/engine.py`) reinforces this structurally:
+at step `i` it only ever passes `candles[:i+1]` to the strategy.
+
+## Fees and slippage in simulation
+
+`BacktestBroker` (`execution/backtest_broker.py`) applies a configurable
+taker fee and slippage to every simulated fill, and slippage always works
+**against** the trader (buys fill higher, sells fill lower than the
+candle close) - the backtest is never allowed to look better than a
+conservative real execution would.
+
+## Guards against double-buying and overselling
+
+- The strategy itself returns HOLD (not BUY) when a bullish crossover
+  occurs while already long, and HOLD (not EXIT) when a bearish crossover
+  occurs while already flat.
+- The position sizer never sizes a sell above the quantity actually held
+  (`sizing/position_sizer.py::compute_sell_quantity` rounds down and
+  rejects any request to sell more than is available).
+- `portfolio/state.py::apply_buy`/`apply_sell` raise
+  `InvalidTransitionError` if a buy is attempted while already long, or a
+  sell for more than the held balance is attempted - a second, structural
+  line of defense independent of the strategy's own logic.
+
+## What this strategy is not
+
+- It is not optimized, curve-fit, or selected because it produced the
+  best historical return - see `backtest/engine.py`'s docstring and
+  RISK_POLICY.md.
+- It has no stop-loss; its only exit is the trend-reversal signal. See
+  RISK_POLICY.md's discussion of `max_risk_per_trade_pct` for the
+  consequence of that.
+- It is long-or-cash only, matching the project's V0.1 constraints - no
+  shorting, no leverage, no margin.
