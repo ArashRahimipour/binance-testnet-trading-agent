@@ -85,7 +85,8 @@ def test_backtest_command_end_to_end(tmp_path):
     )
     result = CliRunner().invoke(cli, ["--config", config_path, "backtest"])
     assert result.exit_code == 0, result.output
-    assert "--- overall ---" in result.output
+    assert "--- overall (continuous run) ---" in result.output
+    assert "INDEPENDENT FIXED-PARAMETER HOLDOUT EVALUATION" in result.output
     assert "not a claim of live profitability" in result.output
 
 

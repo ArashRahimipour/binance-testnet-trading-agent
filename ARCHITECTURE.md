@@ -45,7 +45,7 @@ fact.
 | `persistence/` | The unified `ExecutionStateStore` (portfolio state + pending orders, one atomic transaction boundary - see below) and the live risk-tracking state store |
 | `journal/` | Append-only audit trail of every decision |
 | `metrics/` | Backtest performance report computation |
-| `backtest/` | The chronological-holdout backtest engine tying the above together |
+| `backtest/` | The backtest engine tying the above together: a continuous operational simulation AND an independent fixed-parameter holdout evaluation - see below |
 | `cli/` | The `trading-agent` command-line entry point |
 | `logging_setup.py` | Structured JSON logging with mandatory secret redaction |
 
@@ -137,14 +137,21 @@ deliberately separate path exists for research data only:
    ("segment" by default for this research-only command, "reject" to
    restore the original strict behavior) and, in "segment" mode, runs
    each contiguous segment as its own fully independent backtest - fresh
-   portfolio, fresh indicator warm-up, fresh day/cooldown state. A signal
-   still queued at a non-final segment's end is cancelled, not carried
-   into the next segment; a position still open at a gap-adjacent segment
-   boundary is marked an unresolved research condition (no exit price is
-   ever invented for it) and is, by default, excluded from the aggregate
-   trade statistics. The overall concatenated equity curve is explicitly
-   NOT claimed to be one continuous tradable history whenever any gap was
-   found - see the engine's module docstring and `BacktestResult.warnings`.
+   portfolio (from `config.backtest.starting_equity`), fresh indicator
+   warm-up, fresh day/cooldown state. A signal still queued at a
+   non-final segment's end is cancelled, not carried into the next
+   segment; a position still open at a gap-adjacent segment boundary is
+   marked an unresolved research condition (no exit price is ever
+   invented for it) and is, by default, excluded from the aggregate
+   trade statistics. When more than one segment actually ran, the equity
+   curves are NEVER naively concatenated into one "overall"
+   return/drawdown/Sharpe/Sortino - each segment gets its own complete,
+   independent `PerformanceReport` (`segments[i].performance`), plus an
+   explicitly-labeled `AggregateTradeStats` containing only the
+   trade-level figures that remain mathematically valid to sum across
+   independently-restarted segments (total trades, total realized PnL,
+   overall win rate - never a percentage return or drawdown); see the
+   engine's module docstring and `BacktestResult.warnings`.
 
 At no point does anything in this path fabricate, interpolate, or guess
 an OHLCV value - a confirmed gap is recorded and preserved, never filled.
@@ -181,7 +188,31 @@ an OHLCV value - a confirmed gap is recorded and preserved, never filled.
 The backtest engine (`backtest/engine.py`) walks a similar pipeline
 candle-by-candle over historical data, swapping the broker for
 `BacktestBroker` and adding the queued-signal/next-open execution and
-stop-loss mechanics described in its module docstring.
+stop-loss mechanics described in its module docstring. It exposes two
+independent entry points built on the SAME per-candle loop
+(`_run_segment`):
+
+- `run_backtest` - the continuous operational simulation: risk state
+  (peak equity, drawdown, cooldowns, daily counters) runs uninterrupted
+  for as long as a contiguous segment's data allows. `RunDiagnostics`
+  (returned per segment, and at the top level when exactly one segment
+  ran) makes every rejected entry's exact reason code, every risk
+  shutdown's first-activation equity/drawdown/timestamp and whether it
+  stayed latched, and the first/last executed trade timestamps directly
+  inspectable - this is what lets a claim like "the drawdown shutdown
+  explains zero validation-window trades" be demonstrated with evidence
+  rather than inferred from the numbers alone.
+- `run_independent_holdout_evaluation` - runs train/validation/test as
+  three SEPARATE calls to `_run_segment`, each given a fresh
+  `starting_equity` and a warm-up-prefixed slice of its own segment (never
+  reaching into a different segment across a gap, never seeing a candle
+  past its own window's end). Because each window is its own independent
+  `_run_segment` call, no risk state of any kind - and no open position or
+  pending signal - ever carries from one window into the next. This is
+  explicitly labeled "INDEPENDENT FIXED-PARAMETER HOLDOUT EVALUATION - NOT
+  walk-forward optimization" everywhere it is printed, since the strategy
+  parameters are identical and fixed across all three windows; only the
+  starting balance and risk state are reset.
 
 ## Crash recovery, the pending-order state machine, and the atomic transaction boundary
 

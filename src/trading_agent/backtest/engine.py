@@ -24,25 +24,13 @@ still exceed it - a disclosed limitation of a fixed-percentage stop, not
 something position sizing alone can prevent. This is backtest-only in this
 revision; automatic entry is disabled on Testnet pending a verified
 exchange-resident protective order (see execution/live_runner.py and
-RISK_POLICY.md).
+RISK_POLICY.md). Each completed `Trade.exit_reason` records whether it
+closed via this stop ("STOP_LOSS") or via the strategy's own EXIT signal
+("STRATEGY_EXIT") - see metrics/performance.py.
 
 Every proposed trade goes through the same RiskEngine and OrderValidator
 that a testnet run would use; only the broker is swapped for
-`BacktestBroker`'s simulated fills. Chronological train/validation/test
-splits are CHRONOLOGICAL HOLDOUT REPORTING ONLY, not model selection - the
-strategy's parameters are fixed by config and never fit to any split
-(review Finding 10: this is not genuine rolling walk-forward re-fitting).
-
-UTC-day boundary ordering (review round 2, Finding 5): a signal queued on
-one candle can fill on the next, which may be the first candle of a new
-UTC day. Each iteration therefore detects/initializes a new day (using
-that candle's OPEN price for the day's starting equity, since a queued
-fill or stop-loss executes against that open, not some later, already-
-moved price) and decrements cooldown BEFORE resolving any pending signal
-or checking the stop-loss - so a trade that executes on the first candle
-of a new day has its count and realized PnL attributed to that new day,
-never discarded into the day that merely queued it or a fresh cooldown
-immediately eaten into by that same candle's decrement.
+`BacktestBroker`'s simulated fills.
 
 Historical-gap segmentation (`config.backtest.gap_policy`): a downloaded
 historical series can contain a CONFIRMED gap (see data/gap_detection.py,
@@ -55,27 +43,69 @@ record, never fabricated or interpolated over. Two policies:
     config at all.
   - "segment" (the default for this research-only command): the series is
     split into independent contiguous segments at each gap. Each segment
-    runs as its own fresh backtest - fresh portfolio, fresh indicator
-    warm-up, fresh day/cooldown state - so nothing (an indicator's
-    internal state, a queued but unfilled signal, an open position) is
-    ever carried across a gap. A signal still pending at the end of a
-    non-final segment is cancelled, not carried forward. A position still
-    open at the end of a non-final segment is a genuinely unresolved
-    research condition - this segment's own data cannot tell us how or
-    when it would have closed, so no exit price is ever invented for it,
-    and by default (`exclude_open_position_segments`) that segment's
-    already-completed trades are excluded from the aggregate/overall
-    statistics, since its unresolved tail makes it not directly comparable
-    to a fully-resolved segment. (A position still open at the very END of
-    the last segment is NOT a gap-related condition - that is simply "the
-    series ran out of data while holding a position," the same situation
-    this engine has always allowed and still does not invent an exit for.)
-    Because each segment starts fresh from the same baseline equity, the
-    concatenated overall trades/equity curve is NOT one continuous
-    tradable equity history - `BacktestResult.warnings` says so explicitly
-    whenever any gap was found, and `BacktestResult.segments` gives the
-    per-segment breakdown for a reader who wants to judge each
-    independently rather than trust the naive concatenation.
+    runs as its own fresh backtest - fresh portfolio (from
+    `config.backtest.starting_equity`), fresh indicator warm-up, fresh
+    day/cooldown state - so nothing is ever carried across a gap. A signal
+    still pending at the end of a non-final segment is cancelled, not
+    carried forward. A position still open at the end of a non-final
+    segment is a genuinely unresolved research condition - no exit price
+    is ever invented for it, and by default
+    (`exclude_open_position_segments`) that segment's already-completed
+    trades are excluded from any aggregate.
+
+Two independent evaluation modes (see the corrected-reporting round):
+
+  1. `run_backtest` - the CONTINUOUS OPERATIONAL SIMULATION: what would
+     actually have happened if the system began trading at the first
+     candle and retained its risk state (peak equity, drawdown, cooldowns,
+     daily counters) continuously for as long as data allows within each
+     contiguous segment. When exactly one segment is actually backtested
+     (the overwhelmingly common case - no confirmed gap), `result.reports`
+     still exposes the familiar `"train"/"validation"/"test"/"overall"`
+     keys, informational chronological slices of that ONE continuous run
+     (fixed strategy parameters throughout - never refit per slice). This
+     is why a risk shutdown (e.g. `MAX_DRAWDOWN_SHUTDOWN`) latched during
+     the portion of the run labeled "train" mechanically persists,
+     unchanged, through everything subsequently labeled "validation" and
+     "test": these are timeline labels on one uninterrupted simulation,
+     not independent evaluations. `result.diagnostics` makes this
+     mechanism directly inspectable (signal/rejection counts by exact
+     reason code, first shutdown activation with the equity/drawdown that
+     triggered it, whether it stayed latched, first/last executed trade
+     timestamps, ending cash/asset/equity - see `RunDiagnostics`) so this
+     is never left to be inferred from the numbers alone. When MORE than
+     one segment is actually backtested (a confirmed gap was found),
+     `result.reports` is empty and `result.segments[i].performance` holds
+     a full, independent `PerformanceReport` per segment instead - see the
+     module-level note below on why a single naively-concatenated
+     "overall" is never produced in that case.
+
+  2. `run_independent_holdout_evaluation` - INDEPENDENT FIXED-PARAMETER
+     HOLDOUT EVALUATION, NOT walk-forward optimization: train/validation/
+     test windows that use the SAME fixed strategy parameters but each
+     start with a completely FRESH configured starting balance and fresh
+     risk state (peak equity, drawdown, cooldowns, day counters all reset
+     to their initial values). A window may look back at PRECEDING candles
+     from the same gap-free segment for indicator warm-up only - those
+     warm-up candles never generate a trade or contribute to the window's
+     performance, never reach into a different segment across a confirmed
+     gap, and no candle beyond the window's own end is ever visible to it.
+     A position or pending signal open at a window's end is reported as
+     such but is NEVER carried into the next window. This directly answers
+     "what would validation/test have looked like on their own merits,
+     without inheriting train's risk state" - see `HoldoutEvaluationResult`.
+
+Gap-segment aggregate reporting: the equity curve of one segment is NOT
+commensurable with another's (each restarts from the same baseline
+`starting_equity` rather than continuing the previous segment's ending
+balance) - concatenating them and computing an ordinary percentage
+return/drawdown/Sharpe/Sortino over the naive concatenation would silently
+describe an account that never existed. This module therefore never does
+that: with more than one segment, only a full per-segment
+`PerformanceReport` (independent, correct) and an explicitly-labeled
+`AggregateTradeStats` (only mathematically valid trade-level sums/ratios -
+total realized PnL in quote currency, overall win rate - never a
+percentage return or drawdown) are produced.
 """
 
 from __future__ import annotations
@@ -91,9 +121,12 @@ from trading_agent.execution.backtest_broker import BacktestBroker, SimulatedFil
 from trading_agent.execution.order_validator import validate_order
 from trading_agent.journal.journal import Journal
 from trading_agent.metrics.performance import (
+    EXIT_REASON_STOP_LOSS,
+    EXIT_REASON_STRATEGY,
     EquityPoint,
     PerformanceReport,
     Trade,
+    compute_buy_and_hold_report,
     compute_performance_report,
 )
 from trading_agent.portfolio.state import PortfolioState, apply_buy, apply_sell
@@ -111,6 +144,66 @@ _MS_PER_DAY = 24 * 60 * 60 * 1000
 
 SPLIT_NAMES = ("train", "validation", "test")
 
+#: Label attached to every result of `run_independent_holdout_evaluation` -
+#: printed verbatim by the CLI so this is never confused with genuine
+#: rolling walk-forward re-optimization (strategy parameters are always
+#: fixed here, never fit to any window).
+HOLDOUT_EVALUATION_LABEL = (
+    "INDEPENDENT FIXED-PARAMETER HOLDOUT EVALUATION - NOT walk-forward optimization. "
+    "Train/validation/test windows share identical, fixed strategy parameters. Each window "
+    "starts from a fresh configured starting balance and fresh risk state (peak equity, "
+    "drawdown, cooldowns, and daily counters all reset); no position or pending signal ever "
+    "carries from one window into the next; validation/test may look back only at preceding "
+    "candles from the same gap-free segment for indicator warm-up, and those warm-up candles "
+    "never generate a trade or contribute to the reported performance."
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ShutdownActivation:
+    """Evidence for one risk-gate rejection reason code within a single
+    continuous run (a segment or a holdout window) - see the module
+    docstring's discussion of why a drawdown shutdown, once triggered while
+    flat, can never self-recover within that same run."""
+
+    reason_code: str
+    first_activated_time_ms: int
+    equity_at_activation: Decimal
+    drawdown_pct_at_activation: float
+    last_active_time_ms: int
+    blocked_buy_count: int
+    #: True when no BUY was approved again after this code first activated
+    #: - i.e. this run never recovered from it before it ended.
+    remained_latched_to_end: bool
+    duration_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class RunDiagnostics:
+    """Concrete, inspectable evidence for one continuous run (a segment in
+    `run_backtest`, or one window in `run_independent_holdout_evaluation`) -
+    exists so a claim like "the drawdown shutdown caused zero trades" is
+    always backed by exact counts and timestamps, never left as inference.
+    """
+
+    buy_signals_generated: int
+    exit_signals_generated: int
+    unexecuted_signals: int
+    executed_entries: int
+    executed_strategy_exits: int
+    executed_stop_loss_exits: int
+    rejected_entries_by_reason: dict[str, int]
+    first_executed_trade_time_ms: int | None
+    last_executed_trade_time_ms: int | None
+    max_drawdown_pct: float
+    max_drawdown_time_ms: int | None
+    shutdown_activations: dict[str, ShutdownActivation]
+    starting_equity: Decimal
+    ending_equity: Decimal
+    ending_cash_quote: Decimal
+    ending_base_quantity: Decimal
+    ends_with_open_position: bool
+
 
 @dataclass(frozen=True, slots=True)
 class SegmentReport:
@@ -123,17 +216,80 @@ class SegmentReport:
     excluded_from_overall: bool
     cancelled_pending_signal: str | None
     skipped_insufficient_candles: bool
+    #: Full, independent performance report for this segment alone (its
+    #: own continuous run, starting fresh from `config.backtest.
+    #: starting_equity`). None only when the segment was skipped entirely
+    #: for having too few candles for indicator warm-up.
+    performance: PerformanceReport | None = None
+    diagnostics: RunDiagnostics | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AggregateTradeStats:
+    """An EXPLICITLY-LABELED aggregate across multiple independent
+    segments - contains ONLY figures that remain mathematically valid when
+    summed/ratioed across independently-restarted equity curves (money
+    amounts, trade counts, a win-rate ratio). It deliberately has no
+    return/drawdown/Sharpe/Sortino field: those require one single valid
+    continuous equity curve, which a naive concatenation across a gap is
+    not - see the module docstring.
+    """
+
+    segments_included: int
+    total_trades: int
+    total_realized_pnl_quote: Decimal
+    win_rate: float | None
+    total_strategy_exits: int
+    total_stop_loss_exits: int
+    note: str = (
+        "Trade-level aggregate ONLY across independently-restarted segments (each began from "
+        "the same baseline starting_equity, not from the previous segment's ending balance). "
+        "Money amounts and counts sum validly; there is deliberately no aggregate percentage "
+        "return, drawdown, Sharpe, or Sortino here - those require one single continuous equity "
+        "curve, which this is not. Read each segment's own PerformanceReport for those."
+    )
 
 
 @dataclass(frozen=True, slots=True)
 class BacktestResult:
     trades: list[Trade]
     equity_curve: list[EquityPoint]
+    #: Populated with the familiar "train"/"validation"/"test"/"overall"
+    #: keys ONLY when exactly one segment was actually backtested (the
+    #: no-confirmed-gap case). Empty when more than one segment ran - see
+    #: `segments[i].performance` and `aggregate_trade_stats` instead.
     reports: dict[str, PerformanceReport]
     warnings: list[str]
     unexecuted_final_signal: str | None  # reason a queued signal on the last candle went unfilled
     gaps: list[GapRecord] = field(default_factory=list)
     segments: list[SegmentReport] = field(default_factory=list)
+    aggregate_trade_stats: AggregateTradeStats | None = None
+    #: Diagnostics for the single segment backtested, when `reports` is
+    #: populated (see above). None when multiple segments ran - use each
+    #: segment's own `diagnostics` in that case.
+    diagnostics: RunDiagnostics | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class HoldoutWindowReport:
+    segment_index: int
+    label: str  # "train" | "validation" | "test"
+    warm_up_start_time_ms: int
+    warm_up_candle_count: int
+    window_start_time_ms: int
+    window_end_time_ms: int
+    candle_count: int
+    performance: PerformanceReport
+    diagnostics: RunDiagnostics
+    ends_with_open_position: bool
+    unresolved_pending_signal: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class HoldoutEvaluationResult:
+    label: str
+    windows: list[HoldoutWindowReport]
+    warnings: list[str]
 
 
 @dataclass
@@ -155,12 +311,36 @@ class _LoopState:
     cooldown_bars_remaining: int
 
 
+@dataclass
+class _DiagBuilder:
+    """Mutable diagnostics accumulator for one `_run_segment` call - frozen
+    into a `RunDiagnostics` once the run completes."""
+
+    buy_signals_generated: int = 0
+    exit_signals_generated: int = 0
+    executed_entries: int = 0
+    rejected_entries_by_reason: dict[str, int] = field(default_factory=dict)
+    shutdown_first_activation: dict[str, tuple[int, Decimal, float]] = field(default_factory=dict)
+    shutdown_last_active: dict[str, int] = field(default_factory=dict)
+    last_approved_buy_time_ms: int | None = None
+
+    def record_rejected_entry(self, reason_code: str) -> None:
+        self.rejected_entries_by_reason[reason_code] = self.rejected_entries_by_reason.get(reason_code, 0) + 1
+
+    def record_risk_gate_rejection(self, reason_code: str, time_ms: int, equity: Decimal, drawdown_pct: float) -> None:
+        self.record_rejected_entry(reason_code)
+        if reason_code not in self.shutdown_first_activation:
+            self.shutdown_first_activation[reason_code] = (time_ms, equity, drawdown_pct)
+        self.shutdown_last_active[reason_code] = time_ms
+
+
 @dataclass(frozen=True, slots=True)
 class _SegmentRunResult:
     trades: list[Trade]
     equity_curve: list[EquityPoint]
     ends_with_open_position: bool
     pending_signal_note: str | None
+    diagnostics: RunDiagnostics
 
 
 def run_backtest(
@@ -185,6 +365,7 @@ def run_backtest(
     risk_engine = RiskEngine(config.risk)
     broker = BacktestBroker(config.fees)
     min_required = config.strategy.ema_slow + 1
+    starting_equity = Decimal(str(config.backtest.starting_equity))
 
     if not any(len(seg) >= min_required for seg in raw_segments):
         sizes = [len(seg) for seg in raw_segments]
@@ -193,17 +374,10 @@ def run_backtest(
             f"got segment sizes {sizes}"
         )
 
-    n_total = len(candles)
-    train_end_idx = int(n_total * config.backtest.train_fraction)
-    validation_end_idx = train_end_idx + int(n_total * config.backtest.validation_fraction)
-    original_index_by_close_time = {c.close_time_ms: i for i, c in enumerate(candles)}
-
-    all_trades: list[Trade] = []
-    all_equity: list[EquityPoint] = []
-    split_labels: list[str] = []
     segment_reports: list[SegmentReport] = []
     warnings: list[str] = []
     unexecuted_final_signal: str | None = None
+    used_results: list[tuple[int, list[Candle], _SegmentRunResult]] = []
 
     for seg_idx, segment in enumerate(raw_segments):
         is_last_segment = seg_idx == len(raw_segments) - 1
@@ -228,7 +402,7 @@ def run_backtest(
             )
             continue
 
-        result = _run_segment(segment, config, filters, strategy, risk_engine, broker, journal, min_required)
+        result = _run_segment(segment, config, filters, strategy, risk_engine, broker, journal, min_required, starting_equity)
 
         if result.pending_signal_note is not None:
             if is_last_segment:
@@ -255,6 +429,16 @@ def run_backtest(
                 + (" Excluded from aggregate trade statistics." if exclude else "")
             )
 
+        segment_performance = compute_performance_report(
+            result.trades,
+            result.equity_curve,
+            interval,
+            config.backtest.min_trades_for_significance,
+            buy_and_hold=compute_buy_and_hold_report(
+                segment[min_required - 1 :], starting_equity, config.fees.taker_fee_pct
+            ),
+        )
+
         segment_reports.append(
             SegmentReport(
                 index=seg_idx,
@@ -266,49 +450,192 @@ def run_backtest(
                 excluded_from_overall=exclude,
                 cancelled_pending_signal=result.pending_signal_note,
                 skipped_insufficient_candles=False,
+                performance=segment_performance,
+                diagnostics=result.diagnostics,
             )
         )
 
         if not exclude:
-            all_trades.extend(result.trades)
-            for point in result.equity_curve:
-                all_equity.append(point)
-                idx = original_index_by_close_time.get(point.timestamp_ms)
-                split_labels.append(
-                    _split_name(idx, train_end_idx, validation_end_idx) if idx is not None else "test"
-                )
+            used_results.append((seg_idx, segment, result))
 
     if gaps:
         warnings.append(
             f"{len(gaps)} confirmed historical gap(s) were detected and preserved as independent "
             "segment boundaries - results across gaps are NOT one continuous tradable equity "
-            "history. Each segment starts fresh from the same baseline equity; read its own "
-            "statistics independently rather than trusting the naive overall concatenation alone."
+            "history. Each segment starts fresh from the same baseline starting_equity; read its "
+            "own PerformanceReport independently (see `segments[i].performance`) rather than "
+            "trusting any naive concatenation."
         )
 
     reports: dict[str, PerformanceReport] = {}
-    for split in (*SPLIT_NAMES, "overall"):
-        split_equity = [p for p, label in zip(all_equity, split_labels) if split == "overall" or label == split]
-        split_trades = [
-            t for t in all_trades
-            if split == "overall" or _split_name_for_time(t.exit_time_ms, candles, train_end_idx, validation_end_idx) == split
-        ]
-        buy_and_hold_pct = _buy_and_hold_return_pct(split_equity, candles)
-        report = compute_performance_report(
-            split_trades, split_equity, interval, config.backtest.min_trades_for_significance, buy_and_hold_pct
-        )
-        reports[split] = report
-        if report.low_trade_count_warning:
-            warnings.append(
-                f"{split}: only {report.trade_count} trade(s), below the configured "
-                f"significance threshold of {config.backtest.min_trades_for_significance} - "
-                "results are not statistically meaningful."
+    diagnostics: RunDiagnostics | None = None
+    aggregate_trade_stats: AggregateTradeStats | None = None
+    all_trades: list[Trade] = [t for _, _, r in used_results for t in r.trades]
+    all_equity: list[EquityPoint] = [p for _, _, r in used_results for p in r.equity_curve]
+
+    if len(used_results) == 1:
+        # The common, no-confirmed-gap case: exactly one continuous run.
+        # Chronological train/validation/test slices of THAT ONE RUN,
+        # computed from local (this segment's own) index fractions -
+        # informational labels on one uninterrupted simulation, never
+        # independent evaluations (see `run_independent_holdout_evaluation`
+        # for that) and never refit per slice.
+        _, segment, result = used_results[0]
+        n = len(segment)
+        train_end = min_required - 1 + int((n - (min_required - 1)) * config.backtest.train_fraction)
+        validation_end = train_end + int((n - (min_required - 1)) * config.backtest.validation_fraction)
+        bounds = {
+            "train": (min_required - 1, train_end),
+            "validation": (train_end, validation_end),
+            "test": (validation_end, n),
+            "overall": (min_required - 1, n),
+        }
+        offset = min_required - 1
+        for split, (start_idx, end_idx) in bounds.items():
+            split_trades = [t for t in result.trades if start_idx <= _index_for_time(segment, t.exit_time_ms, offset) < end_idx]
+            split_equity = result.equity_curve[max(0, start_idx - offset) : max(0, end_idx - offset)]
+            buy_and_hold = compute_buy_and_hold_report(
+                segment[start_idx:end_idx], starting_equity, config.fees.taker_fee_pct
             )
+            report = compute_performance_report(
+                split_trades, split_equity, interval, config.backtest.min_trades_for_significance, buy_and_hold=buy_and_hold
+            )
+            reports[split] = report
+            if report.low_trade_count_warning:
+                warnings.append(
+                    f"{split}: only {report.trade_count} trade(s), below the configured "
+                    f"significance threshold of {config.backtest.min_trades_for_significance} - "
+                    "results are not statistically meaningful."
+                )
+        diagnostics = result.diagnostics
+    elif len(used_results) > 1:
+        total_realized = sum((t.pnl_quote for t in all_trades), Decimal(0))
+        wins = sum(1 for t in all_trades if t.pnl_quote > 0)
+        aggregate_trade_stats = AggregateTradeStats(
+            segments_included=len(used_results),
+            total_trades=len(all_trades),
+            total_realized_pnl_quote=total_realized,
+            win_rate=(100.0 * wins / len(all_trades)) if all_trades else None,
+            total_strategy_exits=sum(1 for t in all_trades if t.exit_reason == EXIT_REASON_STRATEGY),
+            total_stop_loss_exits=sum(1 for t in all_trades if t.exit_reason == EXIT_REASON_STOP_LOSS),
+        )
+        warnings.append(
+            f"{len(used_results)} independent segments contributed trades. No combined 'overall' "
+            "return/drawdown/Sharpe/Sortino is reported - see `segments[i].performance` for each "
+            "segment's own complete, independent report, and `aggregate_trade_stats` for the only "
+            "mathematically valid cross-segment aggregate (trade-level counts and money sums)."
+        )
 
     return BacktestResult(
-        trades=all_trades, equity_curve=all_equity, reports=reports, warnings=warnings,
-        unexecuted_final_signal=unexecuted_final_signal, gaps=gaps, segments=segment_reports,
+        trades=all_trades,
+        equity_curve=all_equity,
+        reports=reports,
+        warnings=warnings,
+        unexecuted_final_signal=unexecuted_final_signal,
+        gaps=gaps,
+        segments=segment_reports,
+        aggregate_trade_stats=aggregate_trade_stats,
+        diagnostics=diagnostics,
     )
+
+
+def run_independent_holdout_evaluation(
+    candles: list[Candle],
+    config: AppConfig,
+    filters: SymbolFilters,
+    journal: Journal | None = None,
+) -> HoldoutEvaluationResult:
+    """Run the INDEPENDENT FIXED-PARAMETER HOLDOUT EVALUATION described in
+    the module docstring - see `HOLDOUT_EVALUATION_LABEL`."""
+    interval = config.market.interval
+    policy = config.backtest.gap_policy
+
+    if policy == "reject":
+        validate_candle_sequence(candles, interval)
+        raw_segments: list[list[Candle]] = [candles]
+    else:
+        raw_segments = partition_into_segments(candles, interval).segments
+
+    strategy = EmaCrossoverTrendStrategy(config.strategy.ema_fast, config.strategy.ema_slow)
+    risk_engine = RiskEngine(config.risk)
+    broker = BacktestBroker(config.fees)
+    min_required = config.strategy.ema_slow + 1
+    starting_equity = Decimal(str(config.backtest.starting_equity))
+
+    windows: list[HoldoutWindowReport] = []
+    warnings: list[str] = []
+
+    for seg_idx, segment in enumerate(raw_segments):
+        n = len(segment)
+        if n < min_required:
+            warnings.append(
+                f"segment {seg_idx}: only {n} candle(s), fewer than the {min_required} required for "
+                "indicator warm-up - skipped entirely for holdout evaluation."
+            )
+            continue
+
+        tradable_n = n - (min_required - 1)
+        train_end = (min_required - 1) + int(tradable_n * config.backtest.train_fraction)
+        validation_end = train_end + int(tradable_n * config.backtest.validation_fraction)
+        if train_end <= min_required - 1:
+            warnings.append(
+                f"segment {seg_idx}: not enough candles to form a non-empty train window - skipped "
+                "entirely for holdout evaluation."
+            )
+            continue
+
+        for label, start_idx, end_idx in (
+            ("train", min_required - 1, train_end),
+            ("validation", train_end, validation_end),
+            ("test", validation_end, n),
+        ):
+            if end_idx <= start_idx:
+                warnings.append(f"segment {seg_idx} {label}: window would be empty - skipped.")
+                continue
+
+            warm_up_start_idx = start_idx - (min_required - 1)
+            window_slice = segment[warm_up_start_idx:end_idx]
+            result = _run_segment(
+                window_slice, config, filters, strategy, risk_engine, broker, journal, min_required, starting_equity
+            )
+            window_candles = segment[start_idx:end_idx]
+            buy_and_hold = compute_buy_and_hold_report(window_candles, starting_equity, config.fees.taker_fee_pct)
+            report = compute_performance_report(
+                result.trades, result.equity_curve, interval, config.backtest.min_trades_for_significance,
+                buy_and_hold=buy_and_hold,
+            )
+            if report.low_trade_count_warning:
+                warnings.append(
+                    f"segment {seg_idx} {label}: only {report.trade_count} trade(s), below the "
+                    f"configured significance threshold of {config.backtest.min_trades_for_significance}."
+                )
+            if result.pending_signal_note is not None:
+                warnings.append(f"segment {seg_idx} {label}: {result.pending_signal_note}")
+
+            windows.append(
+                HoldoutWindowReport(
+                    segment_index=seg_idx,
+                    label=label,
+                    warm_up_start_time_ms=segment[warm_up_start_idx].open_time_ms,
+                    warm_up_candle_count=min_required - 1,
+                    window_start_time_ms=segment[start_idx].open_time_ms,
+                    window_end_time_ms=segment[end_idx - 1].close_time_ms,
+                    candle_count=end_idx - start_idx,
+                    performance=report,
+                    diagnostics=result.diagnostics,
+                    ends_with_open_position=result.ends_with_open_position,
+                    unresolved_pending_signal=result.pending_signal_note,
+                )
+            )
+
+    return HoldoutEvaluationResult(label=HOLDOUT_EVALUATION_LABEL, windows=windows, warnings=warnings)
+
+
+def _index_for_time(segment: list[Candle], time_ms: int, offset: int) -> int:
+    for i, candle in enumerate(segment):
+        if candle.open_time_ms == time_ms:
+            return i
+    return offset  # pragma: no cover - defensive; every trade time originates from this segment
 
 
 def _run_segment(
@@ -320,24 +647,28 @@ def _run_segment(
     broker: BacktestBroker,
     journal: Journal | None,
     min_required: int,
+    starting_equity: Decimal,
 ) -> _SegmentRunResult:
-    """Run one fully independent backtest over a single contiguous segment.
+    """Run one fully independent backtest over a single contiguous segment
+    (or, from `run_independent_holdout_evaluation`, over one window's own
+    warm-up-prefixed candle slice).
 
-    Fresh portfolio, fresh indicator warm-up (via `segment[: i + 1]`, never
-    reaching back into a previous segment), fresh day/cooldown state -
-    nothing from a previous segment (or a gap before this one) is ever
-    visible here.
+    Fresh portfolio (from `starting_equity`), fresh indicator warm-up (via
+    `segment[: i + 1]`, never reaching back into a previous segment or
+    window), fresh day/cooldown state - nothing from a previous segment (or
+    a gap before this one) is ever visible here.
     """
     state = _LoopState(
-        portfolio=PortfolioState.initial(Decimal(50)),
+        portfolio=PortfolioState.initial(starting_equity),
         open_trade=None,
         stop_price=None,
         trades_today=0,
         daily_realized_pnl_pct=0.0,
-        daily_start_equity=Decimal(50),
+        daily_start_equity=starting_equity,
         cooldown_bars_remaining=0,
     )
     peak_equity = state.portfolio.equity(segment[min_required - 1].close)
+    diag = _DiagBuilder()
 
     pending_signal: SignalType | None = None
     trades: list[Trade] = []
@@ -363,7 +694,7 @@ def _run_segment(
 
         if pending_signal is not None:
             state, trades, peak_equity = _resolve_pending_signal(
-                pending_signal, candle, state, trades, config, filters, risk_engine, broker, peak_equity, journal
+                pending_signal, candle, state, trades, config, filters, risk_engine, broker, peak_equity, journal, diag
             )
             pending_signal = None
 
@@ -384,7 +715,11 @@ def _run_segment(
                 {"type": signal.type.value, "reason_code": signal.reason_code, **signal.inputs},
                 candle.close_time_ms,
             )
-        if signal.type in (SignalType.BUY, SignalType.EXIT):
+        if signal.type == SignalType.BUY:
+            diag.buy_signals_generated += 1
+            pending_signal = signal.type
+        elif signal.type == SignalType.EXIT:
+            diag.exit_signals_generated += 1
             pending_signal = signal.type
 
         equity_curve.append(
@@ -403,11 +738,55 @@ def _run_segment(
             "within this segment."
         )
 
+    strategy_exits = sum(1 for t in trades if t.exit_reason == EXIT_REASON_STRATEGY)
+    stop_exits = sum(1 for t in trades if t.exit_reason == EXIT_REASON_STOP_LOSS)
+    max_dd_pct, max_dd_time_ms = _max_drawdown_with_time(equity_curve)
+    segment_end_time_ms = segment[-1].close_time_ms
+
+    shutdown_activations: dict[str, ShutdownActivation] = {}
+    for reason_code, (first_ms, eq_at_activation, dd_at_activation) in diag.shutdown_first_activation.items():
+        last_active_ms = diag.shutdown_last_active[reason_code]
+        remained_latched = (
+            diag.last_approved_buy_time_ms is None or diag.last_approved_buy_time_ms < first_ms
+        )
+        duration_ms = (segment_end_time_ms - first_ms) if remained_latched else (last_active_ms - first_ms)
+        shutdown_activations[reason_code] = ShutdownActivation(
+            reason_code=reason_code,
+            first_activated_time_ms=first_ms,
+            equity_at_activation=eq_at_activation,
+            drawdown_pct_at_activation=dd_at_activation,
+            last_active_time_ms=last_active_ms,
+            blocked_buy_count=diag.rejected_entries_by_reason.get(reason_code, 0),
+            remained_latched_to_end=remained_latched,
+            duration_ms=duration_ms,
+        )
+
+    diagnostics = RunDiagnostics(
+        buy_signals_generated=diag.buy_signals_generated,
+        exit_signals_generated=diag.exit_signals_generated,
+        unexecuted_signals=1 if pending_signal_note is not None else 0,
+        executed_entries=diag.executed_entries,
+        executed_strategy_exits=strategy_exits,
+        executed_stop_loss_exits=stop_exits,
+        rejected_entries_by_reason=dict(diag.rejected_entries_by_reason),
+        first_executed_trade_time_ms=trades[0].entry_time_ms if trades else None,
+        last_executed_trade_time_ms=trades[-1].exit_time_ms if trades else None,
+        max_drawdown_pct=max_dd_pct,
+        max_drawdown_time_ms=max_dd_time_ms,
+        shutdown_activations=shutdown_activations,
+        starting_equity=starting_equity,
+        ending_equity=state.portfolio.equity(segment[-1].close),
+        ending_cash_quote=state.portfolio.quote_balance,
+        ending_base_quantity=state.portfolio.base_balance,
+        ends_with_open_position=state.portfolio.position_side == PositionSide.LONG,
+    )
+
     return _SegmentRunResult(
         trades=trades,
         equity_curve=equity_curve,
         ends_with_open_position=state.portfolio.position_side == PositionSide.LONG,
         pending_signal_note=pending_signal_note,
+        diagnostics=diagnostics,
     )
 
 
@@ -422,6 +801,7 @@ def _resolve_pending_signal(
     broker: BacktestBroker,
     peak_equity: Decimal,
     journal: Journal | None,
+    diag: _DiagBuilder,
 ) -> tuple[_LoopState, list[Trade], Decimal]:
     reference_price = candle.open
     equity = state.portfolio.equity(reference_price)
@@ -445,6 +825,8 @@ def _resolve_pending_signal(
             candle.open_time_ms,
         )
     if not sizing.approved or sizing.quantity is None:
+        if signal_type == SignalType.BUY:
+            diag.record_rejected_entry(sizing.reason_code)
         return state, trades, peak_equity
 
     intent = TradeIntent(signal_type, candle.symbol, sizing.quantity, reference_price)
@@ -468,6 +850,8 @@ def _resolve_pending_signal(
             candle.open_time_ms,
         )
     if not risk_decision.approved:
+        if signal_type == SignalType.BUY:
+            diag.record_risk_gate_rejection(risk_decision.reason_code, candle.open_time_ms, equity, drawdown_pct)
         return state, trades, peak_equity
 
     validation = validate_order(intent, filters)
@@ -478,6 +862,8 @@ def _resolve_pending_signal(
             candle.open_time_ms,
         )
     if not validation.approved or validation.validated_quantity is None:
+        if signal_type == SignalType.BUY:
+            diag.record_rejected_entry(validation.reason_code)
         return state, trades, peak_equity
 
     quantity = validation.validated_quantity
@@ -488,9 +874,11 @@ def _resolve_pending_signal(
         state.stop_price = fill.fill_price * (1 - Decimal(str(config.stop_loss.stop_distance_pct)))
         state.open_trade = _OpenTrade(candle.open_time_ms, fill.fill_price, quantity, fill.fee_quote)
         state.trades_today += 1
+        diag.executed_entries += 1
+        diag.last_approved_buy_time_ms = candle.open_time_ms
     else:
         fill = broker.simulate_sell(quantity, reference_price)
-        state = _apply_exit_fill(state, candle.open_time_ms, quantity, fill, trades, config)
+        state = _apply_exit_fill(state, candle.open_time_ms, quantity, fill, trades, config, EXIT_REASON_STRATEGY)
 
     return state, trades, peak_equity
 
@@ -510,7 +898,7 @@ def _execute_stop_exit(
     fill_reference_price = min(state.stop_price, candle.open)
     quantity = state.portfolio.base_balance
     fill = broker.simulate_sell(quantity, fill_reference_price)
-    state = _apply_exit_fill(state, candle.open_time_ms, quantity, fill, trades, config)
+    state = _apply_exit_fill(state, candle.open_time_ms, quantity, fill, trades, config, EXIT_REASON_STOP_LOSS)
     if journal is not None:
         journal.record(
             "STOP_LOSS_TRIGGERED",
@@ -521,7 +909,13 @@ def _execute_stop_exit(
 
 
 def _apply_exit_fill(
-    state: _LoopState, exit_time_ms: int, quantity: Decimal, fill: SimulatedFill, trades: list[Trade], config: AppConfig
+    state: _LoopState,
+    exit_time_ms: int,
+    quantity: Decimal,
+    fill: SimulatedFill,
+    trades: list[Trade],
+    config: AppConfig,
+    exit_reason: str,
 ) -> _LoopState:
     pnl_before = state.portfolio.realized_pnl_quote
     open_trade = state.open_trade
@@ -538,6 +932,7 @@ def _apply_exit_fill(
                 quantity=quantity,
                 fees_paid=open_trade.entry_fee + fill.fee_quote,
                 pnl_quote=realized,
+                exit_reason=exit_reason,
             )
         )
 
@@ -551,28 +946,17 @@ def _apply_exit_fill(
     return state
 
 
-def _split_name(index: int, train_end_idx: int, validation_end_idx: int) -> str:
-    if index < train_end_idx:
-        return "train"
-    if index < validation_end_idx:
-        return "validation"
-    return "test"
-
-
-def _split_name_for_time(time_ms: int, candles: list[Candle], train_end_idx: int, validation_end_idx: int) -> str:
-    for i, candle in enumerate(candles):
-        if candle.open_time_ms == time_ms:
-            return _split_name(i, train_end_idx, validation_end_idx)
-    return "test"
-
-
-def _buy_and_hold_return_pct(equity_points: list[EquityPoint], candles: list[Candle]) -> float | None:
-    if not equity_points:
-        return None
-    start_time = equity_points[0].timestamp_ms
-    end_time = equity_points[-1].timestamp_ms
-    start_close = next((c.close for c in candles if c.close_time_ms == start_time), None)
-    end_close = next((c.close for c in candles if c.close_time_ms == end_time), None)
-    if start_close is None or end_close is None or start_close == 0:
-        return None
-    return float((end_close / start_close - 1) * 100)
+def _max_drawdown_with_time(equity_curve: list[EquityPoint]) -> tuple[float, int | None]:
+    if not equity_curve:
+        return 0.0, None
+    peak = equity_curve[0].equity
+    max_dd = 0.0
+    max_dd_time_ms: int | None = None
+    for point in equity_curve:
+        peak = max(peak, point.equity)
+        if peak > 0:
+            drawdown = float((peak - point.equity) / peak)
+            if drawdown > max_dd:
+                max_dd = drawdown
+                max_dd_time_ms = point.timestamp_ms
+    return max_dd * 100, max_dd_time_ms

@@ -2,6 +2,83 @@
 
 All notable changes to this project are documented here.
 
+## [0.1.5] - Backtest evaluation/reporting correctness fixes
+
+The first real BTCUSDT backtest against the full stored 2020-01-01 to
+2026-09-04 dataset reported 0 trades in both the validation and test
+windows. Reading the previous engine's code showed why: train/validation/
+test were post-hoc labels (global candle-index fractions) applied to ONE
+continuous, unbroken simulation with no risk-state reset at those label
+boundaries - so a risk shutdown latched during the "train"-labeled portion
+mechanically persisted, unchanged, through everything labeled "validation"
+and "test" after it. This release adds concrete, instrumented evidence for
+that mechanism instead of leaving it as an inference, and adds a genuinely
+independent evaluation mode alongside the preserved continuous simulation.
+Adds 12 tests (311 -> 323 total).
+
+### Added
+
+- `backtest/engine.py::RunDiagnostics` (and `ShutdownActivation`): exact
+  BUY/EXIT signal counts, executed entries vs. strategy exits vs.
+  stop-loss exits (now counted separately via the new `Trade.exit_reason`
+  field), every rejected entry grouped by its exact reason code, the
+  first and last executed trade timestamps, the maximum-drawdown value
+  AND timestamp, and for every risk-gate rejection reason that ever
+  activated: the first activation's timestamp/equity/drawdown, how many
+  otherwise-valid BUY signals it blocked, whether it remained latched to
+  the end of the run, and the ending cash/asset-quantity/marked-to-market
+  equity. Attached to every segment (`SegmentReport.diagnostics`) and to
+  the top-level `BacktestResult` when exactly one segment ran.
+- `backtest/engine.py::run_independent_holdout_evaluation`: a SEPARATE
+  evaluation mode, clearly labeled "INDEPENDENT FIXED-PARAMETER HOLDOUT
+  EVALUATION - NOT walk-forward optimization" everywhere it is printed.
+  Train, validation, and test each run as an independent call to the same
+  per-candle simulation loop, each starting from a fresh configured
+  `starting_equity` and fresh risk state (peak equity, drawdown,
+  cooldowns, day counters all reset). A window may look back at preceding
+  candles from its own gap-free segment for indicator warm-up only - those
+  warm-up candles never generate a trade, never contribute to the
+  reported performance, never reach across a confirmed gap, and no candle
+  beyond the window's own end is ever visible to it. A position or
+  pending signal open at a window's end is reported but never carried
+  into the next window. `HoldoutEvaluationResult`/`HoldoutWindowReport`
+  report the exact calendar start/end of every window.
+- `config.backtest.starting_equity` (default `50.0`): the quote-currency
+  balance every simulation (a continuous segment, or one holdout window)
+  starts from - previously a hardcoded `Decimal(50)` inside
+  `backtest/engine.py`. `PerformanceReport` now carries both
+  `starting_equity` and `ending_equity` explicitly.
+- Buy-and-hold comparison rewrite (`metrics/performance.py::
+  BuyAndHoldReport`, `compute_buy_and_hold_report`): computed over the
+  EXACT same candle range as the report it is attached to (matching
+  start/end timestamps, never a different window), starting from the same
+  `starting_equity`, with one documented buy-side transaction cost applied
+  at entry, its own maximum drawdown, marked to market at the final
+  available candle's close, and never bridged across a confirmed gap.
+- Gap-segment reporting overhaul: when more than one segment actually ran,
+  `BacktestResult.reports` is now empty and each segment instead gets a
+  full, independent `PerformanceReport` (`segments[i].performance`) - no
+  naive concatenation of independently-restarted equity curves into an
+  ordinary percentage return/drawdown/Sharpe/Sortino. The only
+  cross-segment aggregate produced is the new, explicitly-labeled
+  `AggregateTradeStats`, which contains ONLY figures that remain
+  mathematically valid to sum/ratio across independent segments (total
+  trades, total realized PnL in quote currency, overall win rate) and
+  deliberately has no return/drawdown/Sharpe/Sortino field. The
+  single-segment (no-confirmed-gap) case is unchanged: `reports` still
+  carries the familiar `"train"/"validation"/"test"/"overall"` keys.
+
+### Unchanged, deliberately
+
+- Strategy parameters (EMA periods, stop distance, fees, slippage, risk
+  limits) were not tuned or otherwise changed by this release - only
+  evaluation and reporting were corrected, per the explicit constraint
+  this round was done under.
+- The continuous operational simulation (`run_backtest`) is preserved
+  exactly as before for the common no-gap case (same trades, same equity
+  curve) - only its diagnostics, starting-equity source, and buy-and-hold
+  calculation changed.
+
 ## [0.1.4] - Historical-data gap handling
 
 The first real multi-year download (`trading-agent fetch-data --start

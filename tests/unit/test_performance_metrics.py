@@ -1,6 +1,11 @@
 from decimal import Decimal
 
-from trading_agent.metrics.performance import EquityPoint, Trade, compute_performance_report
+from trading_agent.metrics.performance import (
+    BuyAndHoldReport,
+    EquityPoint,
+    Trade,
+    compute_performance_report,
+)
 
 INTERVAL = "4h"
 STEP_MS = 4 * 60 * 60 * 1000
@@ -67,8 +72,13 @@ def test_low_trade_count_warning_threshold():
 
 def test_buy_and_hold_return_passed_through():
     curve = _equity_curve([100, 105])
-    report = compute_performance_report([], curve, INTERVAL, min_trades_for_significance=1, buy_and_hold_return_pct=42.0)
+    bh = BuyAndHoldReport(
+        return_pct=42.0, max_drawdown_pct=5.0, start_time_ms=START, end_time_ms=START + STEP_MS,
+        buy_fee_pct_applied=0.001, note="test",
+    )
+    report = compute_performance_report([], curve, INTERVAL, min_trades_for_significance=1, buy_and_hold=bh)
     assert report.buy_and_hold_return_pct == 42.0
+    assert report.buy_and_hold is bh
 
 
 def test_assumptions_documented_in_report():

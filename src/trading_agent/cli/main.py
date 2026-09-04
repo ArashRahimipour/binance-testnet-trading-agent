@@ -13,7 +13,12 @@ from datetime import UTC, datetime
 
 import click
 
-from trading_agent.backtest.engine import run_backtest
+from trading_agent.backtest.engine import (
+    RunDiagnostics,
+    ShutdownActivation,
+    run_backtest,
+    run_independent_holdout_evaluation,
+)
 from trading_agent.config import AppConfig, Mode, load_config
 from trading_agent.config.loader import load_secrets
 from trading_agent.data.historical_fetch import (
@@ -170,13 +175,16 @@ def backtest_cmd(ctx: click.Context) -> None:
     with Journal(journal_path) as journal:
         try:
             result = run_backtest(candles, config, filters, journal)
+            holdout = run_independent_holdout_evaluation(candles, config, filters, journal)
         except ValueError as exc:
             click.echo(f"Backtest failed: {exc}", err=True)
             sys.exit(1)
 
+    click.echo("=== CONTINUOUS OPERATIONAL SIMULATION ===")
     click.echo(
         f"gap_policy={config.backtest.gap_policy}  "
-        f"segments={len(result.segments)}  confirmed_gaps={len(result.gaps)}"
+        f"segments={len(result.segments)}  confirmed_gaps={len(result.gaps)}  "
+        f"starting_equity={config.backtest.starting_equity}"
     )
     for seg in result.segments:
         status_bits = []
@@ -193,30 +201,135 @@ def backtest_cmd(ctx: click.Context) -> None:
             f"  segment {seg.index}: {start_date} to {end_date} "
             f"({seg.candle_count} candles, {seg.trade_count} trade(s)){status}"
         )
+        if seg.performance is not None:
+            report = seg.performance
+            click.echo(
+                f"    starting_equity={report.starting_equity} ending_equity={report.ending_equity} "
+                f"total_return_pct={report.total_return_pct:.2f} max_drawdown_pct={report.max_drawdown_pct:.2f} "
+                f"strategy_exits={report.strategy_exit_count} stop_loss_exits={report.stop_loss_exit_count}"
+            )
+            if report.buy_and_hold is not None:
+                bh = report.buy_and_hold
+                click.echo(
+                    f"    buy_and_hold: return_pct={bh.return_pct} max_drawdown_pct={bh.max_drawdown_pct} "
+                    f"fee_pct_applied={bh.buy_fee_pct_applied}"
+                )
+        if seg.diagnostics is not None:
+            _print_diagnostics(seg.diagnostics, indent="    ")
     if result.gaps:
         click.echo(
             "WARNING: results across gaps are NOT one continuous tradable equity history - "
-            "each segment above starts fresh from the same baseline equity; read its own "
-            "statistics independently rather than trusting only the overall row below."
+            "each segment above starts fresh from the same baseline starting_equity; read each "
+            "segment's own report above independently."
         )
 
-    for split in ("train", "validation", "test", "overall"):
-        report = result.reports[split]
-        click.echo(f"--- {split} ---")
+    if result.reports:
+        # Exactly one segment ran (the no-confirmed-gap case): the familiar
+        # chronological train/validation/test/overall labels on that ONE
+        # continuous run - see backtest/engine.py's module docstring for
+        # why these are informational timeline slices, not independent
+        # evaluations (use the holdout evaluation below for that).
+        for split in ("train", "validation", "test", "overall"):
+            report = result.reports[split]
+            click.echo(f"--- {split} (continuous run) ---")
+            click.echo(
+                f"trades={report.trade_count} starting_equity={report.starting_equity} "
+                f"ending_equity={report.ending_equity} total_return_pct={report.total_return_pct:.2f} "
+                f"buy_and_hold_pct={report.buy_and_hold_return_pct} max_drawdown_pct={report.max_drawdown_pct:.2f}"
+            )
+            if report.buy_and_hold is not None:
+                click.echo(
+                    f"buy_and_hold_max_drawdown_pct={report.buy_and_hold.max_drawdown_pct} "
+                    f"buy_and_hold_fee_pct_applied={report.buy_and_hold.buy_fee_pct_applied}"
+                )
+            click.echo(
+                f"sharpe={report.sharpe_ratio} sortino={report.sortino_ratio} "
+                f"win_rate={report.win_rate} profit_factor={report.profit_factor} "
+                f"exposure_pct={report.exposure_pct:.1f} turnover={report.turnover:.2f} "
+                f"strategy_exits={report.strategy_exit_count} stop_loss_exits={report.stop_loss_exit_count}"
+            )
+        if result.diagnostics is not None:
+            click.echo("--- diagnostics (continuous run) ---")
+            _print_diagnostics(result.diagnostics, indent="")
+    elif result.aggregate_trade_stats is not None:
+        agg = result.aggregate_trade_stats
+        click.echo("--- aggregate_trade_stats (trade-level ONLY, see note) ---")
         click.echo(
-            f"trades={report.trade_count} total_return_pct={report.total_return_pct:.2f} "
-            f"buy_and_hold_pct={report.buy_and_hold_return_pct} max_drawdown_pct={report.max_drawdown_pct:.2f}"
+            f"segments_included={agg.segments_included} total_trades={agg.total_trades} "
+            f"total_realized_pnl_quote={agg.total_realized_pnl_quote} win_rate={agg.win_rate} "
+            f"total_strategy_exits={agg.total_strategy_exits} total_stop_loss_exits={agg.total_stop_loss_exits}"
         )
-        click.echo(
-            f"sharpe={report.sharpe_ratio} sortino={report.sortino_ratio} "
-            f"win_rate={report.win_rate} profit_factor={report.profit_factor} "
-            f"exposure_pct={report.exposure_pct:.1f} turnover={report.turnover:.2f}"
-        )
+        click.echo(f"NOTE: {agg.note}")
+
     for warning in result.warnings:
         click.echo(f"WARNING: {warning}", err=True)
+
+    click.echo("")
+    click.echo(f"=== {holdout.label} ===")
+    for window in holdout.windows:
+        start_date = datetime.fromtimestamp(window.window_start_time_ms / 1000, tz=UTC).date()
+        end_date = datetime.fromtimestamp(window.window_end_time_ms / 1000, tz=UTC).date()
+        warmup_date = datetime.fromtimestamp(window.warm_up_start_time_ms / 1000, tz=UTC).date()
+        report = window.performance
+        click.echo(
+            f"  segment {window.segment_index} {window.label}: {start_date} to {end_date} "
+            f"({window.candle_count} candles; warm-up from {warmup_date}, "
+            f"{window.warm_up_candle_count} candle(s), never traded)"
+        )
+        click.echo(
+            f"    trades={report.trade_count} starting_equity={report.starting_equity} "
+            f"ending_equity={report.ending_equity} total_return_pct={report.total_return_pct:.2f} "
+            f"max_drawdown_pct={report.max_drawdown_pct:.2f} "
+            f"buy_and_hold_pct={report.buy_and_hold_return_pct}"
+        )
+        if window.ends_with_open_position or window.unresolved_pending_signal:
+            click.echo(
+                "    NOTE: window ends with an open position or unresolved pending signal - "
+                "never carried into the next window, no exit price invented."
+            )
+        _print_diagnostics(window.diagnostics, indent="    ")
+    for warning in holdout.warnings:
+        click.echo(f"WARNING (holdout evaluation): {warning}", err=True)
+
     click.echo(
-        "Note: this is a research backtest on simulated fills, not a claim of live profitability. "
+        "\nNote: this is a research backtest on simulated fills, not a claim of live profitability. "
         "Do not select a strategy based solely on the best historical return."
+    )
+
+
+def _print_diagnostics(diagnostics: RunDiagnostics, indent: str) -> None:
+    d = diagnostics
+    click.echo(
+        f"{indent}signals: buy={d.buy_signals_generated} exit={d.exit_signals_generated} "
+        f"unexecuted={d.unexecuted_signals}"
+    )
+    click.echo(
+        f"{indent}executed: entries={d.executed_entries} strategy_exits={d.executed_strategy_exits} "
+        f"stop_loss_exits={d.executed_stop_loss_exits}"
+    )
+    if d.rejected_entries_by_reason:
+        reasons = ", ".join(f"{code}={count}" for code, count in sorted(d.rejected_entries_by_reason.items()))
+        click.echo(f"{indent}rejected_entries_by_reason: {reasons}")
+    click.echo(
+        f"{indent}first_executed_trade_time_ms={d.first_executed_trade_time_ms} "
+        f"last_executed_trade_time_ms={d.last_executed_trade_time_ms}"
+    )
+    click.echo(f"{indent}max_drawdown_pct={d.max_drawdown_pct:.2f} at time_ms={d.max_drawdown_time_ms}")
+    for activation in d.shutdown_activations.values():
+        _print_shutdown_activation(activation, indent)
+    click.echo(
+        f"{indent}ending: cash_quote={d.ending_cash_quote} base_quantity={d.ending_base_quantity} "
+        f"equity={d.ending_equity} open_position={d.ends_with_open_position}"
+    )
+
+
+def _print_shutdown_activation(activation: ShutdownActivation, indent: str) -> None:
+    click.echo(
+        f"{indent}SHUTDOWN {activation.reason_code}: first_activated_time_ms="
+        f"{activation.first_activated_time_ms} equity_at_activation={activation.equity_at_activation} "
+        f"drawdown_pct_at_activation={activation.drawdown_pct_at_activation * 100:.2f} "
+        f"blocked_buy_count={activation.blocked_buy_count} duration_ms={activation.duration_ms} "
+        f"remained_latched_to_end={activation.remained_latched_to_end}"
     )
 
 

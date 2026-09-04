@@ -55,6 +55,7 @@ backtest:
   validation_fraction: 0.2
   test_fraction: 0.2
   min_trades_for_significance: 20
+  starting_equity: 50.0   # quote-currency balance every simulation (segment or holdout window) starts from
 
 paths:
   data_dir: data

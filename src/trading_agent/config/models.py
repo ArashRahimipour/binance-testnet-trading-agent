@@ -96,6 +96,13 @@ class BacktestConfig(BaseModel):
     test_fraction: float = Field(gt=0, lt=1, default=0.2)
     min_trades_for_significance: int = Field(gt=0, default=20)
 
+    #: Starting quote-currency balance every backtest simulation (a
+    #: continuous segment, or one independent holdout window) begins from.
+    #: Previously hardcoded to 50 inside backtest/engine.py; now validated
+    #: configuration so every report can state it explicitly alongside the
+    #: ending equity it produced.
+    starting_equity: float = Field(gt=0, default=50.0)
+
     #: How a historical candle series with a confirmed gap is handled.
     #: "reject" is the original strict behavior (any gap raises, exactly
     #: like live/Testnet's validate_candle_sequence). "segment" - the

@@ -129,17 +129,57 @@ trading-agent backtest
 
 Runs the baseline strategy candle-by-candle over the stored history with no
 look-ahead (see [STRATEGY.md](STRATEGY.md)), routes every proposed trade
-through the same risk engine and order validator a live run would use,
-and prints a performance report using **chronological holdout reporting**:
-fixed train/validation/test date windows, evaluated with the *same*
-strategy parameters throughout (see config/default.yaml) rather than
-refitting per window. This is deliberately not model selection - it is
-not genuine rolling walk-forward re-optimization, and no parameter is ever
-chosen because it performed best on a split. The report covers total and
+through the same risk engine and order validator a live run would use, and
+prints **two independent evaluations** every time (see
+`backtest/engine.py`'s module docstring for the full design):
+
+1. **The continuous operational simulation** (`run_backtest`) - what would
+   actually have happened if the system started trading at the first
+   candle and kept its risk state (peak equity, drawdown, cooldowns, daily
+   counters) running continuously. When the stored history has no
+   confirmed gap, this still prints the familiar chronological
+   `train`/`validation`/`test`/`overall` labels - fixed strategy
+   parameters throughout (see config/default.yaml), never refit per
+   window - but these are timeline slices of **one uninterrupted run**,
+   not independent evaluations. A risk shutdown latched during the
+   "train"-labeled portion mechanically carries into everything labeled
+   "validation"/"test" after it, because it is the same simulation. A
+   `diagnostics` block is always printed alongside so this is never left
+   to be inferred: exact BUY/EXIT signal counts, executed entries vs.
+   strategy exits vs. stop-loss exits (counted separately), every rejected
+   entry grouped by its exact reason code, the first and last executed
+   trade timestamps, the maximum-drawdown value AND timestamp, and for
+   every risk-gate shutdown that ever activated: when it first triggered,
+   the equity/drawdown at that moment, how many otherwise-valid BUY
+   signals it blocked, whether it stayed latched for the rest of the run,
+   and the ending cash/asset quantity/marked-to-market equity.
+2. **The independent fixed-parameter holdout evaluation**
+   (`run_independent_holdout_evaluation`) - printed under a banner that
+   says exactly that, **not walk-forward optimization**. Train,
+   validation, and test each run with the *same* fixed strategy
+   parameters but start from a completely fresh configured starting
+   balance and fresh risk state (peak equity, drawdown, cooldowns, and day
+   counters all reset). A window may look back at preceding candles from
+   its own gap-free segment for indicator warm-up only - those warm-up
+   candles never generate a trade, never contribute to the reported
+   performance, never reach across a confirmed gap, and no candle beyond
+   the window's own end is ever visible to it. A position or pending
+   signal open at a window's end is reported, never carried into the next
+   window. This directly answers what validation/test look like on their
+   own merits, without inheriting whatever risk state train's own run
+   happened to end in.
+
+Both reports show **starting AND ending equity** for every window/segment
+(`config.backtest.starting_equity`, default `50.0` - previously a hardcoded
+constant, now validated configuration) and a buy-and-hold comparison
+computed over the *exact* same candle range as the report it sits next to:
+same start/end timestamps, one documented buy-side transaction cost, marked
+to market at the final available candle's close, its own maximum drawdown,
+and never bridged across a confirmed gap. Each report covers total and
 annualized return, max drawdown, volatility, Sharpe/Sortino (assumptions
-documented), win rate, profit factor, exposure, turnover, trade count, and
-a buy-and-hold comparison. A warning is printed whenever a split has too few trades to
-be statistically meaningful. **This is a research report, not investment
+documented), win rate, profit factor, exposure, turnover, and trade count.
+A warning is printed whenever a window/segment has too few trades to be
+statistically meaningful. **This is a research report, not investment
 advice, and past simulated performance does not indicate future results.**
 
 If the stored history contains a confirmed gap, `config.backtest.gap_policy`
@@ -151,13 +191,27 @@ segment's end is cancelled, never carried into the next segment; a
 position still open at a segment boundary caused by a gap is marked an
 unresolved research condition (no exit price is ever invented for it) and
 is, by default, excluded from the aggregate trade statistics
-(`exclude_open_position_segments`). The command reports the breakdown:
+(`exclude_open_position_segments`). Because each segment restarts from the
+same baseline `starting_equity` rather than continuing the previous
+segment's ending balance, **their equity curves are never naively
+concatenated into one "overall" return/drawdown/Sharpe/Sortino** - when
+more than one segment actually ran, `result.reports` is empty and each
+segment gets its own complete, independent `PerformanceReport`
+(`segments[i].performance`), alongside an explicitly-labeled
+`aggregate_trade_stats` containing only the trade-level figures that
+remain mathematically valid to sum across independent segments (total
+trades, total realized PnL in quote currency, overall win rate - never a
+percentage return or drawdown). The command reports the breakdown:
 
 ```
 gap_policy=segment  segments=2  confirmed_gaps=1
   segment 0: 2020-01-01 to 2020-02-19 (312 candles, 4 trade(s))
+    starting_equity=50.0 ending_equity=54.12 total_return_pct=8.24 max_drawdown_pct=3.10 ...
   segment 1: 2020-02-19 to 2024-01-01 (43495 candles, 61 trade(s))
+    starting_equity=50.0 ending_equity=71.30 total_return_pct=42.60 max_drawdown_pct=11.02 ...
 WARNING: results across gaps are NOT one continuous tradable equity history - ...
+--- aggregate_trade_stats (trade-level ONLY, see note) ---
+segments_included=2 total_trades=65 total_realized_pnl_quote=25.42 win_rate=44.6 ...
 ```
 
 Set `gap_policy: reject` to restore the original strict behavior (any gap

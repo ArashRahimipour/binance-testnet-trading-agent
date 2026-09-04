@@ -1,6 +1,6 @@
 # Testing
 
-311 tests, all offline: nothing in the suite makes a real network call or
+323 tests, all offline: nothing in the suite makes a real network call or
 requires real credentials. HTTP is mocked with the `responses` library at
 the point where `requests` would otherwise reach the network; time-
 sensitive behavior is tested by passing explicit reference timestamps
@@ -52,6 +52,15 @@ ruff check src tests       # lint
 | Gap manifest persistence, idempotent re-download, atomic candles+gaps write | `tests/unit/test_data_storage.py::test_store_candles_and_gaps_persists_both`, `::test_rerunning_the_same_download_is_idempotent`, `::test_a_failed_write_leaves_no_partially_inconsistent_state` |
 | Backtest gap segmentation: independent warm-up, cancelled pending signal, unresolved open position, `reject` vs `segment` policy | `tests/unit/test_backtest_engine.py::test_ema_warmup_restarts_after_a_gap`, `::test_pending_signal_is_cancelled_at_a_gap_not_executed_in_the_next_segment`, `::test_open_position_at_a_gap_is_marked_unresolved_and_excluded_by_default`, `::test_gap_policy_reject_raises_exactly_like_before`, `::test_gap_policy_defaults_to_segment` |
 | Live/Testnet gap validation remains strict, decoupled from the research gap-tolerance path | `tests/unit/test_backtest_engine.py::test_live_runner_never_references_gap_segmentation_machinery`, `tests/unit/test_data_validation.py` (unmodified, still fully strict) |
+| A permanently-latched risk shutdown explains zero validation/test trades, with concrete evidence (not inference) | `tests/unit/test_backtest_diagnostics_and_holdout.py::test_drawdown_shutdown_evidence_is_concrete_not_inferred` |
+| Independent holdout evaluation resets risk state per window (train/validation/test are NOT the continuous run's latch) | `test_backtest_diagnostics_and_holdout.py::test_independent_holdout_evaluation_resets_risk_state_and_does_not_latch` |
+| Warm-up candles never trade, never contribute return, never leak future data, never cross a gap | `test_backtest_diagnostics_and_holdout.py::test_warmup_candles_never_generate_a_trade_or_appear_before_window_start`, `::test_warmup_never_uses_future_data_beyond_the_window`, `::test_warmup_never_crosses_a_confirmed_gap` |
+| A position/pending signal never carries across an evaluation window boundary | `test_backtest_diagnostics_and_holdout.py::test_open_position_or_pending_signal_never_carries_into_the_next_window` |
+| Stop-loss exits and strategy exits are counted separately (`Trade.exit_reason`, `RunDiagnostics`, `PerformanceReport`) | `test_backtest_diagnostics_and_holdout.py::test_stop_loss_and_strategy_exits_are_counted_separately` |
+| Maximum-drawdown timestamp is correct | `test_backtest_diagnostics_and_holdout.py::test_max_drawdown_timestamp_matches_the_actual_trough` |
+| `backtest.starting_equity` is configurable end-to-end | `test_backtest_diagnostics_and_holdout.py::test_starting_equity_is_configurable` |
+| Multi-segment gap-tolerant backtests never produce a naive concatenated "overall"; only independent per-segment reports plus an explicitly-labeled trade-level aggregate | `test_backtest_diagnostics_and_holdout.py::test_multi_segment_backtest_never_produces_a_naive_overall_report` |
+| Buy-and-hold matches the exact evaluated candle range and is never bridged across a confirmed gap | `test_backtest_diagnostics_and_holdout.py::test_buy_and_hold_matches_exact_report_range`, `::test_buy_and_hold_never_bridges_a_confirmed_gap` |
 | `testnet-health`: GET-only, no order-placement capability reachable | `tests/unit/test_testnet_health.py::test_happy_path_passes_and_only_get_requests_occur`, `::test_testnet_health_module_never_references_place_market_order`, `::test_testnet_readonly_module_never_references_place_market_order`, `test_testnet_readonly.py::test_has_no_order_placing_method_at_all`, `::test_no_request_is_ever_a_post_put_patch_or_delete` |
 | `testnet-health`: no local state created or modified | `tests/unit/test_testnet_health.py::test_no_database_or_local_state_file_created_when_none_exists`, `::test_existing_local_state_is_not_modified`, `::test_pending_orders_reported_but_not_reconciled`, `test_execution_store.py::test_open_read_only_returns_none_and_creates_nothing_when_file_absent`, `::test_open_read_only_connection_rejects_writes` |
 | `testnet-health`: secrets/signatures never leak | `tests/unit/test_testnet_health.py::test_secret_never_appears_in_report_on_happy_path`, `::test_secret_never_appears_on_invalid_credentials_failure`, `::test_secret_never_appears_in_cli_stdout_or_stderr` |
