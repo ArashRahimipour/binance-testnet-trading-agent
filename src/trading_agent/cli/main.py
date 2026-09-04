@@ -25,6 +25,7 @@ from trading_agent.data.market_data_public import (
 from trading_agent.data.storage import CandleStore
 from trading_agent.data.validation import validate_candle_sequence
 from trading_agent.execution.live_runner import ColdStartReconciliationError, run_testnet_cycle
+from trading_agent.execution.testnet_health import run_testnet_health_check
 from trading_agent.journal.journal import Journal
 from trading_agent.persistence.execution_store import ExecutionStateStore
 from trading_agent.persistence.risk_state_store import RiskStateStore
@@ -197,6 +198,36 @@ def run_cmd(ctx: click.Context) -> None:
             click.echo(f"Cannot start: {exc}", err=True)
             sys.exit(1)
     click.echo(f"action={result.action} reason={result.reason_code} detail={result.detail}")
+
+
+@cli.command("testnet-health")
+@click.pass_context
+def testnet_health_cmd(ctx: click.Context) -> None:
+    """Strictly read-only Binance Spot Testnet connectivity check.
+
+    Performs ONLY GET requests: server time, clock sync, BTCUSDT exchange
+    info, a signed account-info call, and an open-orders query. Reports
+    local execution-state presence and any unresolved pending orders
+    without modifying them. Never places, cancels, or modifies an order,
+    never writes to local state, and never prints secrets, signatures, or
+    signed query strings. See RISK_POLICY.md and SECURITY.md.
+    """
+    config: AppConfig = ctx.obj["config"]
+    if config.mode != Mode.TESTNET:
+        click.echo("The testnet-health command requires --mode testnet.", err=True)
+        sys.exit(1)
+    try:
+        secrets = load_secrets()
+    except Exception as exc:  # noqa: BLE001 - surfaced to the user, then exit
+        click.echo(f"Failed to load testnet credentials: {exc}", err=True)
+        sys.exit(1)
+
+    report = run_testnet_health_check(config, secrets)
+    for step in report.steps:
+        click.echo(f"[{'PASS' if step.ok else 'FAIL'}] {step.name}: {step.detail}")
+    click.echo(f"overall: {'PASS' if report.passed else 'FAIL'}")
+    if not report.passed:
+        sys.exit(1)
 
 
 @cli.command("status")

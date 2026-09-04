@@ -109,6 +109,30 @@ class ExecutionStateStore:
     def __exit__(self, *exc_info: object) -> None:
         self.close()
 
+    @classmethod
+    def open_read_only(cls, db_path: str | Path) -> Self | None:
+        """Open an EXISTING execution-state database strictly read-only,
+        for reporting purposes only (e.g. the `testnet-health` CLI
+        command). Returns `None` if the file does not exist - it never
+        creates one, and never runs the `_SCHEMA` migration (which is
+        itself a write, and would otherwise create a fresh, empty database
+        exactly where the caller is trying to detect whether one already
+        exists).
+
+        The connection is opened with SQLite's own `mode=ro` URI flag, so
+        even a bug that tried to write through the returned instance would
+        fail at the SQLite layer - not merely by the caller's discipline of
+        only calling read methods (`load_portfolio`, `load_open_pending`,
+        `get_pending`) on it.
+        """
+        path = Path(db_path)
+        if not path.exists():
+            return None
+        instance = cls.__new__(cls)
+        instance._conn = sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True)
+        instance._raise_fault_at = None
+        return instance
+
     # --- Portfolio: direct (non-order-triggered) reads/writes -----------------
 
     def load_portfolio(self, symbol: str) -> PortfolioState | None:

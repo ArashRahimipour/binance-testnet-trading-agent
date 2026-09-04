@@ -13,6 +13,7 @@ structurally impossible - both tables live behind one connection and one
 transaction.
 """
 
+import sqlite3
 from decimal import Decimal
 
 import pytest
@@ -177,3 +178,46 @@ def test_two_partial_fills_accumulate_via_applied_cumulative_fields(tmp_path):
     assert portfolio.base_balance == Decimal("0.001")
     assert pending.applied_cumulative_quote_qty == Decimal("51.0")
     assert pending.status == "RESOLVED"
+
+
+# --- open_read_only: used by execution/testnet_health.py. ---
+
+
+def test_open_read_only_returns_none_and_creates_nothing_when_file_absent(tmp_path):
+    db_path = tmp_path / "does_not_exist.db"
+    store = ExecutionStateStore.open_read_only(db_path)
+    assert store is None
+    assert not db_path.exists()
+
+
+def test_open_read_only_reads_existing_data_without_creating_schema_side_effects(tmp_path):
+    db_path = tmp_path / "state.db"
+    with ExecutionStateStore(db_path) as store:
+        _seed(store)
+        store.apply_order_result_atomically("BTCUSDT", QUOTE_ASSET, BASE_ASSET, _filled_order(), Decimal("0.001"), now_ms=3)
+
+    with ExecutionStateStore.open_read_only(db_path) as ro_store:
+        portfolio = ro_store.load_portfolio("BTCUSDT")
+        pending = ro_store.get_pending("ta-1")
+    assert portfolio.base_balance == Decimal("0.001")
+    assert pending.status == "RESOLVED"
+
+
+def test_open_read_only_connection_rejects_writes(tmp_path):
+    db_path = tmp_path / "state.db"
+    with ExecutionStateStore(db_path) as store:
+        _seed(store)
+
+    with ExecutionStateStore.open_read_only(db_path) as ro_store, pytest.raises(sqlite3.OperationalError):
+        ro_store.save_portfolio("BTCUSDT", PortfolioState.initial(Decimal(999)), updated_at_ms=99)
+
+    # Unaffected by the rejected write attempt.
+    with ExecutionStateStore(db_path) as store:
+        assert store.load_portfolio("BTCUSDT").quote_balance == Decimal(100)
+
+
+def test_open_read_only_missing_tables_raise_rather_than_silently_create(tmp_path):
+    db_path = tmp_path / "empty.db"
+    sqlite3.connect(str(db_path)).close()  # an existing file, but no schema at all
+    with ExecutionStateStore.open_read_only(db_path) as ro_store, pytest.raises(sqlite3.OperationalError):
+        ro_store.load_portfolio("BTCUSDT")

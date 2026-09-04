@@ -41,8 +41,8 @@ fact.
 | `sizing/` | Exchange filter parsing/rounding and fixed-fractional position sizing |
 | `portfolio/` | Pure-function portfolio state machine (buy/sell transitions) and its SQLite persistence |
 | `risk/` | The independent `RiskEngine`, its data contracts, and the kill switch |
-| `execution/` | Order validator, idempotent client order IDs, the Testnet-only broker adapter, order-outcome dispatch, timeout/uncertain-order and startup reconciliation, fee computation, the backtest broker, and the single-cycle live runner |
-| `persistence/` | SQLite stores for portfolio state, live risk-tracking state, and pending (in-flight) orders |
+| `execution/` | Order validator, idempotent client order IDs, the Testnet-only broker adapter, the strictly read-only Testnet client and health check, shared signing primitives, order-outcome dispatch, timeout/uncertain-order and startup reconciliation, fee computation, the backtest broker, and the single-cycle live runner |
+| `persistence/` | The unified `ExecutionStateStore` (portfolio state + pending orders, one atomic transaction boundary - see below) and the live risk-tracking state store |
 | `journal/` | Append-only audit trail of every decision |
 | `metrics/` | Backtest performance report computation |
 | `backtest/` | The chronological-holdout backtest engine tying the above together |
@@ -64,6 +64,36 @@ A future adapter for a different venue (or, in a much later version, a
 different account tier) would be a new class implementing the same shape,
 not a configuration option on `TestnetBrokerAdapter` - see SECURITY.md for
 why that separation is load-bearing, not just tidiness.
+
+## Shared signing primitives, and the strictly read-only client
+
+`execution/binance_signing.py` holds pure, side-effect-free computation
+only - HMAC request signing, clock-offset math, the common
+`BinanceApiError`/`ClockDriftError` types, and the `TESTNET_HOST`
+constant. It makes no HTTP calls and has no order-placing capability of
+any kind. `TestnetBrokerAdapter` (order-capable) and
+`execution/testnet_readonly.py::ReadOnlyTestnetClient` (GET-only, used by
+`testnet-health` below) both build on these shared primitives, but
+**neither imports the other**: this is what lets the read-only client -
+and everything built on it - prove it has zero reference to
+`place_market_order` anywhere in its own source or import graph, rather
+than merely by convention (see `tests/unit/test_testnet_health.py`).
+`ReadOnlyTestnetClient`'s one internal request method is hard-wired to
+`requests.Session.get`, with no `method` parameter anywhere that could
+turn a call into a POST/PUT/PATCH/DELETE - the "GET only" guarantee is
+structural, not just a documented intent.
+
+`execution/testnet_health.py` (`trading-agent --mode testnet
+testnet-health`) is the CLI-facing orchestration built on
+`ReadOnlyTestnetClient`: server time, clock sync, BTCUSDT exchange filter
+validation, one signed `/api/v3/account` GET, one `/api/v3/openOrders`
+GET, and a read-only report of local execution state (via
+`ExecutionStateStore.open_read_only()` - see below) if any exists. Every
+detail string it produces is scrubbed for anything shaped like a
+signature or the literal secret values before being stored or printed,
+and it never calls `str()` on an exception type that could embed a full
+signed URL (e.g. a `requests` connection error) - see SECURITY.md for the
+complete list of guarantees this command carries.
 
 ## Data flow for a single decision cycle (testnet mode)
 
@@ -245,3 +275,18 @@ CLI. There is no concurrent-writer scenario in V0.1 (one CLI invocation
 runs at a time), so a lightweight, hand-written schema is preferred over an
 ORM's abstraction for a project whose priority is auditability over
 developer convenience at scale.
+
+That single-invocation assumption is exactly what does NOT hold once
+automatic scheduling exists (a cron job, a daemon) - see
+[SCHEDULING_DESIGN.md](SCHEDULING_DESIGN.md) for the overlap-guard design
+(a single-instance process lock, a database-backed cycle lease with
+expiry, and candle-close-time uniqueness) required before that is safe to
+build. Nothing in that design is implemented yet.
+
+`ExecutionStateStore.open_read_only()` is a second, narrower exception to
+"one CLI invocation at a time": it opens a SQLite connection with the
+driver's own `mode=ro` URI flag specifically so that `testnet-health`
+(read-only by design) can safely inspect execution state while, in
+principle, another process holds the writable connection - a write
+attempted through the read-only connection fails at the SQLite layer,
+and it never creates the database file if one does not already exist.

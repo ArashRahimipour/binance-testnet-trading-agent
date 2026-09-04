@@ -20,28 +20,33 @@ docstring note on clock drift below `ClockDriftError`.
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import time
-import urllib.parse
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Literal
 
 import requests
 
-TESTNET_HOST = "https://testnet.binance.vision"
+from trading_agent.execution.binance_signing import (
+    DEFAULT_MAX_CLOCK_DRIFT_MS,
+    TESTNET_HOST,
+    BinanceApiError,
+    ClockDriftError,
+    auth_headers,
+    compute_clock_offset,
+    safe_json,
+    sign_params,
+)
 
-# Generous relative to Binance's default recvWindow (5000ms) and max
-# (60000ms), but still small enough to catch a genuinely misconfigured
-# system clock before it causes a confusing -1021 error mid-trade.
-DEFAULT_MAX_CLOCK_DRIFT_MS = 1000
-
-
-class ClockDriftError(Exception):
-    """Raised when the local clock disagrees with Binance's server time by
-    more than the configured tolerance. Fail closed rather than sign
-    requests with a timestamp that might fall outside recvWindow."""
+__all__ = [
+    "DEFAULT_MAX_CLOCK_DRIFT_MS",
+    "TESTNET_HOST",
+    "BinanceApiError",
+    "ClockDriftError",
+    "Fill",
+    "OrderResult",
+    "TestnetBrokerAdapter",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,14 +67,6 @@ class OrderResult:
     transact_time_ms: int
     fills: list[Fill] = field(default_factory=list)
     raw: dict = field(default_factory=dict)
-
-
-class BinanceApiError(Exception):
-    def __init__(self, status_code: int, code: int | None, message: str) -> None:
-        super().__init__(f"Binance API error {code}: {message} (HTTP {status_code})")
-        self.status_code = status_code
-        self.code = code
-        self.message = message
 
 
 class TestnetBrokerAdapter:
@@ -111,28 +108,15 @@ class TestnetBrokerAdapter:
         Testnet and its public endpoints share one clock.
         """
         local_time_ms = int(time.time() * 1000)
-        offset_ms = server_time_ms - local_time_ms
-        if abs(offset_ms) > self._max_clock_drift_ms:
-            raise ClockDriftError(
-                f"local clock drift {offset_ms}ms exceeds max allowed "
-                f"{self._max_clock_drift_ms}ms - refusing to sign requests"
-            )
+        offset_ms = compute_clock_offset(server_time_ms, local_time_ms, self._max_clock_drift_ms)
         self._clock_offset_ms = offset_ms
         return offset_ms
 
     def _headers(self) -> dict:
-        return {"X-MBX-APIKEY": self._api_key}
+        return auth_headers(self._api_key)
 
     def _sign(self, params: dict) -> dict:
-        signed = dict(params)
-        signed.setdefault("timestamp", int(time.time() * 1000) + self._clock_offset_ms)
-        signed.setdefault("recvWindow", self._recv_window_ms)
-        query_string = urllib.parse.urlencode(signed)
-        signature = hmac.new(
-            self._api_secret.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256
-        ).hexdigest()
-        signed["signature"] = signature
-        return signed
+        return sign_params(self._api_secret, params, self._clock_offset_ms, self._recv_window_ms)
 
     def _request(self, method: Literal["GET", "POST", "DELETE"], path: str, params: dict) -> dict:
         signed_params = self._sign(params)
@@ -147,10 +131,7 @@ class TestnetBrokerAdapter:
 
     @staticmethod
     def _safe_json(response: requests.Response) -> dict:
-        try:
-            return response.json()
-        except ValueError:
-            return {}
+        return safe_json(response)
 
     def place_market_order(
         self, symbol: str, side: Literal["BUY", "SELL"], quantity: Decimal, client_order_id: str

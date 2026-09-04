@@ -104,6 +104,49 @@ it; do not include real credentials or account details in the report.
   position that already exists and has been fully reconciled - never to
   open or add to one. See RISK_POLICY.md's "Protective exits" section.
 
+## Read-only Testnet connectivity check (`testnet-health`)
+
+`trading-agent --mode testnet testnet-health` (`execution/testnet_health.py`)
+exists to verify connectivity and credentials before relying on `run`, with
+its own, stronger set of structural guarantees on top of the ones above:
+
+- It has **no reference to `place_market_order` anywhere in its source or
+  import graph** - it does not import `execution/testnet_adapter.py` at
+  all (the one class in this codebase capable of placing, canceling, or
+  modifying an order). It talks to Testnet only through
+  `execution/testnet_readonly.py::ReadOnlyTestnetClient`, a separate class
+  with no such method to call in the first place, sharing only pure,
+  side-effect-free signing primitives (`execution/binance_signing.py`)
+  with the order-capable class - neither depends on the other.
+  `tests/unit/test_testnet_health.py` proves this at the source level, not
+  just behaviorally.
+- Its one internal request method is hard-wired to `requests.Session.get`
+  - there is no `method` parameter anywhere in that class that could turn
+  a call into a POST, PUT, PATCH, or DELETE.
+- It never opens local state in a way that could create it: a missing
+  execution-state database is reported as absent, never created
+  (`ExecutionStateStore.open_read_only()`, which returns `None` for a
+  missing file and otherwise opens the connection with SQLite's own
+  `mode=ro` URI flag, so even a bug attempting a write through it fails at
+  the SQLite layer, not merely by convention). It never calls any of
+  `ExecutionStateStore`'s write methods.
+- Every detail string it produces is passed through a scrubbing step
+  before being stored or printed, stripping anything shaped like
+  `signature=...` and the literal secret values if they ever appeared -
+  defense in depth on top of never calling `str()` on an exception type
+  (e.g. a `requests` connection error) that could embed a full signed URL.
+  `tests/unit/test_testnet_health.py` proves the secret and any signature
+  never appear in the report, in CLI stdout/stderr, or in an induced
+  invalid-credentials failure.
+- It fails closed: invalid credentials, excessive clock drift, and a
+  malformed or incomplete exchange-info response (missing or zero
+  required filters) each produce a sanitized failure and a non-zero exit,
+  and a failure at an earlier step (clock sync, exchange info) means no
+  later, signed request is ever attempted at all.
+- A nonzero BTC balance is reported as information, never treated as a
+  failure - this command's job is connectivity/credentials health, not an
+  opinion about account state.
+
 ## Data integrity
 
 Missing, stale, duplicated, or out-of-order candle data blocks trading

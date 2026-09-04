@@ -165,6 +165,38 @@ your actual Testnet account balance. If that account already holds a
 nonzero base-asset balance, the agent refuses to start rather than guess a
 cost basis - flatten the position manually via the Testnet UI first.
 
+### Read-only Testnet connectivity check
+
+```bash
+trading-agent --mode testnet testnet-health
+```
+
+Before running `run` for the first time (or after rotating credentials, or
+just to check things are working), this command verifies connectivity and
+credentials **without ever placing, canceling, or modifying anything**:
+server time, clock sync, BTCUSDT exchange filters, a signed account-info
+call, and an open-orders query - all GET requests, nothing else. It also
+reports (never modifies) local execution-state presence, a balance
+comparison against the exchange when local state exists, and any
+unresolved local pending orders. Exits non-zero on any failure - invalid
+credentials, excessive clock drift, or a malformed/incomplete exchange
+response all fail closed rather than reporting a false pass. Never prints
+API keys, secrets, signatures, or signed query strings. See
+[SECURITY.md](SECURITY.md) and [RISK_POLICY.md](RISK_POLICY.md) for the
+full list of structural guarantees, and `tests/unit/test_testnet_health.py`
+for their proofs.
+
+```
+[PASS] server_time: serverTime=1700000000000
+[PASS] clock_sync: offset_ms=12
+[PASS] exchange_info: tick_size=0.01 step_size=0.00001 min_qty=0.00001 min_notional=5
+[PASS] account_info: signed GET /api/v3/account succeeded
+[PASS] balances: BTC: free=0 locked=0; USDT: free=50 locked=0
+[PASS] open_orders: 0 open order(s): none
+[PASS] local_state: no local execution-state database present
+overall: PASS
+```
+
 ### Kill switch
 
 ```bash
@@ -193,6 +225,7 @@ secrets).
 - [STRATEGY.md](STRATEGY.md) - the baseline strategy's exact rules and limitations
 - [TESTING.md](TESTING.md) - what is tested and how
 - [SECURITY.md](SECURITY.md) - secret handling, endpoint restrictions, reporting
+- [SCHEDULING_DESIGN.md](SCHEDULING_DESIGN.md) - the overlap-guard design required before any automatic scheduling is built (not yet implemented)
 - [CHANGELOG.md](CHANGELOG.md) - version history
 
 ## Official Binance documentation consulted

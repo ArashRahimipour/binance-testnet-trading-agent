@@ -1,6 +1,6 @@
 # Testing
 
-253 tests, all offline: nothing in the suite makes a real network call or
+282 tests, all offline: nothing in the suite makes a real network call or
 requires real credentials. HTTP is mocked with the `responses` library at
 the point where `requests` would otherwise reach the network; time-
 sensitive behavior is tested by passing explicit reference timestamps
@@ -47,6 +47,10 @@ ruff check src tests       # lint
 | Cost-aware, risk-budget stop-loss position sizing | `tests/unit/test_risk_based_position_sizer.py`, `test_backtest_engine.py::test_ordinary_stop_hit_stays_within_risk_budget`, `::test_gap_through_stop_can_exceed_risk_budget`, `::test_risk_budget_sizing_produces_smaller_position_for_smaller_risk_pct` |
 | Server-time sync / clock drift | `tests/unit/test_testnet_adapter.py::test_sync_time_*`, `::test_timestamp_outside_recv_window_error_propagates`, `test_live_runner.py::test_excessive_clock_drift_fails_closed` |
 | Historical-data pagination, retries, rate limits, dedup | `tests/unit/test_historical_fetch.py` |
+| `testnet-health`: GET-only, no order-placement capability reachable | `tests/unit/test_testnet_health.py::test_happy_path_passes_and_only_get_requests_occur`, `::test_testnet_health_module_never_references_place_market_order`, `::test_testnet_readonly_module_never_references_place_market_order`, `test_testnet_readonly.py::test_has_no_order_placing_method_at_all`, `::test_no_request_is_ever_a_post_put_patch_or_delete` |
+| `testnet-health`: no local state created or modified | `tests/unit/test_testnet_health.py::test_no_database_or_local_state_file_created_when_none_exists`, `::test_existing_local_state_is_not_modified`, `::test_pending_orders_reported_but_not_reconciled`, `test_execution_store.py::test_open_read_only_returns_none_and_creates_nothing_when_file_absent`, `::test_open_read_only_connection_rejects_writes` |
+| `testnet-health`: secrets/signatures never leak | `tests/unit/test_testnet_health.py::test_secret_never_appears_in_report_on_happy_path`, `::test_secret_never_appears_on_invalid_credentials_failure`, `::test_secret_never_appears_in_cli_stdout_or_stderr` |
+| `testnet-health`: balance/open-order reporting, fail-closed behavior | `tests/unit/test_testnet_health.py::test_nonzero_btc_balance_is_reported_as_information_not_a_failure`, `::test_locked_balances_are_reported`, `::test_open_orders_are_displayed_without_modification`, `::test_excessive_clock_drift_fails_closed_before_any_signed_request`, `::test_malformed_exchange_information_fails_closed`, `::test_invalid_credentials_produce_a_sanitized_failure` |
 
 ## Fixtures
 
@@ -62,7 +66,10 @@ ruff check src tests       # lint
   behave correctly given a certain HTTP response, not that the Testnet
   actually returns that response in every case.
 - Concurrency / multi-process access to the SQLite files - V0.1 assumes
-  one CLI invocation at a time (see ARCHITECTURE.md).
+  one CLI invocation at a time (see ARCHITECTURE.md). Automatic scheduling
+  is not implemented at all yet - see
+  [SCHEDULING_DESIGN.md](SCHEDULING_DESIGN.md) for the overlap-guard
+  design required before it can be, which therefore also has no tests.
 - A Testnet-native protective order (OCO / `STOP_LOSS_LIMIT`) - not
   implemented at all in this revision, so there is nothing to test; see
   RISK_POLICY.md's "Protective exits" section for why, and what would need

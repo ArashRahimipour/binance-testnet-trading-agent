@@ -2,6 +2,57 @@
 
 All notable changes to this project are documented here.
 
+## [0.1.3] - Read-only Testnet connectivity check
+
+Added `trading-agent --mode testnet testnet-health`: a strictly read-only
+diagnostic command for verifying Testnet connectivity and credentials
+before relying on `run`. Adds 29 tests (253 -> 282 total).
+
+### Added
+
+- `execution/binance_signing.py`: shared, side-effect-free HMAC signing
+  and clock-offset primitives, extracted from `execution/testnet_adapter.py`
+  without changing its behavior, so both the order-capable adapter and the
+  new read-only client build on the same signing logic without either
+  depending on the other.
+- `execution/testnet_readonly.py::ReadOnlyTestnetClient`: a Testnet client
+  with no `place_market_order` method and no code path capable of issuing
+  a POST/PUT/PATCH/DELETE - its one internal request method is hard-wired
+  to `requests.Session.get`. Provides signed `get_account_balances()` and
+  `get_open_orders()`; public server-time and exchange-info calls reuse
+  the existing `BinancePublicMarketDataClient`.
+- `execution/testnet_health.py::run_testnet_health_check`: fetches server
+  time, synchronizes and reports clock offset, fetches and validates
+  BTCUSDT exchange filters, performs one signed account-info GET, reports
+  free/locked BTC and USDT balances (a nonzero BTC balance is information,
+  not a failure), queries open BTCUSDT orders via GET, and - read-only,
+  via `ExecutionStateStore.open_read_only()` - reports whether local
+  execution state exists, compares it against Testnet balances only when
+  it does, and reports any unresolved local pending orders without
+  reconciling them. Fails closed on invalid credentials, excessive clock
+  drift, or malformed/incomplete exchange filters. Every detail string is
+  scrubbed for signatures and secret values before being stored or
+  printed.
+- `ExecutionStateStore.open_read_only()`: opens an existing execution-state
+  database with SQLite's own `mode=ro` URI flag; returns `None` (creating
+  nothing) if the file does not exist.
+- `SCHEDULING_DESIGN.md`: a design-only specification (no implementation)
+  for the overlap-guard mechanism required before any automatic scheduling
+  of `run` is built - a single-instance process lock, a database-backed
+  cycle lease with expiry, uniqueness by symbol and candle close time, and
+  recovery from a process dying while holding the lease.
+
+### Guarantees added (see SECURITY.md for the full list)
+
+- `testnet-health` has no reference to `place_market_order` anywhere in
+  its source or import graph - it does not import
+  `execution/testnet_adapter.py` at all - proven at the source level in
+  `tests/unit/test_testnet_health.py`, not just behaviorally.
+- Never creates a local execution-state database or file that does not
+  already exist, and never modifies one that does.
+- Never prints API keys, secrets, signed query strings, headers, or
+  signatures, in the report, CLI output, or an induced failure.
+
 ## [0.1.2] - Second independent review response
 
 A second independent review of the round-1 fixes (commit `fde56d7`) found
