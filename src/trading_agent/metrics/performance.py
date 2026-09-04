@@ -52,6 +52,20 @@ class Trade:
     #: the strategy-exit value so existing positional callers (tests that
     #: predate this field) are unaffected.
     exit_reason: str = EXIT_REASON_STRATEGY
+    #: `entry_fee_quote + exit_fee_quote == fees_paid` always - these are
+    #: additive instrumentation (the values were already computed by the
+    #: broker; this only exposes the entry/exit split for reporting) and
+    #: change no fee/slippage calculation. Default 0 for pre-existing
+    #: positional callers that predate this field.
+    entry_fee_quote: Decimal = Decimal(0)
+    exit_fee_quote: Decimal = Decimal(0)
+    #: The pre-slippage reference price the engine used to size/decide the
+    #: fill (the next candle's open - see backtest/engine.py) - recorded
+    #: alongside the post-slippage `entry_price`/`exit_price` purely so a
+    #: slippage cost in quote currency can be reported. No slippage
+    #: computation itself is changed by recording this.
+    entry_reference_price: Decimal = Decimal(0)
+    exit_reference_price: Decimal = Decimal(0)
 
 
 @dataclass(frozen=True, slots=True)

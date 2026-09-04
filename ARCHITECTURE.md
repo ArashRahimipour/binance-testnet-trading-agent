@@ -214,6 +214,23 @@ independent entry points built on the SAME per-candle loop
   parameters are identical and fixed across all three windows; only the
   starting balance and risk state are reset.
 
+`metrics/extended_report.py` computes a further, purely read-only layer of
+diagnostics from a window's already-produced trades/equity curve - never
+re-simulating or tuning anything: an explicit accounting-identity check
+(`ending_equity = ending_cash + ending_base_quantity * final_mark_price`),
+a PnL breakdown (realized/unrealized/total, entry/exit fees, slippage cost,
+never inventing an exit for a still-open position), evidence-backed
+explanations for an ending open position / entries exceeding closed trades
+/ why trading stopped, time-based performance (CAGR, monthly returns,
+longest underwater period, exposure-adjusted return, Calmar ratio),
+trade-distribution statistics, a deterministic fixed-seed bootstrap
+confidence interval (with a permanent caveat that it does not preserve
+market-regime ordering), and chronological rolling-window diagnostics that
+never rank or select a configuration. `metrics/diagnostics.py` holds
+`RunDiagnostics`/`ShutdownActivation`/`OpenPositionInfo` - split out from
+`backtest/engine.py` specifically so `extended_report.py` can depend on
+them without a circular import.
+
 ## Crash recovery, the pending-order state machine, and the atomic transaction boundary
 
 A process can die at any point: before sending an order, mid-HTTP-call, after

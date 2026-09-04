@@ -218,6 +218,46 @@ Set `gap_policy: reject` to restore the original strict behavior (any gap
 raises and aborts the backtest) if you would rather investigate a gap
 manually before trusting a segmented result.
 
+### Extended diagnostics on every window/segment
+
+Every window (a holdout window, a continuous-mode split, or a gap segment)
+also prints an extended diagnostics block - `metrics/extended_report.py` -
+built purely from that window's own already-computed trades and equity
+curve, never re-simulating or tuning anything:
+
+- **Accounting identity**: `ending_equity = ending_cash + ending_base_quantity
+  * final_mark_price` is computed and compared explicitly, not assumed.
+- **PnL breakdown**: realized closed-trade PnL, unrealized PnL on an ending
+  open position (marked at the final available price - no exit is ever
+  invented for it), total mark-to-market PnL, entry/exit fees split apart,
+  a note on why backtest fees are always simulated estimates (never
+  exchange-derived - this code path never talks to a real exchange), and
+  total slippage cost.
+- **Plain-language explanations**, backed by the same evidence as the
+  diagnostics above: why a window ends with an open position, why executed
+  entries can exceed closed-trade counts (an entry with no exit yet isn't a
+  closed trade), and why trading stopped - naming the exact latched
+  risk-gate shutdown when there is one, or noting that the strategy itself
+  simply produced no further signal when there isn't.
+- **Time-based performance**: CAGR, a monthly return series, % of positive
+  months, the longest underwater period, an exposure-adjusted return, and a
+  Calmar ratio - each with a note on when it is mathematically undefined.
+- **Trade-distribution diagnostics**: median trade return, average/largest
+  winner and loser, the best trade's contribution to total PnL and the
+  result excluding it, consecutive win/loss streaks, and the holding-period
+  distribution.
+- **A deterministic (fixed-seed) bootstrap confidence interval** over the
+  window's own closed trades - always printed with a prominent caveat that
+  it does not preserve chronological/market-regime ordering and is not
+  evidence of future profitability.
+- **Chronological rolling-window diagnostics** (fixed trade-count groups,
+  using the same already-configured strategy parameters throughout) -
+  purely for inspection; nothing here ranks, optimizes, or selects a
+  configuration.
+- A **test window is explicitly marked already-consumed** once its results
+  have been reported, with a warning against reusing it as an untouched
+  final holdout for any future strategy selection.
+
 ## Running on the Spot Testnet
 
 ```bash

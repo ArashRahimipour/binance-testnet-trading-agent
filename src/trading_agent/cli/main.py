@@ -35,6 +35,7 @@ from trading_agent.data.storage import CandleStore
 from trading_agent.execution.live_runner import ColdStartReconciliationError, run_testnet_cycle
 from trading_agent.execution.testnet_health import run_testnet_health_check
 from trading_agent.journal.journal import Journal
+from trading_agent.metrics.extended_report import ExtendedDiagnosticsReport
 from trading_agent.persistence.execution_store import ExecutionStateStore
 from trading_agent.persistence.risk_state_store import RiskStateStore
 from trading_agent.risk.kill_switch import KillSwitch
@@ -216,6 +217,8 @@ def backtest_cmd(ctx: click.Context) -> None:
                 )
         if seg.diagnostics is not None:
             _print_diagnostics(seg.diagnostics, indent="    ")
+        if seg.extended is not None:
+            _print_extended_diagnostics(seg.extended, indent="    ")
     if result.gaps:
         click.echo(
             "WARNING: results across gaps are NOT one continuous tradable equity history - "
@@ -248,8 +251,10 @@ def backtest_cmd(ctx: click.Context) -> None:
                 f"exposure_pct={report.exposure_pct:.1f} turnover={report.turnover:.2f} "
                 f"strategy_exits={report.strategy_exit_count} stop_loss_exits={report.stop_loss_exit_count}"
             )
+            if split in result.extended_reports:
+                _print_extended_diagnostics(result.extended_reports[split], indent="")
         if result.diagnostics is not None:
-            click.echo("--- diagnostics (continuous run) ---")
+            click.echo("--- diagnostics (continuous run, whole segment) ---")
             _print_diagnostics(result.diagnostics, indent="")
     elif result.aggregate_trade_stats is not None:
         agg = result.aggregate_trade_stats
@@ -288,6 +293,7 @@ def backtest_cmd(ctx: click.Context) -> None:
                 "never carried into the next window, no exit price invented."
             )
         _print_diagnostics(window.diagnostics, indent="    ")
+        _print_extended_diagnostics(window.extended, indent="    ")
     for warning in holdout.warnings:
         click.echo(f"WARNING (holdout evaluation): {warning}", err=True)
 
@@ -331,6 +337,90 @@ def _print_shutdown_activation(activation: ShutdownActivation, indent: str) -> N
         f"blocked_buy_count={activation.blocked_buy_count} duration_ms={activation.duration_ms} "
         f"remained_latched_to_end={activation.remained_latched_to_end}"
     )
+
+
+def _print_extended_diagnostics(extended: ExtendedDiagnosticsReport, indent: str) -> None:
+    acc = extended.accounting
+    click.echo(
+        f"{indent}accounting_identity: ending_cash={acc.ending_cash_quote} + "
+        f"ending_base_quantity={acc.ending_base_quantity} * final_mark_price={acc.final_mark_price} "
+        f"= computed_ending_equity={acc.computed_ending_equity} "
+        f"(reported_ending_equity={acc.reported_ending_equity}, holds={acc.identity_holds})"
+    )
+
+    pnl = extended.pnl_breakdown
+    click.echo(
+        f"{indent}pnl: realized_closed_trade={pnl.realized_closed_trade_pnl_quote} "
+        f"unrealized_open_position={pnl.unrealized_open_position_pnl_quote} "
+        f"total_marked_to_market={pnl.total_marked_to_market_pnl_quote}"
+    )
+    click.echo(
+        f"{indent}fees: entry_total={pnl.entry_fees_total_quote} exit_total={pnl.exit_fees_total_quote} "
+        f"estimated={pnl.fees_are_estimated}  slippage_cost_total={pnl.slippage_cost_total_quote}"
+    )
+    if pnl.open_position_note:
+        click.echo(f"{indent}NOTE (open position): {pnl.open_position_note}")
+
+    expl = extended.explanation
+    if expl.open_position_reason:
+        click.echo(f"{indent}WHY open position: {expl.open_position_reason}")
+    click.echo(f"{indent}{expl.entries_vs_closed_trades_note}")
+    if expl.trading_stopped_reason:
+        click.echo(f"{indent}WHY trading stopped: {expl.trading_stopped_reason}")
+    if extended.scope_note:
+        click.echo(f"{indent}SCOPE NOTE: {extended.scope_note}")
+
+    tb = extended.time_based
+    click.echo(
+        f"{indent}time_based: cagr_pct={tb.cagr_pct} positive_months_pct={tb.positive_months_pct} "
+        f"longest_underwater_days={tb.longest_underwater_days} "
+        f"exposure_adjusted_return_pct={tb.exposure_adjusted_return_pct} calmar_ratio={tb.calmar_ratio}"
+    )
+    if tb.monthly_returns:
+        months = ", ".join(f"{m.year}-{m.month:02d}={m.return_pct:.2f}%" for m in tb.monthly_returns)
+        click.echo(f"{indent}monthly_returns: {months}")
+
+    td = extended.trade_distribution
+    if td is not None:
+        click.echo(
+            f"{indent}trade_distribution: median_return_pct={td.median_trade_return_pct} "
+            f"avg_winner={td.average_winner_quote} avg_loser={td.average_loser_quote} "
+            f"largest_winner={td.largest_winner_quote} largest_loser={td.largest_loser_quote}"
+        )
+        click.echo(
+            f"{indent}best_trade: pnl={td.best_trade_pnl_quote} "
+            f"contribution_pct={td.best_trade_contribution_pct} "
+            f"result_excluding_best_trade_quote={td.total_pnl_excluding_best_trade_quote} "
+            f"return_pct_excluding_best_trade={td.return_pct_excluding_best_trade}"
+        )
+        click.echo(
+            f"{indent}streaks: max_consecutive_wins={td.max_consecutive_wins} "
+            f"max_consecutive_losses={td.max_consecutive_losses}  "
+            f"holding_period_hours: min={td.holding_period.min_hours} "
+            f"median={td.holding_period.median_hours} mean={td.holding_period.mean_hours} "
+            f"max={td.holding_period.max_hours}"
+        )
+
+    bs = extended.bootstrap
+    click.echo(
+        f"{indent}bootstrap_ci (n_trades={bs.n_trades}, n_resamples={bs.n_resamples}, seed={bs.seed}, "
+        f"confidence={bs.confidence_level}): mean_return_pct={bs.mean_total_return_pct} "
+        f"ci=[{bs.ci_low_pct}, {bs.ci_high_pct}]"
+    )
+    click.echo(f"{indent}CAVEAT: {bs.caveat}")
+
+    rw = extended.rolling_windows
+    if rw.windows:
+        windows_str = ", ".join(
+            f"#{w.window_index}(n={w.trade_count}, return_pct={w.return_pct:.2f}, "
+            f"max_dd_pct={w.max_drawdown_pct:.2f})"
+            for w in rw.windows
+        )
+        click.echo(f"{indent}rolling_windows (trades_per_window={rw.trades_per_window}): {windows_str}")
+        click.echo(f"{indent}{rw.caveat}")
+
+    if extended.already_consumed_warning:
+        click.echo(f"{indent}WARNING: {extended.already_consumed_warning}")
 
 
 @cli.command("run")

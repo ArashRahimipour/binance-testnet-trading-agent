@@ -120,6 +120,11 @@ from trading_agent.data.validation import validate_candle_sequence
 from trading_agent.execution.backtest_broker import BacktestBroker, SimulatedFill
 from trading_agent.execution.order_validator import validate_order
 from trading_agent.journal.journal import Journal
+from trading_agent.metrics.diagnostics import OpenPositionInfo, RunDiagnostics, ShutdownActivation
+from trading_agent.metrics.extended_report import (
+    ExtendedDiagnosticsReport,
+    compute_extended_diagnostics,
+)
 from trading_agent.metrics.performance import (
     EXIT_REASON_STOP_LOSS,
     EXIT_REASON_STRATEGY,
@@ -160,52 +165,6 @@ HOLDOUT_EVALUATION_LABEL = (
 
 
 @dataclass(frozen=True, slots=True)
-class ShutdownActivation:
-    """Evidence for one risk-gate rejection reason code within a single
-    continuous run (a segment or a holdout window) - see the module
-    docstring's discussion of why a drawdown shutdown, once triggered while
-    flat, can never self-recover within that same run."""
-
-    reason_code: str
-    first_activated_time_ms: int
-    equity_at_activation: Decimal
-    drawdown_pct_at_activation: float
-    last_active_time_ms: int
-    blocked_buy_count: int
-    #: True when no BUY was approved again after this code first activated
-    #: - i.e. this run never recovered from it before it ended.
-    remained_latched_to_end: bool
-    duration_ms: int
-
-
-@dataclass(frozen=True, slots=True)
-class RunDiagnostics:
-    """Concrete, inspectable evidence for one continuous run (a segment in
-    `run_backtest`, or one window in `run_independent_holdout_evaluation`) -
-    exists so a claim like "the drawdown shutdown caused zero trades" is
-    always backed by exact counts and timestamps, never left as inference.
-    """
-
-    buy_signals_generated: int
-    exit_signals_generated: int
-    unexecuted_signals: int
-    executed_entries: int
-    executed_strategy_exits: int
-    executed_stop_loss_exits: int
-    rejected_entries_by_reason: dict[str, int]
-    first_executed_trade_time_ms: int | None
-    last_executed_trade_time_ms: int | None
-    max_drawdown_pct: float
-    max_drawdown_time_ms: int | None
-    shutdown_activations: dict[str, ShutdownActivation]
-    starting_equity: Decimal
-    ending_equity: Decimal
-    ending_cash_quote: Decimal
-    ending_base_quantity: Decimal
-    ends_with_open_position: bool
-
-
-@dataclass(frozen=True, slots=True)
 class SegmentReport:
     index: int
     start_time_ms: int
@@ -222,6 +181,8 @@ class SegmentReport:
     #: for having too few candles for indicator warm-up.
     performance: PerformanceReport | None = None
     diagnostics: RunDiagnostics | None = None
+    open_position: OpenPositionInfo | None = None
+    extended: ExtendedDiagnosticsReport | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,6 +229,10 @@ class BacktestResult:
     #: populated (see above). None when multiple segments ran - use each
     #: segment's own `diagnostics` in that case.
     diagnostics: RunDiagnostics | None = None
+    #: Extended diagnostics (accounting identity, PnL breakdown, time-based
+    #: and trade-distribution stats, bootstrap CI, rolling windows) keyed
+    #: the same as `reports` - populated only alongside `reports`.
+    extended_reports: dict[str, ExtendedDiagnosticsReport] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,6 +248,8 @@ class HoldoutWindowReport:
     diagnostics: RunDiagnostics
     ends_with_open_position: bool
     unresolved_pending_signal: str | None
+    open_position: OpenPositionInfo | None
+    extended: ExtendedDiagnosticsReport
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,6 +265,22 @@ class _OpenTrade:
     entry_price: Decimal
     quantity: Decimal
     entry_fee: Decimal
+    #: The pre-slippage reference price (the fill candle's open) - recorded
+    #: for slippage-cost reporting only; changes no fee/slippage/fill
+    #: calculation.
+    entry_reference_price: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class _PortfolioSnapshot:
+    """Cash/base/open-trade state at one candle - recorded alongside
+    `equity_curve` (same index alignment) purely so a later report can look
+    up the EXACT state at any split boundary within a continuous run,
+    without re-simulating anything or approximating."""
+
+    cash_quote: Decimal
+    base_quantity: Decimal
+    open_trade: _OpenTrade | None
 
 
 @dataclass
@@ -341,6 +324,15 @@ class _SegmentRunResult:
     ends_with_open_position: bool
     pending_signal_note: str | None
     diagnostics: RunDiagnostics
+    #: The still-open position's own entry economics when
+    #: `ends_with_open_position` is True - None otherwise. No exit is ever
+    #: invented for it; this only carries what already happened (the entry)
+    #: so unrealized PnL can be reported without fabricating a close.
+    open_position: OpenPositionInfo | None
+    #: Per-candle (cash, base, open_trade) snapshots, index-aligned with
+    #: `equity_curve` - lets a caller reconstruct the EXACT state at any
+    #: split boundary within this run (see `_PortfolioSnapshot`).
+    portfolio_snapshots: list[_PortfolioSnapshot]
 
 
 def run_backtest(
@@ -438,6 +430,19 @@ def run_backtest(
                 segment[min_required - 1 :], starting_equity, config.fees.taker_fee_pct
             ),
         )
+        segment_extended = _build_extended_diagnostics(
+            trades=result.trades,
+            equity_curve=result.equity_curve,
+            window_end_time_ms=segment[-1].close_time_ms,
+            starting_equity=starting_equity,
+            final_mark_price=segment[-1].close,
+            ending_cash_quote=result.diagnostics.ending_cash_quote,
+            ending_base_quantity=result.diagnostics.ending_base_quantity,
+            reported_ending_equity=result.diagnostics.ending_equity,
+            open_position=result.open_position,
+            report=segment_performance,
+            run_diagnostics=result.diagnostics,
+        )
 
         segment_reports.append(
             SegmentReport(
@@ -452,6 +457,8 @@ def run_backtest(
                 skipped_insufficient_candles=False,
                 performance=segment_performance,
                 diagnostics=result.diagnostics,
+                open_position=result.open_position,
+                extended=segment_extended,
             )
         )
 
@@ -468,6 +475,7 @@ def run_backtest(
         )
 
     reports: dict[str, PerformanceReport] = {}
+    extended_reports: dict[str, ExtendedDiagnosticsReport] = {}
     diagnostics: RunDiagnostics | None = None
     aggregate_trade_stats: AggregateTradeStats | None = None
     all_trades: list[Trade] = [t for _, _, r in used_results for t in r.trades]
@@ -507,6 +515,25 @@ def run_backtest(
                     f"significance threshold of {config.backtest.min_trades_for_significance} - "
                     "results are not statistically meaningful."
                 )
+
+            snapshot_idx = end_idx - offset - 1
+            is_whole_segment = start_idx == min_required - 1 and end_idx == n
+            snapshot = result.portfolio_snapshots[snapshot_idx] if 0 <= snapshot_idx < len(result.portfolio_snapshots) else None
+            extended_reports[split] = _build_extended_diagnostics(
+                trades=split_trades,
+                equity_curve=split_equity,
+                window_end_time_ms=segment[end_idx - 1].close_time_ms if end_idx > start_idx else segment[-1].close_time_ms,
+                starting_equity=starting_equity,
+                final_mark_price=segment[end_idx - 1].close if end_idx > start_idx else segment[-1].close,
+                ending_cash_quote=snapshot.cash_quote if snapshot else result.diagnostics.ending_cash_quote,
+                ending_base_quantity=snapshot.base_quantity if snapshot else result.diagnostics.ending_base_quantity,
+                reported_ending_equity=split_equity[-1].equity if split_equity else result.diagnostics.ending_equity,
+                open_position=_open_trade_to_info(snapshot.open_trade) if snapshot else result.open_position,
+                report=report,
+                run_diagnostics=result.diagnostics,
+                already_consumed=(split == "test"),
+                scope_note=None if is_whole_segment else _CONTINUOUS_SPLIT_SCOPE_NOTE,
+            )
         diagnostics = result.diagnostics
     elif len(used_results) > 1:
         total_realized = sum((t.pnl_quote for t in all_trades), Decimal(0))
@@ -536,6 +563,7 @@ def run_backtest(
         segments=segment_reports,
         aggregate_trade_stats=aggregate_trade_stats,
         diagnostics=diagnostics,
+        extended_reports=extended_reports,
     )
 
 
@@ -612,6 +640,22 @@ def run_independent_holdout_evaluation(
             if result.pending_signal_note is not None:
                 warnings.append(f"segment {seg_idx} {label}: {result.pending_signal_note}")
 
+            window_end_time_ms = segment[end_idx - 1].close_time_ms
+            extended = _build_extended_diagnostics(
+                trades=result.trades,
+                equity_curve=result.equity_curve,
+                window_end_time_ms=window_end_time_ms,
+                starting_equity=starting_equity,
+                final_mark_price=segment[end_idx - 1].close,
+                ending_cash_quote=result.diagnostics.ending_cash_quote,
+                ending_base_quantity=result.diagnostics.ending_base_quantity,
+                reported_ending_equity=result.diagnostics.ending_equity,
+                open_position=result.open_position,
+                report=report,
+                run_diagnostics=result.diagnostics,
+                already_consumed=(label == "test"),
+            )
+
             windows.append(
                 HoldoutWindowReport(
                     segment_index=seg_idx,
@@ -619,12 +663,14 @@ def run_independent_holdout_evaluation(
                     warm_up_start_time_ms=segment[warm_up_start_idx].open_time_ms,
                     warm_up_candle_count=min_required - 1,
                     window_start_time_ms=segment[start_idx].open_time_ms,
-                    window_end_time_ms=segment[end_idx - 1].close_time_ms,
+                    window_end_time_ms=window_end_time_ms,
                     candle_count=end_idx - start_idx,
                     performance=report,
                     diagnostics=result.diagnostics,
                     ends_with_open_position=result.ends_with_open_position,
                     unresolved_pending_signal=result.pending_signal_note,
+                    open_position=result.open_position,
+                    extended=extended,
                 )
             )
 
@@ -673,6 +719,7 @@ def _run_segment(
     pending_signal: SignalType | None = None
     trades: list[Trade] = []
     equity_curve: list[EquityPoint] = []
+    portfolio_snapshots: list[_PortfolioSnapshot] = []
     current_day: int | None = None
     n = len(segment)
 
@@ -727,6 +774,13 @@ def _run_segment(
                 timestamp_ms=candle.close_time_ms,
                 equity=state.portfolio.equity(candle.close),
                 in_position=state.portfolio.position_side == PositionSide.LONG,
+            )
+        )
+        portfolio_snapshots.append(
+            _PortfolioSnapshot(
+                cash_quote=state.portfolio.quote_balance,
+                base_quantity=state.portfolio.base_balance,
+                open_trade=state.open_trade,
             )
         )
 
@@ -787,6 +841,20 @@ def _run_segment(
         ends_with_open_position=state.portfolio.position_side == PositionSide.LONG,
         pending_signal_note=pending_signal_note,
         diagnostics=diagnostics,
+        open_position=_open_trade_to_info(state.open_trade),
+        portfolio_snapshots=portfolio_snapshots,
+    )
+
+
+def _open_trade_to_info(open_trade: _OpenTrade | None) -> OpenPositionInfo | None:
+    if open_trade is None:
+        return None
+    return OpenPositionInfo(
+        entry_time_ms=open_trade.entry_time_ms,
+        entry_price=open_trade.entry_price,
+        entry_reference_price=open_trade.entry_reference_price,
+        quantity=open_trade.quantity,
+        entry_fee_quote=open_trade.entry_fee,
     )
 
 
@@ -872,13 +940,15 @@ def _resolve_pending_signal(
         fill = broker.simulate_buy(quantity, reference_price)
         state.portfolio = apply_buy(state.portfolio, quantity, fill.fill_price, fill.fee_quote)
         state.stop_price = fill.fill_price * (1 - Decimal(str(config.stop_loss.stop_distance_pct)))
-        state.open_trade = _OpenTrade(candle.open_time_ms, fill.fill_price, quantity, fill.fee_quote)
+        state.open_trade = _OpenTrade(candle.open_time_ms, fill.fill_price, quantity, fill.fee_quote, reference_price)
         state.trades_today += 1
         diag.executed_entries += 1
         diag.last_approved_buy_time_ms = candle.open_time_ms
     else:
         fill = broker.simulate_sell(quantity, reference_price)
-        state = _apply_exit_fill(state, candle.open_time_ms, quantity, fill, trades, config, EXIT_REASON_STRATEGY)
+        state = _apply_exit_fill(
+            state, candle.open_time_ms, quantity, fill, trades, config, EXIT_REASON_STRATEGY, reference_price
+        )
 
     return state, trades, peak_equity
 
@@ -898,7 +968,9 @@ def _execute_stop_exit(
     fill_reference_price = min(state.stop_price, candle.open)
     quantity = state.portfolio.base_balance
     fill = broker.simulate_sell(quantity, fill_reference_price)
-    state = _apply_exit_fill(state, candle.open_time_ms, quantity, fill, trades, config, EXIT_REASON_STOP_LOSS)
+    state = _apply_exit_fill(
+        state, candle.open_time_ms, quantity, fill, trades, config, EXIT_REASON_STOP_LOSS, fill_reference_price
+    )
     if journal is not None:
         journal.record(
             "STOP_LOSS_TRIGGERED",
@@ -916,6 +988,7 @@ def _apply_exit_fill(
     trades: list[Trade],
     config: AppConfig,
     exit_reason: str,
+    exit_reference_price: Decimal,
 ) -> _LoopState:
     pnl_before = state.portfolio.realized_pnl_quote
     open_trade = state.open_trade
@@ -933,6 +1006,10 @@ def _apply_exit_fill(
                 fees_paid=open_trade.entry_fee + fill.fee_quote,
                 pnl_quote=realized,
                 exit_reason=exit_reason,
+                entry_fee_quote=open_trade.entry_fee,
+                exit_fee_quote=fill.fee_quote,
+                entry_reference_price=open_trade.entry_reference_price,
+                exit_reference_price=exit_reference_price,
             )
         )
 
@@ -960,3 +1037,53 @@ def _max_drawdown_with_time(equity_curve: list[EquityPoint]) -> tuple[float, int
                 max_dd = drawdown
                 max_dd_time_ms = point.timestamp_ms
     return max_dd * 100, max_dd_time_ms
+
+
+#: Attached to a continuous-mode train/validation/test split's extended
+#: diagnostics: the signal/rejection/shutdown evidence shown there belongs
+#: to the WHOLE continuous segment this split is only a chronological label
+#: within (see the module docstring) - never scoped to the split alone.
+_CONTINUOUS_SPLIT_SCOPE_NOTE = (
+    "This split is a chronological label on ONE continuous run (see the module docstring) - the "
+    "signal/rejection/shutdown-activation counts above belong to the ENTIRE continuous segment, not "
+    "only to this split's own date range. For counts genuinely scoped to an independent window, use "
+    "run_independent_holdout_evaluation instead."
+)
+
+
+def _build_extended_diagnostics(
+    trades: list[Trade],
+    equity_curve: list[EquityPoint],
+    window_end_time_ms: int,
+    starting_equity: Decimal,
+    final_mark_price: Decimal,
+    ending_cash_quote: Decimal,
+    ending_base_quantity: Decimal,
+    reported_ending_equity: Decimal,
+    open_position: OpenPositionInfo | None,
+    report: PerformanceReport,
+    run_diagnostics: RunDiagnostics,
+    already_consumed: bool = False,
+    scope_note: str | None = None,
+) -> ExtendedDiagnosticsReport:
+    return compute_extended_diagnostics(
+        trades=trades,
+        equity_curve=equity_curve,
+        window_end_time_ms=window_end_time_ms,
+        starting_equity=starting_equity,
+        ending_cash_quote=ending_cash_quote,
+        ending_base_quantity=ending_base_quantity,
+        final_mark_price=final_mark_price,
+        reported_ending_equity=reported_ending_equity,
+        open_position=open_position,
+        executed_entries=run_diagnostics.executed_entries,
+        buy_signals_generated=run_diagnostics.buy_signals_generated,
+        exposure_pct=report.exposure_pct,
+        total_return_pct=report.total_return_pct,
+        annualized_return_pct=report.annualized_return_pct,
+        max_drawdown_pct=report.max_drawdown_pct,
+        shutdown_activations=run_diagnostics.shutdown_activations,
+        rejected_entries_by_reason=run_diagnostics.rejected_entries_by_reason,
+        already_consumed=already_consumed,
+        scope_note=scope_note,
+    )

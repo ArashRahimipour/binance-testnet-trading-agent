@@ -2,6 +2,81 @@
 
 All notable changes to this project are documented here.
 
+## [0.1.6] - Extended backtest diagnostics after the first real holdout result
+
+The first real run of v0.1.5's independent holdout evaluation against the
+full stored dataset showed the strategy has not passed the profitability
+gate (train +40.39%/16.43% max drawdown with 59 of 83 BUY signals rejected
+by `MAX_DRAWDOWN_SHUTDOWN`; validation and test each ended with an open,
+marked-to-market BTC position). Per that result, this release performs a
+diagnostic and reporting improvement ONLY - no strategy parameter, entry/
+exit rule, fee, slippage, stop-loss, sizing, or risk threshold was changed.
+Adds 28 tests (323 -> 351 total).
+
+### Added
+
+- `metrics/extended_report.py::ExtendedDiagnosticsReport`, attached to
+  every continuous-mode split, gap segment, and independent holdout
+  window:
+  - **Accounting identity** (`AccountingIdentity`): explicitly verifies
+    `ending_equity = ending_cash + ending_base_quantity * final_mark_price`
+    for that specific run and reports both sides, rather than assuming it.
+  - **PnL breakdown** (`PnlBreakdown`): realized closed-trade PnL,
+    unrealized PnL on an ending open position (marked at the final
+    available price - no exit fee/slippage/exit price is ever invented for
+    it), total mark-to-market PnL, entry/exit fees split apart (new
+    `Trade.entry_fee_quote`/`exit_fee_quote` fields), a note on why
+    backtest fees are always simulated estimates rather than
+    exchange-derived, and total slippage cost (new
+    `Trade.entry_reference_price`/`exit_reference_price` fields recording
+    the pre-slippage reference price alongside the existing post-slippage
+    fill price - additive instrumentation only, no fee/slippage
+    calculation changed).
+  - **Evidence-backed explanations** (`WindowExplanation`): why a window
+    ends with an open position, why executed entries can exceed closed
+    trade counts, and why trading stopped - naming the exact risk-gate
+    reason code and activation evidence when a latched shutdown explains
+    it, or noting the strategy simply produced no further signal when it
+    doesn't.
+  - **Time-based performance** (`TimeBasedPerformance`): CAGR, a monthly
+    return series, % of positive months, the longest underwater period,
+    an exposure-adjusted return, and a Calmar ratio - each documented with
+    when it is mathematically undefined.
+  - **Trade-distribution diagnostics** (`TradeDistribution`): median trade
+    return, average/largest winner and loser, the best trade's
+    contribution to total PnL and the result excluding it, consecutive
+    win/loss streaks, and the holding-period distribution.
+  - **A deterministic bootstrap confidence interval**
+    (`BootstrapConfidenceInterval`): fixed-seed trade resampling with
+    replacement, so the same trades always produce the same interval -
+    always paired with a prominent caveat that it does not preserve
+    chronological/market-regime ordering and is not evidence of future
+    profitability.
+  - **Chronological rolling-window diagnostics**
+    (`RollingWindowDiagnostics`): fixed-size, non-overlapping groups of
+    trades using the same already-configured strategy parameters
+    throughout - purely for inspection; never ranks, optimizes, or
+    selects among windows or configurations.
+  - An **already-consumed warning** on the test window specifically, once
+    its results have been reported, against reusing it as an untouched
+    final holdout for any future strategy selection.
+- `metrics/diagnostics.py`: `RunDiagnostics`/`ShutdownActivation` moved
+  here from `backtest/engine.py` (still re-exported from there), plus new
+  `OpenPositionInfo` - the still-open position's own entry economics at a
+  run's end, carried without ever inventing an exit for it.
+- `BacktestResult.extended_reports` (train/validation/test/overall, when a
+  single segment ran) and `SegmentReport.extended`/`HoldoutWindowReport.
+  extended` (every gap segment and holdout window) expose the above.
+
+### Unchanged, deliberately
+
+- EMA periods, entry/exit rules, fees, slippage, stop-loss, sizing, and
+  risk thresholds were not touched - this release only adds diagnostics
+  and reporting on top of results the engine already produces.
+- The continuous operational simulation and independent holdout evaluation
+  from v0.1.5 produce identical fills, fees, and equity curves; only new,
+  additional reporting fields were layered on top.
+
 ## [0.1.5] - Backtest evaluation/reporting correctness fixes
 
 The first real BTCUSDT backtest against the full stored 2020-01-01 to
