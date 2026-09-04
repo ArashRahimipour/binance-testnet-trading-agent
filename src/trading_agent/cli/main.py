@@ -8,12 +8,15 @@ one - click rejects any other value before any application code runs.
 from __future__ import annotations
 
 import sys
+import time
+from datetime import UTC, datetime
 
 import click
 
 from trading_agent.backtest.engine import run_backtest
 from trading_agent.config import AppConfig, Mode, load_config
 from trading_agent.config.loader import load_secrets
+from trading_agent.data.historical_fetch import DEFAULT_MAX_RETRIES, fetch_historical_range
 from trading_agent.data.ingestion import fetch_completed_candles, require_non_empty
 from trading_agent.data.market_data_public import (
     PRODUCTION_MARKET_DATA_HOST,
@@ -23,6 +26,7 @@ from trading_agent.data.storage import CandleStore
 from trading_agent.data.validation import validate_candle_sequence
 from trading_agent.execution.live_runner import ColdStartReconciliationError, run_testnet_cycle
 from trading_agent.journal.journal import Journal
+from trading_agent.persistence.pending_orders_store import PendingOrdersStore
 from trading_agent.persistence.portfolio_store import PortfolioStore
 from trading_agent.persistence.risk_state_store import RiskStateStore
 from trading_agent.risk.kill_switch import KillSwitch
@@ -73,14 +77,33 @@ def config_check(ctx: click.Context) -> None:
 
 
 @cli.command("fetch-data")
-@click.option("--limit", default=1000, show_default=True, help="Number of most recent completed candles to fetch.")
+@click.option("--limit", default=1000, show_default=True, help="Number of most recent completed candles to fetch (ignored if --start is given).")
+@click.option("--start", "start_str", default=None, help="ISO8601 UTC start date, e.g. 2020-01-01 - triggers a paginated multi-year-capable download.")
+@click.option("--end", "end_str", default=None, help="ISO8601 UTC end date (default: now). Only used with --start.")
+@click.option("--max-retries", default=DEFAULT_MAX_RETRIES, show_default=True, help="Max retries per page before giving up.")
 @click.pass_context
-def fetch_data(ctx: click.Context, limit: int) -> None:
-    """Fetch historical candles from the public read-only market-data host and store them."""
+def fetch_data(ctx: click.Context, limit: int, start_str: str | None, end_str: str | None, max_retries: int) -> None:
+    """Fetch historical candles from the public read-only market-data host and store them.
+
+    Without --start, fetches the most recent `--limit` completed candles in
+    a single request. With --start (optionally --end), pages through the
+    full date range - suitable for downloading multiple years of history.
+    """
     config: AppConfig = ctx.obj["config"]
     client = BinancePublicMarketDataClient(PRODUCTION_MARKET_DATA_HOST)
     try:
-        candles = fetch_completed_candles(client, config.market.symbol, config.market.interval, limit=limit)
+        if start_str:
+            start_ms = int(datetime.strptime(start_str, "%Y-%m-%d").replace(tzinfo=UTC).timestamp() * 1000)
+            end_ms = (
+                int(datetime.strptime(end_str, "%Y-%m-%d").replace(tzinfo=UTC).timestamp() * 1000)
+                if end_str
+                else int(time.time() * 1000)
+            )
+            candles = fetch_historical_range(
+                client, config.market.symbol, config.market.interval, start_ms, end_ms, max_retries=max_retries
+            )
+        else:
+            candles = fetch_completed_candles(client, config.market.symbol, config.market.interval, limit=limit)
         require_non_empty(candles)
         validate_candle_sequence(candles, config.market.interval)
     except Exception as exc:  # noqa: BLE001 - surfaced to the user, then exit
@@ -157,13 +180,17 @@ def run_cmd(ctx: click.Context) -> None:
 
     journal_path = config.paths.data_dir / "journal.db"
     risk_state_path = config.paths.data_dir / "risk_state.db"
+    pending_orders_path = config.paths.data_dir / "pending_orders.db"
     with (
         Journal(journal_path) as journal,
         PortfolioStore(config.paths.db_path) as portfolio_store,
         RiskStateStore(risk_state_path) as risk_state_store,
+        PendingOrdersStore(pending_orders_path) as pending_orders_store,
     ):
         try:
-            result = run_testnet_cycle(config, secrets, journal, portfolio_store, risk_state_store)
+            result = run_testnet_cycle(
+                config, secrets, journal, portfolio_store, risk_state_store, pending_orders_store
+            )
         except ColdStartReconciliationError as exc:
             click.echo(f"Cannot start: {exc}", err=True)
             sys.exit(1)

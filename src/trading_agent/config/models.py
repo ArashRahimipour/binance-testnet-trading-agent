@@ -74,6 +74,21 @@ class RiskConfig(BaseModel):
     max_consecutive_api_errors: int = Field(gt=0, default=3)
 
 
+class StopLossConfig(BaseModel):
+    """A fixed-percentage protective stop, used only in backtesting.
+
+    There is no verified exchange-resident protective order on Testnet in
+    this revision (see RISK_POLICY.md), so automatic entry is disabled
+    there entirely; this config only drives the backtest engine's
+    stop-loss simulation and risk-budget position sizing. A fixed
+    percentage is a deliberately simple, explainable placeholder - not a
+    claim that it is an optimal or sophisticated stop-placement method
+    (e.g. ATR-based stops are a natural future improvement).
+    """
+
+    stop_distance_pct: float = Field(gt=0, lt=1, default=0.05)
+
+
 class BacktestConfig(BaseModel):
     train_fraction: float = Field(gt=0, lt=1, default=0.6)
     validation_fraction: float = Field(gt=0, lt=1, default=0.2)
@@ -101,6 +116,7 @@ class AppConfig(BaseModel):
     sizing: SizingConfig = SizingConfig()
     fees: FeesConfig = FeesConfig()
     risk: RiskConfig = RiskConfig()
+    stop_loss: StopLossConfig = StopLossConfig()
     backtest: BacktestConfig = BacktestConfig()
     paths: PathsConfig = PathsConfig()
 

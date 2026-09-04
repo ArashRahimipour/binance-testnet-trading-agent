@@ -25,9 +25,16 @@ CREATE TABLE IF NOT EXISTS portfolio_state (
     position_side TEXT NOT NULL,
     avg_entry_price TEXT,
     realized_pnl_quote TEXT NOT NULL,
+    open_position_entry_fee TEXT NOT NULL DEFAULT '0',
+    pnl_is_estimated INTEGER NOT NULL DEFAULT 0,
     updated_at_ms INTEGER NOT NULL
 );
 """
+
+_MIGRATIONS = (
+    "ALTER TABLE portfolio_state ADD COLUMN open_position_entry_fee TEXT NOT NULL DEFAULT '0'",
+    "ALTER TABLE portfolio_state ADD COLUMN pnl_is_estimated INTEGER NOT NULL DEFAULT 0",
+)
 
 
 class PortfolioStore:
@@ -36,6 +43,15 @@ class PortfolioStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(path))
         self._conn.execute(_SCHEMA)
+        self._conn.commit()
+        self._apply_migrations()
+
+    def _apply_migrations(self) -> None:
+        existing_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(portfolio_state)")}
+        for migration in _MIGRATIONS:
+            column_name = migration.split("ADD COLUMN")[1].split()[0]
+            if column_name not in existing_columns:
+                self._conn.execute(migration)
         self._conn.commit()
 
     def close(self) -> None:
@@ -52,14 +68,16 @@ class PortfolioStore:
             """
             INSERT INTO portfolio_state
                 (symbol, quote_balance, base_balance, position_side, avg_entry_price,
-                 realized_pnl_quote, updated_at_ms)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                 realized_pnl_quote, open_position_entry_fee, pnl_is_estimated, updated_at_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol) DO UPDATE SET
                 quote_balance=excluded.quote_balance,
                 base_balance=excluded.base_balance,
                 position_side=excluded.position_side,
                 avg_entry_price=excluded.avg_entry_price,
                 realized_pnl_quote=excluded.realized_pnl_quote,
+                open_position_entry_fee=excluded.open_position_entry_fee,
+                pnl_is_estimated=excluded.pnl_is_estimated,
                 updated_at_ms=excluded.updated_at_ms
             """,
             (
@@ -69,6 +87,8 @@ class PortfolioStore:
                 state.position_side.value,
                 str(state.avg_entry_price) if state.avg_entry_price is not None else None,
                 str(state.realized_pnl_quote),
+                str(state.open_position_entry_fee),
+                int(state.pnl_is_estimated),
                 updated_at_ms,
             ),
         )
@@ -77,7 +97,8 @@ class PortfolioStore:
     def load(self, symbol: str) -> PortfolioState | None:
         cursor = self._conn.execute(
             """
-            SELECT quote_balance, base_balance, position_side, avg_entry_price, realized_pnl_quote
+            SELECT quote_balance, base_balance, position_side, avg_entry_price, realized_pnl_quote,
+                   open_position_entry_fee, pnl_is_estimated
             FROM portfolio_state WHERE symbol = ?
             """,
             (symbol,),
@@ -85,11 +106,21 @@ class PortfolioStore:
         row = cursor.fetchone()
         if row is None:
             return None
-        quote_balance, base_balance, position_side, avg_entry_price, realized_pnl_quote = row
+        (
+            quote_balance,
+            base_balance,
+            position_side,
+            avg_entry_price,
+            realized_pnl_quote,
+            open_position_entry_fee,
+            pnl_is_estimated,
+        ) = row
         return PortfolioState(
             quote_balance=Decimal(quote_balance),
             base_balance=Decimal(base_balance),
             position_side=PositionSide(position_side),
             avg_entry_price=Decimal(avg_entry_price) if avg_entry_price is not None else None,
             realized_pnl_quote=Decimal(realized_pnl_quote),
+            open_position_entry_fee=Decimal(open_position_entry_fee),
+            pnl_is_estimated=bool(pnl_is_estimated),
         )

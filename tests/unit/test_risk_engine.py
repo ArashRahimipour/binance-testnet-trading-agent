@@ -120,13 +120,25 @@ def test_exceeds_max_position_pct():
     assert decision.reason_code == "EXCEEDS_MAX_POSITION_PCT"
 
 
-def test_exceeds_max_risk_per_trade_pct():
+def test_max_risk_per_trade_pct_is_not_a_notional_gate_here():
+    # max_risk_per_trade_pct is consumed by the backtest's risk-budget sizer
+    # (sizing/position_sizer.py::compute_risk_based_buy_quantity), not
+    # re-checked here as a notional cap - a tight stop legitimately allows
+    # a larger notional for the same risk budget. Only max_position_pct is
+    # enforced as a notional ceiling in the risk engine.
     engine = RiskEngine(RiskConfig(max_position_pct=0.9, max_risk_per_trade_pct=0.02))
     ctx = _context(equity=Decimal(50))
-    # notional = 0.0004 * 50000 = 20 -> 40% of equity, under position cap but over 2% risk cap
+    # notional = 0.0004 * 50000 = 20 -> 40% of equity: under the 90% position
+    # cap, so this must be approved even though it dwarfs a 2% risk figure.
     decision = engine.evaluate(_buy_intent(quantity="0.0004", price="50000"), ctx)
-    assert decision.approved is False
-    assert decision.reason_code == "EXCEEDS_MAX_RISK_PER_TRADE"
+    assert decision.approved is True
+
+
+def test_reconciliation_blocked_blocks_buy_but_not_exit():
+    engine = RiskEngine(DEFAULT_CONFIG)
+    ctx = _context(reconciliation_blocked=True)
+    assert engine.evaluate(_buy_intent(), ctx).reason_code == "RECONCILIATION_DISCREPANCY_BLOCKS_ENTRY"
+    assert engine.evaluate(_exit_intent(), ctx).approved is True
 
 
 def test_exit_always_approved_when_no_universal_gate_triggered():

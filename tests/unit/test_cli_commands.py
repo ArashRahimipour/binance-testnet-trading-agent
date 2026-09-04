@@ -47,6 +47,28 @@ def test_fetch_data_stores_candles(tmp_path):
 
 
 @responses.activate
+def test_fetch_data_with_date_range_uses_paginated_path(tmp_path):
+    # A page shorter than the (large, default) page limit ends pagination
+    # after one request - full multi-page continuation is covered at the
+    # unit level in test_historical_fetch.py with a configurable page size.
+    # This proves --start/--end is correctly wired to the paginated fetch.
+    config_path = _write_config(tmp_path)
+    rows = make_kline_series(START, INTERVAL, 5)
+    responses.add(responses.GET, f"{PROD_HOST}/api/v3/time", json={"serverTime": rows[-1][6] + 1}, status=200)
+    responses.add(responses.GET, f"{PROD_HOST}/api/v3/klines", json=rows, status=200)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "--config", config_path, "fetch-data",
+            "--start", "2023-11-14", "--end", "2023-11-16",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Stored 5 completed candles" in result.output
+
+
+@responses.activate
 def test_backtest_command_end_to_end(tmp_path):
     config_path = _write_config(tmp_path)
     rows = make_kline_series(START, INTERVAL, 20)

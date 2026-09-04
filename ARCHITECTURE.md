@@ -41,11 +41,11 @@ fact.
 | `sizing/` | Exchange filter parsing/rounding and fixed-fractional position sizing |
 | `portfolio/` | Pure-function portfolio state machine (buy/sell transitions) and its SQLite persistence |
 | `risk/` | The independent `RiskEngine`, its data contracts, and the kill switch |
-| `execution/` | Order validator, idempotent client order IDs, the Testnet-only broker adapter, reconciliation, the backtest broker, and the single-cycle live runner |
-| `persistence/` | SQLite stores for portfolio state and live risk-tracking state |
+| `execution/` | Order validator, idempotent client order IDs, the Testnet-only broker adapter, order-outcome dispatch, timeout/uncertain-order and startup reconciliation, fee computation, the backtest broker, and the single-cycle live runner |
+| `persistence/` | SQLite stores for portfolio state, live risk-tracking state, and pending (in-flight) orders |
 | `journal/` | Append-only audit trail of every decision |
 | `metrics/` | Backtest performance report computation |
-| `backtest/` | The walk-forward backtest engine tying the above together |
+| `backtest/` | The chronological-holdout backtest engine tying the above together |
 | `cli/` | The `trading-agent` command-line entry point |
 | `logging_setup.py` | Structured JSON logging with mandatory secret redaction |
 
@@ -67,17 +67,91 @@ why that separation is load-bearing, not just tidiness.
 
 ## Data flow for a single decision cycle (testnet mode)
 
-1. Fetch server time and the latest completed candles from the Testnet's
-   public market-data endpoints (no API key needed for this).
-2. Validate the candle series (fail closed on staleness/gaps/duplicates).
-3. Load or reconcile portfolio state.
-4. Generate a signal from the completed candles only.
-5. If BUY/EXIT: size it, risk-check it, validate it, submit it via the
-   Testnet-only adapter, reconcile on timeout, update persisted state.
-6. Record every step in the journal.
+1. Fetch server time; call `TestnetBrokerAdapter.sync_time()` with it so
+   every signed request uses a bounded clock offset rather than the raw
+   local clock (fails closed with `ClockDriftError` on excessive drift).
+2. Fetch the latest completed candles from the Testnet's public
+   market-data endpoints (no API key needed for this) and validate the
+   series (fail closed on staleness/gaps/duplicates).
+3. Load or cold-start-reconcile portfolio state.
+4. **Resolve any pending order left over from a previous - possibly
+   crashed - run** (see "Crash recovery" below) BEFORE generating a new
+   signal. An order still open after this blocks new entries this cycle.
+5. **Reconcile local balances against the exchange's free+locked
+   balances**, every cycle, not just at cold start. A mismatch blocks new
+   entries (never exits, never overwrites local state with a guess).
+6. Generate a signal from the completed candles only. A BUY signal is
+   currently always suppressed on Testnet (see "Protective exits" in
+   RISK_POLICY.md); EXIT proceeds.
+7. If EXIT: size it, risk-check it, validate it, durably record the
+   intent (see below), submit it via the Testnet-only adapter, reconcile
+   before any retry on an ambiguous network failure, apply the order's
+   *actual* status via `order_outcome.py` (never substituting the
+   requested quantity), and update persisted state.
+8. Record every step in the journal.
 
-The backtest engine (`backtest/engine.py`) walks the same pipeline
-candle-by-candle over historical data, swapping only the broker.
+The backtest engine (`backtest/engine.py`) walks a similar pipeline
+candle-by-candle over historical data, swapping the broker for
+`BacktestBroker` and adding the queued-signal/next-open execution and
+stop-loss mechanics described in its module docstring.
+
+## Crash recovery and the pending-order state machine
+
+A process can die at any point: before sending an order, mid-HTTP-call, after
+Binance has filled it but before the response is processed, or after the
+response is processed but before the portfolio/risk state is persisted. The
+system must recover correctly from a crash at ANY of these points, without
+double-applying a fill or losing track of one.
+
+The mechanism is `persistence/pending_orders_store.py`, a durable table
+keyed by the deterministic client order ID:
+
+```
+                     write BEFORE the exchange call
+                                |
+                                v
+                         +--------------+
+                         |  SUBMITTED   |  applied_executed_qty = 0
+                         +--------------+
+                                |
+        (exchange call happens; process may crash here)
+                                |
+                                v
+              next cycle's reconciliation queries
+              get_order(client_order_id)
+                                |
+        +-----------+-----------+-----------+
+        |           |                       |
+   NOT_FOUND    still open              terminal
+  (-2013: the   (NEW /                (FILLED / CANCELED /
+   order never  PARTIALLY_FILLED)      REJECTED / EXPIRED)
+   reached                                   |
+   Binance)         |                        v
+        |           v                 apply_order_result()
+        v    apply the NEW delta      applies the full
+  mark RESOLVED,   only (never the    remaining delta,
+  no portfolio     full requested     mark RESOLVED
+  change            qty), STAY
+                    SUBMITTED,
+                    block new
+                    entries this
+                    cycle
+```
+
+Why writing the `SUBMITTED` row *before* the exchange call is what makes
+this correct: no matter when the crash happens, the next run finds a
+durable record it can resolve by asking Binance directly - there is no
+window where an order could have been sent but left no local trace. Exactly-
+once application is enforced by `applied_executed_qty`: `order_outcome.py`
+only ever applies `executed_qty - applied_executed_qty` (a Fill's own price
+and quantity is real information from Binance, not a guess), so observing
+the same order's status again - across cycles, after a crash, or both -
+never double-counts a fill. A row only leaves the `SUBMITTED` state once its
+outcome is terminal; a `NOT_FOUND` result is resolved immediately (nothing
+to apply), and a still-open order stays `SUBMITTED` and blocks new entries
+until a later cycle resolves it - the same order_outcome dispatch used
+right after normal submission is reused here, so a status means the same
+thing whether it is observed today or after a crash and restart.
 
 ## Why SQLite, why no ORM
 

@@ -105,3 +105,105 @@ def test_drawdown_shutdown_reduces_trades_when_very_strict():
     lenient = run_backtest(candles, _config(max_drawdown_pct=0.99), _filters())
     strict = run_backtest(candles, _config(max_drawdown_pct=0.0001), _filters())
     assert strict.reports["overall"].trade_count <= lenient.reports["overall"].trade_count
+
+
+# --- Review Finding 3: no same-close execution; fill depends on the NEXT candle's open. ---
+
+# closes[6] is a bullish EMA(3,6) crossover (BUY signal); closes[10] is a
+# bearish crossover (EXIT signal) - verified against ema() directly.
+_BUY_THEN_EXIT_CLOSES = [100, 99, 98, 97, 96, 95, 100, 105, 110, 115, 60, 60]
+
+
+def _candles_with_controlled_open(closes: list[float], open_overrides: dict[int, float]) -> list[Candle]:
+    opens = [open_overrides.get(i, c) for i, c in enumerate(closes)]
+    return [
+        Candle(
+            symbol="BTCUSDT",
+            interval=INTERVAL,
+            open_time_ms=START + i * STEP,
+            close_time_ms=START + i * STEP + STEP - 1,
+            open=Decimal(str(opens[i])),
+            high=Decimal(str(max(opens[i], closes[i]) + 5)),
+            low=Decimal(str(min(opens[i], closes[i]) - 5)),
+            close=Decimal(str(closes[i])),
+            volume=Decimal(1),
+        )
+        for i in range(len(closes))
+    ]
+
+
+def test_changing_next_candle_open_changes_the_fill_price():
+    # The BUY signal fires using candle 6's close (100), but must fill no
+    # earlier than candle 7's open - vary ONLY that open and the recorded
+    # entry price must move with it.
+    config = _config()
+    candles_a = _candles_with_controlled_open(_BUY_THEN_EXIT_CLOSES, {7: 90})
+    candles_b = _candles_with_controlled_open(_BUY_THEN_EXIT_CLOSES, {7: 110})
+
+    result_a = run_backtest(candles_a, config, _filters())
+    result_b = run_backtest(candles_b, config, _filters())
+
+    assert len(result_a.trades) >= 1
+    assert len(result_b.trades) >= 1
+    assert result_a.trades[0].entry_price != result_b.trades[0].entry_price
+    # Higher next-open must produce a higher (slippage-adjusted) fill.
+    assert result_b.trades[0].entry_price > result_a.trades[0].entry_price
+
+
+def test_no_trade_fills_at_the_signal_candles_own_close():
+    # closes[6] == 100 is the signal candle's close - no recorded trade's
+    # entry price may ever equal it, regardless of what candle 7's open is.
+    config = _config()
+    candles = _candles_with_controlled_open(_BUY_THEN_EXIT_CLOSES, {7: 100})
+    result = run_backtest(candles, config, _filters())
+    assert len(result.trades) >= 1
+    signal_candle_close = Decimal(100)
+    for trade in result.trades:
+        assert trade.entry_price != signal_candle_close
+
+
+def test_signal_on_final_candle_is_reported_as_unexecuted_not_filled():
+    # Truncate right after the BUY signal candle (index 6) - there is no
+    # candle 7 to resolve it against.
+    config = _config()
+    candles = _candles_with_controlled_open(_BUY_THEN_EXIT_CLOSES[:7], {})
+    result = run_backtest(candles, config, _filters())
+    assert result.trades == []  # never silently filled
+    assert result.unexecuted_final_signal is not None
+    assert "BUY" in result.unexecuted_final_signal
+    assert any("unexecuted" in w for w in result.warnings)
+
+
+# --- Review Finding 4: protective stop-loss, sized from risk budget / stop distance. ---
+
+
+def test_stop_loss_closes_position_when_low_breaches_stop():
+    # Entry fills at candle 7's open (90); default stop_distance_pct=0.05
+    # -> stop = 90 * 0.95 = 85.5. Candle 8 is engineered to gap its low
+    # well below that.
+    closes = [100, 99, 98, 97, 96, 95, 100, 100, 100]
+    candles = _candles_with_controlled_open(closes, {7: 90})
+    # Force candle 8's low far below the stop by rebuilding it directly.
+    candles[8] = Candle(
+        symbol="BTCUSDT", interval=INTERVAL,
+        open_time_ms=candles[8].open_time_ms, close_time_ms=candles[8].close_time_ms,
+        open=Decimal(100), high=Decimal(101), low=Decimal(70), close=Decimal(100),
+        volume=Decimal(1),
+    )
+    config = _config()
+    result = run_backtest(candles, config, _filters())
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    # Stop exit price must be at or below the stop level (85.5), never above it.
+    assert trade.exit_price <= Decimal("85.5")
+
+
+def test_risk_budget_sizing_produces_smaller_position_for_smaller_risk_pct():
+    candles = _candles(_zigzag_closes())
+    low_risk = run_backtest(candles, _config(max_risk_per_trade_pct=0.005), _filters())
+    high_risk = run_backtest(candles, _config(max_risk_per_trade_pct=0.05), _filters())
+    assert len(low_risk.trades) >= 1
+    assert len(high_risk.trades) >= 1
+    # Compare the first trade's quantity - a smaller risk budget must never
+    # produce a larger position for the same stop distance.
+    assert low_risk.trades[0].quantity <= high_risk.trades[0].quantity

@@ -59,12 +59,37 @@ Two separate mechanisms, at two different layers:
 The backtest engine (`backtest/engine.py`) reinforces this structurally:
 at step `i` it only ever passes `candles[:i+1]` to the strategy.
 
+## Execution timing: no same-close fills
+
+A signal detected from candle `i`'s close cannot realistically be filled
+at that same close price in the same instant - you cannot react to a
+candle closing and get a fill before the next one opens. So the backtest
+queues an actionable signal at the end of processing candle `i` and only
+resolves it (sizing, risk-checking, validating, and filling with adverse
+slippage and fees) at candle `i+1`'s open. A signal generated on the very
+last candle in a series has no `i+1` to resolve against and is reported
+as unexecuted in `BacktestResult.unexecuted_final_signal` and the run's
+warnings - never silently filled or dropped.
+`tests/unit/test_backtest_engine.py::test_changing_next_candle_open_changes_the_fill_price`
+and `::test_no_trade_fills_at_the_signal_candles_own_close` verify this
+directly.
+
+## Protective stop-loss (backtest only)
+
+Every backtest entry carries a stop price a fixed percentage below its
+fill price (`config.stop_loss.stop_distance_pct`), checked against every
+subsequent candle's low; a breach closes the full position intrabar at
+the worse of the stop price or that candle's open (modeling gap risk).
+Position size is `risk_budget / stop_distance` rather than a notional
+guess - see RISK_POLICY.md's "Protective exits" section for the full
+rationale and for why this is not yet live on Testnet.
+
 ## Fees and slippage in simulation
 
 `BacktestBroker` (`execution/backtest_broker.py`) applies a configurable
 taker fee and slippage to every simulated fill, and slippage always works
 **against** the trader (buys fill higher, sells fill lower than the
-candle close) - the backtest is never allowed to look better than a
+reference price) - the backtest is never allowed to look better than a
 conservative real execution would.
 
 ## Guards against double-buying and overselling
@@ -85,8 +110,9 @@ conservative real execution would.
 - It is not optimized, curve-fit, or selected because it produced the
   best historical return - see `backtest/engine.py`'s docstring and
   RISK_POLICY.md.
-- It has no stop-loss; its only exit is the trend-reversal signal. See
-  RISK_POLICY.md's discussion of `max_risk_per_trade_pct` for the
-  consequence of that.
+- Its only *signal-driven* exit is the trend-reversal crossover; the
+  backtest also attaches a protective stop-loss (see above), but that
+  stop is not yet live on Testnet - see RISK_POLICY.md's "Protective
+  exits" section.
 - It is long-or-cash only, matching the project's V0.1 constraints - no
   shorting, no leverage, no margin.

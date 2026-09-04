@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import inspect
+import time
 import urllib.parse
 from decimal import Decimal
 
@@ -10,6 +11,7 @@ import responses
 from trading_agent.execution.testnet_adapter import (
     TESTNET_HOST,
     BinanceApiError,
+    ClockDriftError,
     TestnetBrokerAdapter,
 )
 
@@ -67,16 +69,18 @@ def test_place_market_order_sends_client_order_id():
 
 
 @responses.activate
-def test_get_account_balances_parses_free_balances():
+def test_get_account_balances_parses_free_and_locked():
     responses.add(
         responses.GET,
         f"{TESTNET_HOST}/api/v3/account",
-        json={"balances": [{"asset": "USDT", "free": "50.00000000", "locked": "0"}]},
+        json={"balances": [{"asset": "USDT", "free": "50.00000000", "locked": "5.00000000"}]},
         status=200,
     )
     adapter = TestnetBrokerAdapter(api_key="k", api_secret="s")
     balances = adapter.get_account_balances()
-    assert balances["USDT"] == Decimal("50.00000000")
+    free, locked = balances["USDT"]
+    assert free == Decimal("50.00000000")
+    assert locked == Decimal("5.00000000")
 
 
 @responses.activate
@@ -91,3 +95,56 @@ def test_api_error_raises_with_code():
     with pytest.raises(BinanceApiError) as exc_info:
         adapter.get_order("BTCUSDT", "ta-missing")
     assert exc_info.value.code == -2013
+
+
+@responses.activate
+def test_timestamp_outside_recv_window_error_propagates():
+    responses.add(
+        responses.GET,
+        f"{TESTNET_HOST}/api/v3/order",
+        json={"code": -1021, "msg": "Timestamp for this request is outside of the recvWindow."},
+        status=400,
+    )
+    adapter = TestnetBrokerAdapter(api_key="k", api_secret="s")
+    with pytest.raises(BinanceApiError) as exc_info:
+        adapter.get_order("BTCUSDT", "ta-x")
+    assert exc_info.value.code == -1021
+
+
+def test_sync_time_computes_positive_offset_when_server_ahead():
+    adapter = TestnetBrokerAdapter(api_key="k", api_secret="s")
+    local_ms = int(time.time() * 1000)
+    offset = adapter.sync_time(server_time_ms=local_ms + 500)
+    assert offset > 0
+    assert offset == pytest.approx(500, abs=50)
+
+
+def test_sync_time_computes_negative_offset_when_server_behind():
+    adapter = TestnetBrokerAdapter(api_key="k", api_secret="s")
+    local_ms = int(time.time() * 1000)
+    offset = adapter.sync_time(server_time_ms=local_ms - 500)
+    assert offset < 0
+    assert offset == pytest.approx(-500, abs=50)
+
+
+def test_sync_time_raises_on_excessive_drift():
+    adapter = TestnetBrokerAdapter(api_key="k", api_secret="s", max_clock_drift_ms=1000)
+    local_ms = int(time.time() * 1000)
+    with pytest.raises(ClockDriftError):
+        adapter.sync_time(server_time_ms=local_ms + 50_000)
+
+
+def test_sync_time_within_tolerance_is_applied_to_signing():
+    adapter = TestnetBrokerAdapter(api_key="k", api_secret="s", max_clock_drift_ms=1000)
+    local_ms = int(time.time() * 1000)
+    adapter.sync_time(server_time_ms=local_ms + 300)
+    signed = adapter._sign({"symbol": "BTCUSDT"})
+    # signed timestamp should reflect local time + the learned offset, not raw local time.
+    assert signed["timestamp"] == pytest.approx(local_ms + 300, abs=100)
+
+
+def test_unsynced_adapter_defaults_to_zero_offset():
+    adapter = TestnetBrokerAdapter(api_key="k", api_secret="s")
+    local_ms = int(time.time() * 1000)
+    signed = adapter._sign({"symbol": "BTCUSDT"})
+    assert signed["timestamp"] == pytest.approx(local_ms, abs=100)

@@ -26,13 +26,16 @@ fees:
   slippage_pct: 0.0005
 
 risk:
-  max_position_pct: 0.90           # max fraction of equity in one position
-  # The baseline strategy has no stop-loss price, so there is no principled
-  # stop-distance-based "risk" to measure. max_risk_per_trade_pct is instead
-  # enforced as another cap on the trade's notional value as a fraction of
-  # equity (see risk/engine.py docstring). It defaults to the same value as
-  # max_position_pct; lower it independently for a stricter per-trade cap.
-  max_risk_per_trade_pct: 0.90
+  max_position_pct: 0.90           # max fraction of equity ever committed to one position (backtest and, if
+                                    # entry were enabled, testnet alike) - a notional ceiling, independent of risk sizing.
+  # max_risk_per_trade_pct is the fraction of equity the BACKTEST is willing
+  # to lose if the stop_loss (below) is hit, used directly by
+  # sizing/position_sizer.py::compute_risk_based_buy_quantity as
+  # `risk_budget = equity * max_risk_per_trade_pct`, sized against the
+  # stop distance - NOT re-checked as a notional cap (see risk/engine.py).
+  # Automatic entry is disabled on Testnet in this revision (RISK_POLICY.md),
+  # so this figure currently has no effect there at all.
+  max_risk_per_trade_pct: 0.02
   max_daily_loss_pct: 0.05         # trading halts for the day if exceeded
   max_drawdown_pct: 0.15           # trading halts entirely if exceeded (needs manual reset)
   max_trades_per_day: 4
@@ -40,6 +43,12 @@ risk:
   stale_data_max_age_seconds: 21600  # 2 candle-widths at 4h; older data blocks trading
   min_quote_balance: 5.0           # never trade below this quote balance
   max_consecutive_api_errors: 3    # shutdown after this many consecutive API errors
+
+stop_loss:
+  # A fixed-percentage protective stop, used only in the backtest (see
+  # config/models.py::StopLossConfig and RISK_POLICY.md's "Protective
+  # exits" section for why this is not yet live on Testnet).
+  stop_distance_pct: 0.05
 
 backtest:
   train_fraction: 0.6

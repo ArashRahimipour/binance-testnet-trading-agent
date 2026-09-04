@@ -93,20 +93,36 @@ This fetches the most recent completed candles for the configured symbol
 and interval and stores them in the local SQLite database
 (`config.paths.db_path`).
 
+For a specific date range - including multiple years of history, which
+needs more than one 1000-candle request - use `--start`/`--end`:
+
+```bash
+trading-agent fetch-data --start 2020-01-01 --end 2024-01-01
+```
+
+This pages through the full range automatically, with bounded retries and
+backoff on rate limits, de-duplicates overlapping candles, and validates
+the assembled series before storing it (see
+`src/trading_agent/data/historical_fetch.py`).
+
 ## Backtesting
 
 ```bash
 trading-agent backtest
 ```
 
-Runs the baseline strategy walk-forward over the stored candles (no
-look-ahead - see [STRATEGY.md](STRATEGY.md)), routes every proposed trade
+Runs the baseline strategy candle-by-candle over the stored history with no
+look-ahead (see [STRATEGY.md](STRATEGY.md)), routes every proposed trade
 through the same risk engine and order validator a live run would use,
-and prints a performance report for chronological train/validation/test
-splits plus an overall summary: total and annualized return, max
-drawdown, volatility, Sharpe/Sortino (assumptions documented), win rate,
-profit factor, exposure, turnover, trade count, and a buy-and-hold
-comparison. A warning is printed whenever a split has too few trades to
+and prints a performance report using **chronological holdout reporting**:
+fixed train/validation/test date windows, evaluated with the *same*
+strategy parameters throughout (see config/default.yaml) rather than
+refitting per window. This is deliberately not model selection - it is
+not genuine rolling walk-forward re-optimization, and no parameter is ever
+chosen because it performed best on a split. The report covers total and
+annualized return, max drawdown, volatility, Sharpe/Sortino (assumptions
+documented), win rate, profit factor, exposure, turnover, trade count, and
+a buy-and-hold comparison. A warning is printed whenever a split has too few trades to
 be statistically meaningful. **This is a research report, not investment
 advice, and past simulated performance does not indicate future results.**
 
@@ -116,10 +132,12 @@ advice, and past simulated performance does not indicate future results.**
 trading-agent --mode testnet run
 ```
 
-This performs **one decision cycle**: fetch the latest completed candles
-from the Testnet, generate a signal, size it, risk-check it, validate it
-against live exchange filters, and - only if every check passes and the
-[kill switch](RISK_POLICY.md#kill-switch) is not engaged - place one real
+This performs **one decision cycle**: reconcile any unresolved order from
+a previous run and check that local and exchange balances still agree,
+fetch the latest completed candles from the Testnet, generate a signal,
+and - for an EXIT only - size it, risk-check it, validate it against live
+exchange filters, and (if every check passes and the
+[kill switch](RISK_POLICY.md#kill-switch) is not engaged) place one real
 (but play-money) order on the Spot Testnet. It is meant to be invoked once
 per completed 4h candle, e.g. by a cron job or scheduled task:
 
@@ -127,6 +145,13 @@ per completed 4h candle, e.g. by a cron job or scheduled task:
 # Run 5 minutes after every 4h candle closes (server time is UTC)
 5 0,4,8,12,16,20 * * * cd /path/to/repo && .venv/bin/trading-agent --mode testnet run >> logs/cron.log 2>&1
 ```
+
+> **A BUY signal is currently never acted on automatically on Testnet.**
+> Automatic entry is disabled pending a verified exchange-resident
+> protective stop order - see [RISK_POLICY.md](RISK_POLICY.md#protective-exits-why-max_risk_per_trade_pct-now-means-what-it-says-and-why-testnet-entry-is-disabled)
+> for why. The `run` command will log and report a suppressed BUY signal
+> rather than silently ignoring it. EXIT (closing a position you opened
+> manually via the Testnet UI) still works normally.
 
 On its very first run, the agent reconciles its starting portfolio from
 your actual Testnet account balance. If that account already holds a

@@ -38,6 +38,7 @@ class RiskContext:
     consecutive_api_errors: int
     kill_switch_engaged: bool
     is_duplicate_order: bool
+    reconciliation_blocked: bool = False
 
 
 @dataclass(frozen=True, slots=True)

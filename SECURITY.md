@@ -52,11 +52,31 @@ it; do not include real credentials or account details in the report.
 
 - Client order IDs are deterministic
   (`execution/client_order_id.py`) - a hash of symbol, side, and the
-  signal candle's close time - so a retry after a timeout reuses the same
-  ID rather than risking a duplicate order.
-- Before ever retrying a timed-out order, the agent queries Binance for
-  its actual status (`execution/reconciliation.py`) and retries only on a
-  positive "order does not exist" confirmation.
+  signal candle's close time - so a retry after a submission failure
+  reuses the same ID rather than risking a duplicate order.
+- Before ever retrying, the agent queries Binance for the order's actual
+  status (`execution/reconciliation.py`) and retries only on a positive
+  "order does not exist" confirmation. This applies to **any** ambiguous
+  network failure - timeout, connection reset, DNS failure - not just a
+  timeout specifically (`requests.exceptions.RequestException` is caught
+  as a whole in `execution/live_runner.py`).
+- The intent to submit an order is durably recorded (`persistence/
+  pending_orders_store.py`) *before* the exchange call is made, so a
+  process crash at any point - before, during, or after that call - is
+  recoverable: the next run resolves it by asking Binance directly rather
+  than guessing. See ARCHITECTURE.md's "Crash recovery" section.
+- An order's actual reported status (`NEW`, `PARTIALLY_FILLED`, `FILLED`,
+  `CANCELED`, `REJECTED`, `EXPIRED`) decides what happens to local state
+  (`execution/order_outcome.py`) - the requested quantity is never
+  substituted for a missing or zero `executed_qty`, and re-observing the
+  same order (e.g. during crash recovery) never double-applies a fill.
+- Local balances are reconciled against the exchange's actual free+locked
+  balances every cycle, not just at startup; an unexplained mismatch
+  blocks new entries rather than being silently absorbed.
+- Signed requests use a bounded offset from the exchange's own server
+  time, not the raw local clock (`TestnetBrokerAdapter.sync_time()`);
+  excessive drift raises `ClockDriftError` and blocks the cycle rather
+  than risking a rejected or misinterpreted signed request.
 - Every proposed order passes through an independent risk engine
   (`risk/engine.py`) and order validator (`execution/order_validator.py`)
   before it can reach the broker adapter - the strategy has no path to
@@ -64,6 +84,9 @@ it; do not include real credentials or account details in the report.
 - Position sizing and order validation only ever round quantity/price
   **down** to exchange filter boundaries and **reject** (never enlarge) a
   trade that falls below an exchange minimum after rounding.
+- Automatic entry (BUY) is disabled on Testnet in this revision pending a
+  verified exchange-resident protective stop order - see RISK_POLICY.md's
+  "Protective exits" section.
 
 ## Data integrity
 

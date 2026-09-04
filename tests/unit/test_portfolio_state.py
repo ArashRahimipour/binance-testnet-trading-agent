@@ -73,3 +73,55 @@ def test_apply_sell_partial_keeps_position_long():
     assert sold.position_side == PositionSide.LONG
     assert sold.base_balance == Decimal("0.001")
     assert sold.avg_entry_price == Decimal(50000)
+
+
+def test_realized_pnl_nets_out_entry_fee_on_full_close():
+    # Buy 0.001 BTC @ 50000 with a 1.0 quote entry fee, sell @ 55000 with a 1.0 exit fee.
+    # Gross gain = 0.001 * (55000-50000) = 5.0. Net PnL must subtract BOTH fees: 5.0 - 1.0 - 1.0 = 3.0.
+    state = apply_buy(
+        PortfolioState.initial(Decimal(100)), Decimal("0.001"), Decimal(50000), Decimal("1.0")
+    )
+    assert state.open_position_entry_fee == Decimal("1.0")
+    sold = apply_sell(state, quantity=Decimal("0.001"), price=Decimal(55000), fee_quote=Decimal("1.0"))
+    assert sold.realized_pnl_quote == Decimal("3.0")
+    assert sold.open_position_entry_fee == Decimal(0)
+
+
+def test_realized_pnl_allocates_entry_fee_proportionally_on_partial_close():
+    # Buy 0.002 BTC @ 50000 with a 2.0 entry fee. Sell half (0.001) - half the entry fee (1.0)
+    # should be allocated to this partial close, the other half stays attributed to the remainder.
+    state = apply_buy(
+        PortfolioState.initial(Decimal(200)), Decimal("0.002"), Decimal(50000), Decimal("2.0")
+    )
+    sold = apply_sell(state, quantity=Decimal("0.001"), price=Decimal(50000), fee_quote=Decimal(0))
+    # gross gain on the half sold = 0, minus allocated entry fee 1.0 = -1.0
+    assert sold.realized_pnl_quote == Decimal("-1.0")
+    assert sold.open_position_entry_fee == Decimal("1.0")  # remaining half still attributed
+    assert sold.position_side == PositionSide.LONG
+
+
+def test_pnl_is_estimated_flag_propagates_from_entry_fee():
+    state = apply_buy(
+        PortfolioState.initial(Decimal(100)),
+        Decimal("0.001"),
+        Decimal(50000),
+        Decimal("1.0"),
+        fee_is_estimated=True,
+    )
+    assert state.pnl_is_estimated is True
+    sold = apply_sell(state, quantity=Decimal("0.001"), price=Decimal(55000), fee_quote=Decimal(0))
+    assert sold.pnl_is_estimated is False  # position fully closed, flag resets
+
+
+def test_pnl_is_estimated_flag_propagates_from_exit_fee():
+    state = apply_buy(
+        PortfolioState.initial(Decimal(100)), Decimal("0.002"), Decimal(50000), Decimal(0)
+    )
+    sold = apply_sell(
+        state,
+        quantity=Decimal("0.001"),
+        price=Decimal(55000),
+        fee_quote=Decimal(0),
+        fee_is_estimated=True,
+    )
+    assert sold.pnl_is_estimated is True  # partial close, position still open -> flag carries forward
