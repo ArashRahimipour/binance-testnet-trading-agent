@@ -3,22 +3,22 @@ start): resolve any order left unresolved by a previous - possibly
 crashed - run, then compare local balances against the exchange's actual
 free+locked balances. Both checks run BEFORE a new trading signal is ever
 generated, and both fail closed: an unresolved order or an unexplained
-balance mismatch blocks new entries (never exits, and never overwrites
-local state with a guess) until repaired.
+balance mismatch blocks ALL new order submission (see risk/engine.py's
+universal `reconciliation_blocked` gate - round 2 finding #2 corrected
+this from a buy-only check, since an untrusted local balance is exactly
+as unsafe for sizing a SELL as a BUY) until repaired. Nothing here ever
+overwrites local state with a guess.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Literal
 
-from trading_agent.execution.order_outcome import apply_order_result
 from trading_agent.execution.reconciliation import ReconciledStatus, reconcile_order
 from trading_agent.execution.testnet_adapter import TestnetBrokerAdapter
 from trading_agent.journal.journal import Journal
-from trading_agent.persistence.pending_orders_store import PendingOrdersStore
-from trading_agent.portfolio.state import PortfolioState
+from trading_agent.persistence.execution_store import ExecutionStateStore
 
 # Small absolute tolerance for Decimal rounding noise accumulated across
 # many fills - not a license to ignore a real discrepancy.
@@ -27,7 +27,6 @@ BALANCE_RECONCILIATION_TOLERANCE = Decimal("0.00000010")
 
 @dataclass(frozen=True, slots=True)
 class PendingOrderReconciliationResult:
-    portfolio: PortfolioState
     blocked: bool
     blocked_reason: str | None
 
@@ -36,19 +35,28 @@ def reconcile_pending_orders(
     adapter: TestnetBrokerAdapter,
     symbol: str,
     quote_asset: str,
-    store: PendingOrdersStore,
-    portfolio: PortfolioState,
+    base_asset: str,
+    store: ExecutionStateStore,
     fallback_fee_pct: Decimal,
     journal: Journal,
     now_ms: int,
 ) -> PendingOrderReconciliationResult:
-    for pending in store.load_open(symbol):
-        side: Literal["BUY", "SELL"] = "BUY" if pending.side == "BUY" else "SELL"
+    for pending in store.load_open_pending(symbol):
         status, order = reconcile_order(adapter, symbol, pending.client_order_id)
 
         if status == ReconciledStatus.NOT_FOUND:
-            # This order never reached Binance - nothing to apply, safe to close out.
-            store.mark_resolved(pending.client_order_id, "NEVER_SUBMITTED", now_ms)
+            # This order never reached Binance - nothing to apply. There is
+            # no fill to run through the atomic path; mark it resolved via
+            # a synthetic zero-execution terminal report so the SAME code
+            # path (and its consistency checks) closes it out.
+            from trading_agent.execution.testnet_adapter import OrderResult
+
+            synthetic = OrderResult(
+                order_id=0, client_order_id=pending.client_order_id, status="NEVER_SUBMITTED",
+                executed_qty=pending.applied_executed_qty, cumulative_quote_qty=pending.applied_cumulative_quote_qty,
+                transact_time_ms=now_ms, fills=[], raw={},
+            )
+            store.apply_order_result_atomically(symbol, quote_asset, base_asset, synthetic, fallback_fee_pct, now_ms)
             journal.record(
                 "RECONCILIATION_STARTUP",
                 {"client_order_id": pending.client_order_id, "outcome": "NOT_FOUND"},
@@ -63,44 +71,42 @@ def reconcile_pending_orders(
                 now_ms,
             )
             return PendingOrderReconciliationResult(
-                portfolio, True,
-                f"unresolved order {pending.client_order_id}: reconciliation returned an unrecognized outcome",
+                True, f"unresolved order {pending.client_order_id}: reconciliation returned an unrecognized outcome"
             )
 
-        outcome = apply_order_result(
-            order, side, quote_asset, portfolio, pending.applied_executed_qty, fallback_fee_pct
-        )
-        portfolio = outcome.portfolio
+        result = store.apply_order_result_atomically(symbol, quote_asset, base_asset, order, fallback_fee_pct, now_ms)
         journal.record(
-            outcome.journal_event_type,
-            {"client_order_id": pending.client_order_id, **outcome.journal_payload},
+            result.journal_event_type,
+            {"client_order_id": pending.client_order_id, **result.journal_payload},
             now_ms,
         )
-        new_applied_qty = pending.applied_executed_qty + outcome.newly_applied_qty
 
-        if outcome.is_terminal:
-            store.mark_resolved(pending.client_order_id, order.status, now_ms)
-        else:
-            store.update_applied_qty(pending.client_order_id, new_applied_qty)
+        if not result.is_terminal:
             return PendingOrderReconciliationResult(
-                portfolio, True, f"order {pending.client_order_id} is still open ({order.status})"
+                True, f"order {pending.client_order_id} is still open ({order.status})"
             )
 
-    return PendingOrderReconciliationResult(portfolio, False, None)
+    return PendingOrderReconciliationResult(False, None)
 
 
 def reconcile_balances(
     adapter: TestnetBrokerAdapter,
+    symbol: str,
     quote_asset: str,
     base_asset: str,
-    portfolio: PortfolioState,
+    store: ExecutionStateStore,
 ) -> tuple[bool, str | None]:
     """Compare local (quote_balance, base_balance) against exchange free+locked.
 
     Returns (ok, reason). Never overwrites local state - only reports
-    whether it is trustworthy enough to open a NEW position; existing
-    positions can still be closed regardless (see risk/engine.py).
+    whether it is trustworthy enough to submit ANY new order. Reads the
+    portfolio fresh from the store rather than trusting a caller-held
+    copy, since pending-order reconciliation may just have changed it.
     """
+    portfolio = store.load_portfolio(symbol)
+    if portfolio is None:
+        return False, f"no portfolio state for {symbol!r} to reconcile"
+
     balances = adapter.get_account_balances()
     exchange_quote_free, exchange_quote_locked = balances.get(quote_asset, (Decimal(0), Decimal(0)))
     exchange_base_free, exchange_base_locked = balances.get(base_asset, (Decimal(0), Decimal(0)))

@@ -1,12 +1,23 @@
-"""Fee computation from Binance's per-fill commission data.
+"""Commission-asset-aware fee computation from Binance's per-fill data.
 
-If every fill's commission is denominated in the trade's quote asset, the
-fee is exact - just the sum of those commissions. If any fill's commission
-is charged in a different asset (most commonly BNB, when fee discounts are
-enabled), converting it to quote terms would require a separate price feed
-this project does not maintain, so instead of guessing, that outcome is
-reported as an estimate via `taker_fee_pct * notional` and the caller is
-told the result is not exact.
+Binance's `fills` array (with per-fill `commission`/`commissionAsset`) is
+only present in the immediate response to placing an order
+(`POST /api/v3/order`) - `GET /api/v3/order` (used for reconciliation)
+never returns it, confirmed against the official docs and community
+reports for this project. So exact, asset-aware commission accounting is
+only possible on the happy path (a direct successful submission); any
+reconciliation-sourced order result has no fills data at all and must fall
+back to a percentage-of-notional estimate, honestly flagged as such -
+never silently guessed and reported as exact.
+
+Commission is bucketed by asset:
+  - quote-asset commission -> `commission_quote` (reduces quote proceeds /
+    increases quote cost - see `portfolio/state.py::apply_fill_delta`)
+  - base-asset commission -> `commission_base` (reduces base quantity
+    received on a BUY; unsupported on a SELL - see `apply_fill_delta`)
+  - any other asset (e.g. a BNB fee discount) -> `commission_other`,
+    recorded per-asset but never converted or allowed to touch the
+    quote/base balances this project tracks.
 """
 
 from __future__ import annotations
@@ -16,34 +27,42 @@ from decimal import Decimal
 from trading_agent.execution.testnet_adapter import Fill
 
 
-def compute_confirmed_fee_for_first_application(
-    fills: list[Fill], quote_asset: str, fallback_notional: Decimal, fallback_fee_pct: Decimal
-) -> tuple[Decimal, bool]:
-    """Fee for the first time an order's execution is applied to portfolio
-    state - `fills` (if present) is assumed to cover the order's entire
-    execution to date, which holds the first time an order is observed.
-    Returns (fee_quote, is_estimated).
+def compute_commission_buckets(
+    fills: list[Fill],
+    quote_asset: str,
+    base_asset: str,
+    fallback_notional: Decimal,
+    fallback_fee_pct: Decimal,
+) -> tuple[Decimal, Decimal, dict[str, Decimal], bool]:
+    """Returns (commission_quote, commission_base, commission_other, is_estimated).
+
+    `commission_other` maps asset -> total commission in that asset,
+    recorded for the journal only. `is_estimated` is True only when there
+    was no fill data at all and a fallback estimate was used - it is
+    False whenever real fills were available, regardless of which
+    asset(s) the commission was charged in, since quote/base accounting
+    remains exact in every one of those cases.
     """
     if not fills:
-        return fallback_notional * fallback_fee_pct, True
+        return estimate_fee_from_notional(fallback_notional, fallback_fee_pct), Decimal(0), {}, True
 
-    total_quote_fee = Decimal(0)
-    all_quote_denominated = True
+    commission_quote = Decimal(0)
+    commission_base = Decimal(0)
+    commission_other: dict[str, Decimal] = {}
+
     for fill in fills:
         if fill.commission_asset == quote_asset:
-            total_quote_fee += fill.commission
+            commission_quote += fill.commission
+        elif fill.commission_asset == base_asset:
+            commission_base += fill.commission
         else:
-            all_quote_denominated = False
+            commission_other[fill.commission_asset] = (
+                commission_other.get(fill.commission_asset, Decimal(0)) + fill.commission
+            )
 
-    return total_quote_fee, not all_quote_denominated
+    return commission_quote, commission_base, commission_other, False
 
 
-def estimate_fee_for_incremental_fill(notional: Decimal, fallback_fee_pct: Decimal) -> tuple[Decimal, bool]:
-    """Fee for a later, incremental continuation of an already-partially-
-    applied order. Exact per-fill attribution is not tracked across
-    separate reconciliation passes for this rare case (a single order
-    filling in multiple chunks over multiple cycles) - this is always
-    reported as an estimate, a documented, honest simplification rather
-    than a silent approximation.
-    """
-    return notional * fallback_fee_pct, True
+def estimate_fee_from_notional(notional: Decimal, fallback_fee_pct: Decimal) -> Decimal:
+    """A percentage-of-notional fallback, used only when no fill data exists."""
+    return notional * fallback_fee_pct

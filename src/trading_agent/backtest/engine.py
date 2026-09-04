@@ -10,16 +10,21 @@ of processing candle i+1. A signal generated on the very last candle in the
 series has no i+1 to resolve against and is reported as unexecuted rather
 than silently filled or dropped.
 
-Protective stop-loss (review Finding 4): since `max_risk_per_trade_pct` is
-a genuine risk-budget figure here (see sizing/position_sizer.py::
-compute_risk_based_buy_quantity), every backtest entry carries a stop
-price at a fixed percentage below its fill price (config.stop_loss).
-Each subsequent candle's LOW is checked against the active stop - if
-touched, the position is closed intrabar at (the worse of) the stop price
-or that candle's open, modeling gap risk conservatively. This is backtest-
-only in this revision; automatic entry is disabled on Testnet pending a
-verified exchange-resident protective order (see execution/live_runner.py
-and RISK_POLICY.md).
+Protective stop-loss (review Finding 4, cost-awareness added in round 2
+Finding 6): since `max_risk_per_trade_pct` is a genuine risk-budget figure
+here (see sizing/position_sizer.py::compute_risk_based_buy_quantity, which
+sizes against entry/exit slippage and fees too, not just the bare
+entry-to-stop price gap), every backtest entry carries a stop price at a
+fixed percentage below its fill price (config.stop_loss). Each subsequent
+candle's LOW is checked against the active stop - if touched, the position
+is closed intrabar at (the worse of) the stop price or that candle's open,
+modeling gap risk conservatively. An ordinary (non-gap) stop's expected
+loss is therefore bounded by the risk budget; a gap through the stop can
+still exceed it - a disclosed limitation of a fixed-percentage stop, not
+something position sizing alone can prevent. This is backtest-only in this
+revision; automatic entry is disabled on Testnet pending a verified
+exchange-resident protective order (see execution/live_runner.py and
+RISK_POLICY.md).
 
 Every proposed trade goes through the same RiskEngine and OrderValidator
 that a testnet run would use; only the broker is swapped for
@@ -27,6 +32,17 @@ that a testnet run would use; only the broker is swapped for
 splits are CHRONOLOGICAL HOLDOUT REPORTING ONLY, not model selection - the
 strategy's parameters are fixed by config and never fit to any split
 (review Finding 10: this is not genuine rolling walk-forward re-fitting).
+
+UTC-day boundary ordering (review round 2, Finding 5): a signal queued on
+one candle can fill on the next, which may be the first candle of a new
+UTC day. Each iteration therefore detects/initializes a new day (using
+that candle's OPEN price for the day's starting equity, since a queued
+fill or stop-loss executes against that open, not some later, already-
+moved price) and decrements cooldown BEFORE resolving any pending signal
+or checking the stop-loss - so a trade that executes on the first candle
+of a new day has its count and realized PnL attributed to that new day,
+never discarded into the day that merely queued it or a fresh cooldown
+immediately eaten into by that same candle's decrement.
 """
 
 from __future__ import annotations
@@ -131,19 +147,27 @@ def run_backtest(
     for i in range(min_required - 1, n):
         candle = candles[i]
 
+        # Round 2 finding #5: detect/initialize a new UTC day FIRST (using
+        # this candle's OPEN, since that is when any pending signal from the
+        # previous candle actually fills), THEN resolve that pending signal -
+        # so its trade count and realized PnL are attributed to the day it
+        # actually executes in, never to the day it merely was decided on.
+        # Cooldown is decremented here too, before any fill this candle can
+        # set a fresh cooldown, so a just-triggered cooldown is never
+        # immediately eaten into within the same candle that set it.
+        day = candle.open_time_ms // _MS_PER_DAY
+        if current_day is None or day != current_day:
+            current_day = day
+            state.daily_start_equity = state.portfolio.equity(candle.open)
+            state.daily_realized_pnl_pct = 0.0
+            state.trades_today = 0
+        state.cooldown_bars_remaining = max(0, state.cooldown_bars_remaining - 1)
+
         if pending_signal is not None:
             state, trades, peak_equity = _resolve_pending_signal(
                 pending_signal, candle, state, trades, config, filters, risk_engine, broker, peak_equity, journal
             )
             pending_signal = None
-
-        day = candle.close_time_ms // _MS_PER_DAY
-        if current_day is None or day != current_day:
-            current_day = day
-            state.daily_start_equity = state.portfolio.equity(candle.close)
-            state.daily_realized_pnl_pct = 0.0
-            state.trades_today = 0
-        state.cooldown_bars_remaining = max(0, state.cooldown_bars_remaining - 1)
 
         if (
             state.portfolio.position_side == PositionSide.LONG
@@ -231,7 +255,8 @@ def _resolve_pending_signal(
         stop_price = reference_price * (1 - Decimal(str(config.stop_loss.stop_distance_pct)))
         sizing = compute_risk_based_buy_quantity(
             equity, reference_price, stop_price,
-            config.risk.max_risk_per_trade_pct, config.risk.max_position_pct, filters,
+            config.risk.max_risk_per_trade_pct, config.risk.max_position_pct,
+            config.fees.taker_fee_pct, config.fees.slippage_pct, filters,
         )
     else:
         sizing = compute_sell_quantity(state.portfolio.base_balance, reference_price, filters)

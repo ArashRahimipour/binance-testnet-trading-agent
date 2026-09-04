@@ -26,8 +26,7 @@ from trading_agent.data.storage import CandleStore
 from trading_agent.data.validation import validate_candle_sequence
 from trading_agent.execution.live_runner import ColdStartReconciliationError, run_testnet_cycle
 from trading_agent.journal.journal import Journal
-from trading_agent.persistence.pending_orders_store import PendingOrdersStore
-from trading_agent.persistence.portfolio_store import PortfolioStore
+from trading_agent.persistence.execution_store import ExecutionStateStore
 from trading_agent.persistence.risk_state_store import RiskStateStore
 from trading_agent.risk.kill_switch import KillSwitch
 from trading_agent.sizing.exchange_filters import SymbolFilters
@@ -167,7 +166,14 @@ def backtest_cmd(ctx: click.Context) -> None:
 @cli.command("run")
 @click.pass_context
 def run_cmd(ctx: click.Context) -> None:
-    """Run a single testnet decision cycle (intended to be invoked once per completed candle)."""
+    """Run a single testnet decision cycle (intended to be invoked once per completed candle).
+
+    Testnet operation is OBSERVATIONAL: every cycle evaluates HOLD normally,
+    but a BUY signal is always suppressed - this agent cannot initiate a
+    position on Testnet. SELL exists only to close (or help recover) a
+    position that already exists and has been fully reconciled against the
+    exchange; it is not a general trading path. See RISK_POLICY.md.
+    """
     config: AppConfig = ctx.obj["config"]
     if config.mode != Mode.TESTNET:
         click.echo("The run command requires --mode testnet.", err=True)
@@ -180,17 +186,13 @@ def run_cmd(ctx: click.Context) -> None:
 
     journal_path = config.paths.data_dir / "journal.db"
     risk_state_path = config.paths.data_dir / "risk_state.db"
-    pending_orders_path = config.paths.data_dir / "pending_orders.db"
     with (
         Journal(journal_path) as journal,
-        PortfolioStore(config.paths.db_path) as portfolio_store,
+        ExecutionStateStore(config.paths.db_path) as execution_store,
         RiskStateStore(risk_state_path) as risk_state_store,
-        PendingOrdersStore(pending_orders_path) as pending_orders_store,
     ):
         try:
-            result = run_testnet_cycle(
-                config, secrets, journal, portfolio_store, risk_state_store, pending_orders_store
-            )
+            result = run_testnet_cycle(config, secrets, journal, execution_store, risk_state_store)
         except ColdStartReconciliationError as exc:
             click.echo(f"Cannot start: {exc}", err=True)
             sys.exit(1)
@@ -203,10 +205,17 @@ def status_cmd(ctx: click.Context) -> None:
     """Show current mode, kill switch state, and portfolio state (no secrets)."""
     config: AppConfig = ctx.obj["config"]
     click.echo(f"mode: {config.mode.value}  symbol: {config.market.symbol}")
+    if config.mode == Mode.TESTNET:
+        click.echo(
+            "testnet capability: OBSERVATIONAL - HOLD is evaluated normally, BUY is always "
+            "suppressed (this agent cannot initiate a position on Testnet). SELL only closes "
+            "or helps recover an already-established, fully-reconciled position; it is not a "
+            "general trading path. See RISK_POLICY.md."
+        )
     switch = KillSwitch(config.paths.data_dir / "KILL_SWITCH")
     click.echo(f"kill_switch: {'ENGAGED (' + (switch.reason() or '') + ')' if switch.is_engaged() else 'disengaged'}")
-    with PortfolioStore(config.paths.db_path) as store:
-        portfolio = store.load(config.market.symbol)
+    with ExecutionStateStore(config.paths.db_path) as store:
+        portfolio = store.load_portfolio(config.market.symbol)
     if portfolio is None:
         click.echo("portfolio: not initialized")
     else:

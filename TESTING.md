@@ -1,6 +1,6 @@
 # Testing
 
-233 tests, all offline: nothing in the suite makes a real network call or
+253 tests, all offline: nothing in the suite makes a real network call or
 requires real credentials. HTTP is mocked with the `responses` library at
 the point where `requests` would otherwise reach the network; time-
 sensitive behavior is tested by passing explicit reference timestamps
@@ -37,11 +37,14 @@ ruff check src tests       # lint
 | Unsupported execution mode rejected | `tests/unit/test_cli.py::test_mode_live_is_rejected_at_cli_parsing`, `test_mode_production_is_rejected_at_cli_parsing`; `tests/unit/test_config.py::test_mode_rejects_live` |
 | Proof production endpoints cannot be selected | `tests/integration/test_no_production_endpoints.py` - scans the actual package source for production hostnames outside the one approved read-only client |
 | Order status handling (every Binance status) | `tests/unit/test_order_outcome.py` - one test per NEW/PARTIALLY_FILLED/FILLED/CANCELED/REJECTED/EXPIRED, including zero- and partial-execution cases, and that the requested quantity is never substituted |
-| Crash recovery / exactly-once fill application | `tests/unit/test_startup_reconciliation.py`, `tests/unit/test_pending_orders_store.py`, `tests/unit/test_live_runner.py::test_pending_order_from_previous_crashed_run_is_resolved_before_new_signal`, `::test_still_open_pending_order_blocks_new_signal_this_cycle` |
-| Continuous balance reconciliation (free+locked) | `tests/unit/test_startup_reconciliation.py::test_reconcile_balances_*`, `test_live_runner.py::test_balance_discrepancy_blocks_new_entries_but_exit_still_allowed` |
-| Fee accounting (per-fill commission, entry+exit netting) | `tests/unit/test_fees.py`, `tests/unit/test_portfolio_state.py::test_realized_pnl_nets_out_entry_fee_on_full_close`, `::test_realized_pnl_allocates_entry_fee_proportionally_on_partial_close` |
+| Crash recovery / exactly-once fill application, atomic across BOTH tables | `tests/unit/test_execution_store.py` (fault injection at all three former crash boundaries, retry-after-commit never double-applies, decreasing-value rejection), `tests/unit/test_startup_reconciliation.py`, `tests/unit/test_live_runner.py::test_pending_order_from_previous_crashed_run_is_resolved_before_new_signal`, `::test_still_open_pending_order_blocks_new_signal_this_cycle` |
+| Reconciliation mismatch blocks ALL orders, not just BUY | `tests/unit/test_risk_engine.py::test_reconciliation_blocked_blocks_both_buy_and_exit`, `test_live_runner.py::test_balance_discrepancy_blocks_sell_too`, `::test_local_base_balance_exceeding_exchange_blocks_sell`, `::test_exchange_base_balance_exceeding_local_blocks_sell` |
+| Exact partial-fill delta accounting across cumulative fields | `tests/unit/test_execution_store.py::test_two_partial_fills_at_different_prices_produce_exact_cash_asset_and_avg_price`, `test_order_outcome.py::test_decreasing_executed_qty_is_rejected_not_silently_applied` |
+| Continuous balance reconciliation (free+locked) | `tests/unit/test_startup_reconciliation.py::test_reconcile_balances_*`, `test_live_runner.py::test_balance_discrepancy_blocks_sell_too` |
+| Fee accounting (per-fill commission, entry+exit netting, commission-asset-aware) | `tests/unit/test_fees.py`, `tests/unit/test_portfolio_state.py::test_realized_pnl_nets_out_entry_fee_on_full_close`, `::test_realized_pnl_allocates_entry_fee_proportionally_on_partial_close`, `test_order_outcome.py::test_base_asset_commission_on_buy_reduces_received_quantity`, `::test_third_asset_commission_is_recorded_but_never_touches_quote_or_base` |
 | No same-close backtest execution | `tests/unit/test_backtest_engine.py::test_changing_next_candle_open_changes_the_fill_price`, `::test_no_trade_fills_at_the_signal_candles_own_close`, `::test_signal_on_final_candle_is_reported_as_unexecuted_not_filled` |
-| Risk-budget stop-loss position sizing | `tests/unit/test_risk_based_position_sizer.py`, `test_backtest_engine.py::test_stop_loss_closes_position_when_low_breaches_stop`, `::test_risk_budget_sizing_produces_smaller_position_for_smaller_risk_pct` |
+| Backtest UTC-day boundary ordering | `tests/unit/test_backtest_engine.py::test_exit_resolved_on_first_candle_of_new_utc_day_is_attributed_to_new_day`, `::test_losing_stop_at_first_candle_of_new_utc_day_is_attributed_to_new_day` |
+| Cost-aware, risk-budget stop-loss position sizing | `tests/unit/test_risk_based_position_sizer.py`, `test_backtest_engine.py::test_ordinary_stop_hit_stays_within_risk_budget`, `::test_gap_through_stop_can_exceed_risk_budget`, `::test_risk_budget_sizing_produces_smaller_position_for_smaller_risk_pct` |
 | Server-time sync / clock drift | `tests/unit/test_testnet_adapter.py::test_sync_time_*`, `::test_timestamp_outside_recv_window_error_propagates`, `test_live_runner.py::test_excessive_clock_drift_fails_closed` |
 | Historical-data pagination, retries, rate limits, dedup | `tests/unit/test_historical_fetch.py` |
 

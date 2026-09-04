@@ -8,7 +8,7 @@ from tests.fixtures.exchange_info import make_exchange_info
 from tests.fixtures.klines import make_kline_series
 from trading_agent.cli.main import cli
 from trading_agent.data.models import interval_to_ms
-from trading_agent.persistence.portfolio_store import PortfolioStore
+from trading_agent.persistence.execution_store import ExecutionStateStore
 from trading_agent.portfolio.state import PortfolioState
 
 PROD_HOST = "https://api.binance.com"
@@ -135,8 +135,8 @@ def test_status_command_shows_uninitialized_portfolio(tmp_path):
 def test_status_command_shows_seeded_portfolio(tmp_path):
     config_path = _write_config(tmp_path)
     db_path = tmp_path / "agent.db"
-    with PortfolioStore(db_path) as store:
-        store.save("BTCUSDT", PortfolioState.initial(Decimal(50)), updated_at_ms=0)
+    with ExecutionStateStore(db_path) as store:
+        store.save_portfolio("BTCUSDT", PortfolioState.initial(Decimal(50)), updated_at_ms=0)
     result = CliRunner().invoke(cli, ["--config", config_path, "status"])
     assert result.exit_code == 0
     assert "quote_balance=50" in result.output

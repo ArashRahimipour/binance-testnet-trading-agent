@@ -80,8 +80,11 @@ Every backtest entry carries a stop price a fixed percentage below its
 fill price (`config.stop_loss.stop_distance_pct`), checked against every
 subsequent candle's low; a breach closes the full position intrabar at
 the worse of the stop price or that candle's open (modeling gap risk).
-Position size is `risk_budget / stop_distance` rather than a notional
-guess - see RISK_POLICY.md's "Protective exits" section for the full
+Position size is `risk_budget / total_loss_per_unit`, where
+`total_loss_per_unit` includes entry/exit slippage and fees, not just the
+bare entry-to-stop price gap - so an ordinary (non-gap) stop hit stays
+within the risk budget, though a real gap through the stop can still
+exceed it - see RISK_POLICY.md's "Protective exits" section for the full
 rationale and for why this is not yet live on Testnet.
 
 ## Fees and slippage in simulation

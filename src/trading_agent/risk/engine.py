@@ -25,12 +25,20 @@ protective order (see execution/live_runner.py and RISK_POLICY.md), so
 `max_risk_per_trade_pct` currently has no effect in `testnet` mode at all.
 
 Universal gates (kill switch, stale data, duplicate order, consecutive API
-errors, unresolved reconciliation discrepancies) block both BUY and EXIT,
-because trading on bad or untrusted state is unsafe regardless of
-direction. Portfolio-performance gates (drawdown, daily loss, trade count,
-cooldown, minimum balance, position sizing limits) apply only to BUY - an
-EXIT reduces risk and is capital-preservation-positive, so it is never
-blocked by having "used up" a daily allowance.
+errors, and unresolved reconciliation discrepancies) block BOTH BUY and
+EXIT. Review round 2 corrected a real bug here: an untrusted local balance
+is exactly as unsafe for sizing a SELL as for sizing a BUY (Finding 2:
+"reconciliation mismatch must block untrusted selling") - `reconciliation_
+blocked` was previously checked only in the buy-only gates, so an EXIT
+could still be sized from a local base balance that might not match the
+exchange. It is now checked here, in `_check_universal_gates`, before the
+signal-type branch is even reached. `execution/live_runner.py` additionally
+never sizes a SELL from local state at all while blocked - it does not
+rely on this gate alone to prevent that (see its module docstring).
+Portfolio-performance gates (drawdown, daily loss, trade count, cooldown,
+minimum balance, position sizing limits) remain BUY-only - an EXIT reduces
+risk and is capital-preservation-positive, so it is never blocked by
+having "used up" a daily allowance.
 """
 
 from __future__ import annotations
@@ -65,11 +73,11 @@ class RiskEngine:
             return RiskDecision(False, "STALE_DATA")
         if context.is_duplicate_order:
             return RiskDecision(False, "DUPLICATE_ORDER_BLOCKED")
+        if context.reconciliation_blocked:
+            return RiskDecision(False, "RECONCILIATION_DISCREPANCY_BLOCKS_ALL_ORDERS")
         return None
 
     def _check_buy_gates(self, intent: TradeIntent, context: RiskContext) -> RiskDecision:
-        if context.reconciliation_blocked:
-            return RiskDecision(False, "RECONCILIATION_DISCREPANCY_BLOCKS_ENTRY")
         if context.current_drawdown_pct >= self._config.max_drawdown_pct:
             return RiskDecision(False, "MAX_DRAWDOWN_SHUTDOWN")
         if context.daily_realized_pnl_pct <= -self._config.max_daily_loss_pct:

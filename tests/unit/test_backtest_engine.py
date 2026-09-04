@@ -4,8 +4,9 @@ import pytest
 
 from tests.fixtures.exchange_info import make_exchange_info
 from trading_agent.backtest.engine import run_backtest
-from trading_agent.config.models import AppConfig
+from trading_agent.config.models import AppConfig, StopLossConfig
 from trading_agent.data.models import Candle, interval_to_ms
+from trading_agent.journal.journal import Journal
 from trading_agent.sizing.exchange_filters import SymbolFilters
 
 INTERVAL = "4h"
@@ -196,6 +197,171 @@ def test_stop_loss_closes_position_when_low_breaches_stop():
     trade = result.trades[0]
     # Stop exit price must be at or below the stop level (85.5), never above it.
     assert trade.exit_price <= Decimal("85.5")
+
+
+# --- Round 2 finding #6: cost-aware stop sizing. ---
+
+
+def _entry_candles_with_stop_candle(low_ordinary_or_gap: str) -> list[Candle]:
+    """BUY signal at index 6, entry fills at candle 7's open (90). Candle
+    7's own wick is kept safely above the stop so the position survives to
+    candle 8 - isolating the stop's behavior from the entry candle's own
+    default wick (which would otherwise breach it immediately, same-candle
+    as entry). Candle 8 then either touches the stop ordinarily (open
+    unchanged, only the low wicks down to it) or gaps below it entirely
+    (open itself already under the stop) depending on the mode requested.
+    """
+    closes = [100, 99, 98, 97, 96, 95, 100, 100, 100 if low_ordinary_or_gap == "ordinary" else 50]
+    opens = {7: 90, 8: 100 if low_ordinary_or_gap == "ordinary" else 50}
+    lows = {7: 89, 8: 85 if low_ordinary_or_gap == "ordinary" else 40}
+    highs = {7: 101, 8: 101 if low_ordinary_or_gap == "ordinary" else 55}
+    return [
+        Candle(
+            symbol="BTCUSDT", interval=INTERVAL,
+            open_time_ms=START + i * STEP, close_time_ms=START + i * STEP + STEP - 1,
+            open=Decimal(str(opens.get(i, c))), high=Decimal(str(highs.get(i, max(opens.get(i, c), c) + 1))),
+            low=Decimal(str(lows.get(i, min(opens.get(i, c), c) - 1))), close=Decimal(str(c)), volume=Decimal(1),
+        )
+        for i, c in enumerate(closes)
+    ]
+
+
+def test_ordinary_stop_hit_stays_within_risk_budget():
+    # An ordinary (non-gap) stop touch - the candle's open is unaffected,
+    # only its low wicks down to the stop - must lose no more than
+    # equity * max_risk_per_trade_pct, including realistic slippage and fees.
+    candles = _entry_candles_with_stop_candle("ordinary")
+    config = _config(max_risk_per_trade_pct=0.02, max_position_pct=0.9)
+    result = run_backtest(candles, config, _filters())
+    assert len(result.trades) == 1
+    starting_equity = Decimal(50)  # run_backtest's fixed starting balance
+    risk_budget = starting_equity * Decimal(str(config.risk.max_risk_per_trade_pct))
+    assert -result.trades[0].pnl_quote <= risk_budget
+
+
+def test_gap_through_stop_can_exceed_risk_budget():
+    # Documented limitation: no position sizing can bound a real gap. Here
+    # candle 8 OPENS already below the stop - the fill (worse of stop price
+    # or that open) is far below what sizing assumed, and the loss should
+    # clearly exceed the risk budget it was sized against.
+    candles = _entry_candles_with_stop_candle("gap")
+    config = _config(max_risk_per_trade_pct=0.02, max_position_pct=0.9)
+    result = run_backtest(candles, config, _filters())
+    assert len(result.trades) == 1
+    starting_equity = Decimal(50)
+    risk_budget = starting_equity * Decimal(str(config.risk.max_risk_per_trade_pct))
+    assert -result.trades[0].pnl_quote > risk_budget
+
+
+# --- Round 2 finding #5: UTC-day boundary ordering. ---
+#
+# A signal queued on the last candle of one UTC day only fills on the next
+# candle's open - which may be the first candle of the NEXT day. The day
+# must be detected/initialized (using that candle's OPEN, not its close)
+# BEFORE the queued signal is resolved, so the resulting trade's count and
+# PnL are attributed to the day it actually executes in. Getting this
+# backwards has two independently observable effects, each isolated below:
+# resolving before the roll misattributes a crossover EXIT's loss to the
+# day it was decided on (and discards it from the new day entirely); and
+# computing the new day's starting equity from the candle's CLOSE instead
+# of its OPEN materially changes the % impact of a loss that happens
+# within that very first candle (e.g. a stop-loss gap). Both are tuned so
+# a big-enough daily loss should trip `max_daily_loss_pct` and block a
+# later same-day BUY - proving the misattributed/mis-based version would
+# wrongly let it through.
+#
+# All day-boundary candles below use a day-aligned local START (0) with 4h
+# candles (exactly 6 per UTC day), so day boundaries fall at indices
+# 6, 12, 18, ... - independent of the module-level START used elsewhere in
+# this file (which is not day-aligned).
+
+_DAY_STEP = interval_to_ms(INTERVAL)
+
+
+def _day_aligned_candles(closes: list[float], open_overrides: dict[int, float]) -> list[Candle]:
+    opens = [open_overrides.get(i, c) for i, c in enumerate(closes)]
+    return [
+        Candle(
+            symbol="BTCUSDT", interval=INTERVAL,
+            open_time_ms=i * _DAY_STEP, close_time_ms=i * _DAY_STEP + _DAY_STEP - 1,
+            open=Decimal(str(opens[i])), high=Decimal(str(max(opens[i], c) + 1)),
+            low=Decimal(str(min(opens[i], c) - 1)), close=Decimal(str(c)), volume=Decimal(1),
+        )
+        for i, c in enumerate(closes)
+    ]
+
+
+def _tight_daily_loss_config() -> AppConfig:
+    return AppConfig(
+        mode="backtest",
+        strategy={"ema_fast": 3, "ema_slow": 6},
+        backtest={
+            "train_fraction": 0.98, "validation_fraction": 0.01, "test_fraction": 0.01,
+            "min_trades_for_significance": 20,
+        },
+        risk={
+            "max_daily_loss_pct": 0.05, "max_drawdown_pct": 0.99,
+            "max_trades_per_day": 999, "cooldown_bars_after_loss": 0,
+        },
+    )
+
+
+def test_exit_resolved_on_first_candle_of_new_utc_day_is_attributed_to_new_day(tmp_path):
+    # BUY signal at index 6 fills at candle 7's open; bearish EXIT crossover
+    # signal at index 11 (last candle of day 1) fills at candle 12's open -
+    # the first candle of day 2 - at a steep loss. stop_distance_pct is
+    # widened so the backtest's own stop-loss never fires first, isolating
+    # this scenario to the crossover-EXIT resolution-ordering bug alone.
+    closes = [100, 99, 98, 97, 96, 95, 100, 105, 110, 115, 115, 60, 60, 50, 40, 30, 90, 90]
+    candles = _day_aligned_candles(closes, {7: 100, 12: 10})
+    config = _tight_daily_loss_config().model_copy(update={"stop_loss": StopLossConfig(stop_distance_pct=0.9)})
+
+    with Journal(tmp_path / "journal.db") as journal:
+        result = run_backtest(candles, config, _filters(), journal)
+        risk_decisions = journal.entries_by_type("RISK_DECISION")
+
+    assert len(result.trades) == 1
+    assert result.trades[0].pnl_quote < 0  # the EXIT closed at a steep loss
+    buy_decisions = [e for e in risk_decisions if e["payload"]["signal_type"] == "buy"]
+    assert len(buy_decisions) == 2  # the opening buy, then the later same-day re-entry attempt
+    # If the EXIT's loss were discarded by a day-rollover that ran BEFORE
+    # resolving it (the bug), this later same-day BUY would be approved.
+    assert buy_decisions[-1]["payload"]["approved"] is False
+    assert buy_decisions[-1]["payload"]["reason_code"] == "MAX_DAILY_LOSS_SHUTDOWN"
+
+
+def test_losing_stop_at_first_candle_of_new_utc_day_is_attributed_to_new_day(tmp_path):
+    # BUY at index 6 fills at candle 7's open (100). Candle 12 (the first
+    # candle of day 2) gaps down through the 5%-below-entry stop (~95.05)
+    # intrabar before recovering to close far higher (300) - a case
+    # engineered so that basing the new day's starting equity on this
+    # candle's CLOSE (post-recovery, ~140 equity) rather than its OPEN
+    # (pre-move, ~45 equity) changes whether the stop's loss even reads as
+    # exceeding max_daily_loss_pct. A later same-day bullish re-cross (index
+    # 16, filling at candle 17's open) must be blocked - proving the loss
+    # was correctly attributed to (and sized against) the new day.
+    closes = [100, 99, 98, 97, 96, 95, 100, 101, 102, 103, 104, 105, 300, 60, 40, 30, 200, 200]
+    candles = _day_aligned_candles(closes, {7: 100, 12: 90})
+    candles[12] = Candle(
+        symbol="BTCUSDT", interval=INTERVAL,
+        open_time_ms=candles[12].open_time_ms, close_time_ms=candles[12].close_time_ms,
+        open=Decimal(90), high=Decimal(305), low=Decimal(80), close=Decimal(300), volume=Decimal(1),
+    )
+    config = _tight_daily_loss_config()
+
+    with Journal(tmp_path / "journal.db") as journal:
+        result = run_backtest(candles, config, _filters(), journal)
+        risk_decisions = journal.entries_by_type("RISK_DECISION")
+
+    assert len(result.trades) == 1
+    assert result.trades[0].pnl_quote < 0  # the stop closed at a loss
+    buy_decisions = [e for e in risk_decisions if e["payload"]["signal_type"] == "buy"]
+    assert len(buy_decisions) == 2
+    # If the day's starting equity were based on this candle's CLOSE (after
+    # its own recovery) instead of its OPEN, the same loss would read as a
+    # smaller percentage and this later same-day BUY would wrongly pass.
+    assert buy_decisions[-1]["payload"]["approved"] is False
+    assert buy_decisions[-1]["payload"]["reason_code"] == "MAX_DAILY_LOSS_SHUTDOWN"
 
 
 def test_risk_budget_sizing_produces_smaller_position_for_smaller_risk_pct():

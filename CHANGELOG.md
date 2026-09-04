@@ -2,6 +2,91 @@
 
 All notable changes to this project are documented here.
 
+## [0.1.2] - Second independent review response
+
+A second independent review of the round-1 fixes (commit `fde56d7`) found
+seven further safety and correctness defects the round-1 test suite did
+not detect - all in the round-1 fixes themselves. All seven were confirmed
+and fixed, adding 20 tests (233 -> 253 total). Automatic Testnet entry
+(BUY) remains disabled; no live/production execution exists anywhere in
+this or any prior version.
+
+### Fixed
+
+- **Exactly-once persistence was not atomic**: round 1 applied a fill's
+  outcome across two independently-committed SQLite files/stores
+  (`portfolio_store.py`, `pending_orders_store.py`); a crash between those
+  two commits could apply a fill's cost without recording it resolved, or
+  the reverse, with no way to detect or repair the split afterward.
+  Replaced both with a single `persistence/execution_store.py`
+  (`ExecutionStateStore`): one SQLite connection, both tables, and one
+  explicit `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` transaction
+  (`apply_order_result_atomically`) that verifies, applies, and marks
+  resolution together or not at all. `tests/unit/test_execution_store.py`
+  proves this with fault injection at all three former crash boundaries,
+  proving exactly-once-or-safely-pending, never zero-permanently or twice.
+  See ARCHITECTURE.md's "Crash recovery" section for the full transaction
+  boundary and the two operations still deliberately outside it (the
+  exchange call itself, and the journal write).
+- **Reconciliation mismatch was a buy-only gate**: an untrusted local
+  balance could still be used to size a SELL, on the mistaken reasoning
+  that Binance would reject an oversized sell anyway - but this project
+  sizes a SELL from the *local* balance before ever asking Binance, so a
+  mismatch in either direction (local exceeding exchange, or the reverse)
+  was exactly as unsafe there as for a BUY. `reconciliation_blocked` is
+  now a universal gate in `risk/engine.py`, checked before the BUY/EXIT
+  branch is even reached; `execution/live_runner.py` additionally never
+  calls the sell-sizing function at all while blocked, rather than relying
+  on the risk gate alone. New tests cover both mismatch directions.
+- **Partial-fill deltas were proportional estimates**: computing a fill's
+  contribution by splitting a cumulative total proportionally across fills
+  is exact only when all fills are seen in one pass - it produces the
+  wrong average entry price once an order fills incrementally across
+  separate reconciliation observations at different prices. Deltas are now
+  computed directly from Binance's own cumulative `executed_qty`/
+  `cumulative_quote_qty` fields (which are persisted per pending order),
+  and a decrease in either field is rejected rather than silently applied.
+  A new test drives two partial fills at different prices through separate
+  reconciliation passes and asserts an exact resulting average price.
+- **Commission was not asset-aware**: round 1 treated any non-quote-asset
+  commission (e.g. Binance's default BTC-denominated fee on a BUY) as
+  "unknown" and silently substituted an estimated quote-denominated fee
+  while still crediting the full base quantity - both wrong and
+  overconfident. Commission is now bucketed by the asset actually charged
+  (quote adjusts quote flow, base adjusts base flow, any third asset like
+  BNB is recorded separately and never touches quote/base balances); a
+  base-asset commission reported on a SELL - which Binance's fee model
+  does not support - is rejected rather than guessed at
+  (`UnsupportedCommissionError`).
+- **Backtest UTC-day ordering was backwards**: a day boundary was detected
+  and its counters reset using the CURRENT candle's close price, and only
+  AFTER resolving whatever signal had been queued from the previous
+  candle - so a trade that executed on the first candle of a new day had
+  its realized PnL attributed to (and then discarded from) the day that
+  merely queued it, and the new day's starting equity was computed from a
+  price already moved by that same day's own price action. Reordered to
+  detect/initialize the new day FIRST, using that candle's OPEN price,
+  before resolving any pending signal or checking the stop-loss.
+  Regression tests reproduce both an EXIT and a losing stop misattributed
+  across a day boundary in the old ordering, and confirm the new ordering
+  correctly lets the loss block a later same-day trade via
+  `max_daily_loss_pct`.
+- **Stop-loss sizing ignored costs**: position size was `risk_budget /
+  (entry_price - stop_price)` - the bare price gap, ignoring the same
+  entry/exit slippage and taker fees every other simulated fill in this
+  project pays, so an ordinary (non-gap) stop hit could lose more than the
+  configured risk budget. `sizing/position_sizer.py::
+  compute_risk_based_buy_quantity` now sizes against the full expected
+  cost (price gap plus both legs' slippage and fees); a genuine gap
+  through the stop can still exceed the budget, and that limitation is now
+  explicitly tested and documented rather than merely implied.
+- **Testnet capability was under-described**: "automatic entry is
+  disabled" did not make clear that Testnet operation is observational, or
+  that SELL exists only to close/recover an already-established, fully
+  reconciled position rather than as a general trading path. Made explicit
+  in the `run`/`status` CLI output and in README.md, RISK_POLICY.md, and
+  SECURITY.md.
+
 ## [0.1.1] - Independent review response
 
 An independent review of commit `bd5a49b` found ten safety and

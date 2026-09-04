@@ -61,16 +61,34 @@ def compute_risk_based_buy_quantity(
     stop_price: Decimal,
     max_risk_per_trade_pct: float,
     max_position_pct: float,
+    taker_fee_pct: float,
+    slippage_pct: float,
     filters: SymbolFilters,
 ) -> SizingDecision:
-    """Size a position from a real stop-loss distance, not a notional guess.
+    """Size a position from a real, cost-aware stop-loss distance, not a
+    notional guess and not the bare price gap between entry and stop.
 
-    quantity = risk_budget / stop_distance, where risk_budget = equity *
-    max_risk_per_trade_pct and stop_distance = entry_price - stop_price.
-    That is the actual amount lost, per unit, if the stop is hit - this is
-    what makes `max_risk_per_trade_pct` a genuine risk figure rather than a
-    proxy for position size (contrast with the old notional-cap approach
-    documented as a limitation in earlier revisions - see RISK_POLICY.md).
+    Review round 2, Finding 6: the raw `entry_price - stop_price` gap
+    understates what an ordinary (non-gap) stop actually costs, because it
+    ignores the same slippage and fees every other simulated fill in this
+    project pays. quantity = risk_budget / total_loss_per_unit, where:
+
+      - effective_entry = entry_price * (1 + slippage_pct)  (a buy fills
+        higher than the reference price - see execution/backtest_broker.py)
+      - effective_exit  = stop_price  * (1 - slippage_pct)  (a sell/stop
+        fills lower)
+      - total_loss_per_unit = (effective_entry - effective_exit)
+        + effective_entry * taker_fee_pct + effective_exit * taker_fee_pct
+
+    Sizing against this total means the EXPECTED loss of an ordinary
+    (non-gap) stop hit is <= equity * max_risk_per_trade_pct. It does NOT
+    bound a gap-through-stop: if the market gaps below the stop price
+    before an exit can be filled at or near it (backtest/engine.py's
+    `_execute_stop_exit` fills at the worse of the stop price or that
+    candle's open, modeling this conservatively rather than hiding it),
+    the realized loss can still exceed the risk budget. That is a real,
+    disclosed limitation of a fixed-percentage stop - not something any
+    position sizing can fully prevent - see RISK_POLICY.md and STRATEGY.md.
 
     `max_position_pct` is enforced as a SEPARATE notional ceiling on top of
     the risk-based size - a tight stop can legitimately justify a large
@@ -84,14 +102,21 @@ def compute_risk_based_buy_quantity(
     """
     if entry_price <= 0 or stop_price <= 0:
         return SizingDecision(False, None, "INVALID_PRICE")
-    stop_distance = entry_price - stop_price
-    if stop_distance <= 0:
-        return SizingDecision(False, None, "INVALID_STOP_DISTANCE")
     if equity <= 0:
         return SizingDecision(False, None, "INVALID_EQUITY")
 
+    slippage = Decimal(str(slippage_pct))
+    fee = Decimal(str(taker_fee_pct))
+    effective_entry = entry_price * (1 + slippage)
+    effective_exit = stop_price * (1 - slippage)
+    total_loss_per_unit = (
+        (effective_entry - effective_exit) + effective_entry * fee + effective_exit * fee
+    )
+    if total_loss_per_unit <= 0:
+        return SizingDecision(False, None, "INVALID_STOP_DISTANCE")
+
     risk_budget = equity * Decimal(str(max_risk_per_trade_pct))
-    risk_based_quantity = risk_budget / stop_distance
+    risk_based_quantity = risk_budget / total_loss_per_unit
 
     max_notional = equity * Decimal(str(max_position_pct))
     position_cap_quantity = max_notional / entry_price

@@ -1,20 +1,20 @@
-"""Applies a Binance order result to portfolio state, handling every
-possible order status distinctly and exactly once.
+"""Computes what happened NEW to an order since the last time its
+cumulative execution was applied - a pure function with no I/O, safe to
+call from inside a single atomic database transaction
+(persistence/execution_store.py).
 
-This is the single place that decides what an order's status means for
-local state. It is used both by the main testnet decision cycle (right
-after submitting an order) and by startup reconciliation
-(startup_reconciliation.py), so a given status is always handled the same
-way regardless of when it is observed - today or after a crash and
-restart.
+Review Finding 3: deltas are computed directly from Binance's own
+cumulative `executed_qty`/`cumulative_quote_qty` fields (never from a
+caller-recomputed running total, and never via proportional estimation
+across fills at different prices - the cumulative fields are exact).
+Binance's cumulative fields must never decrease between observations;
+if they do, that is an inconsistent report and must be rejected, not
+silently applied.
 
-Hard rule, per the review finding this module exists to fix: the
-requested/intended quantity is NEVER substituted for a missing or zero
-`executed_qty`. Only Binance's own reported `executed_qty` and
-`cumulative_quote_qty` are ever applied, and only the portion not already
-applied in a previous call (`previously_applied_qty`) - so re-observing
-the same order (e.g. on a later reconciliation pass) never double-counts
-a fill.
+Review Finding 1: the requested/intended quantity is never substituted
+for a missing or zero `executed_qty` - only Binance's own reported
+numbers are ever applied, and only the delta beyond what was already
+applied, so re-observing the same order never double-counts a fill.
 """
 
 from __future__ import annotations
@@ -23,21 +23,16 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Literal
 
-from trading_agent.execution.fees import (
-    compute_confirmed_fee_for_first_application,
-    estimate_fee_for_incremental_fill,
-)
+from trading_agent.execution.fees import compute_commission_buckets
 from trading_agent.execution.testnet_adapter import OrderResult
-from trading_agent.portfolio.state import (
-    PortfolioState,
-    apply_buy,
-    apply_partial_fill_increase,
-    apply_sell,
-)
+from trading_agent.portfolio.state import PortfolioState, apply_fill_delta
 
-TERMINAL_STATUSES = {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}
+TERMINAL_STATUSES = {"FILLED", "CANCELED", "REJECTED", "EXPIRED", "NEVER_SUBMITTED"}
 OPEN_STATUSES = {"NEW", "PARTIALLY_FILLED"}
 
+# NEVER_SUBMITTED is not a real Binance status - it's used internally by
+# startup_reconciliation.py to close out a pending order that a NOT_FOUND
+# (-2013) reconciliation confirmed never reached the exchange at all.
 _JOURNAL_EVENT_BY_STATUS = {
     "NEW": "ORDER_OPEN",
     "PARTIALLY_FILLED": "ORDER_PARTIALLY_FILLED",
@@ -45,81 +40,120 @@ _JOURNAL_EVENT_BY_STATUS = {
     "CANCELED": "ORDER_CANCELED",
     "REJECTED": "ORDER_REJECTED",
     "EXPIRED": "ORDER_EXPIRED",
+    "NEVER_SUBMITTED": "ORDER_NEVER_SUBMITTED",
 }
 
 
+class InconsistentExecutionReportError(Exception):
+    """Raised when Binance's cumulative fields would decrease, or are
+    otherwise internally inconsistent, relative to what was already
+    applied. Must never be silently accepted."""
+
+
 @dataclass(frozen=True, slots=True)
-class OrderOutcome:
+class OrderApplicationResult:
     portfolio: PortfolioState
     is_terminal: bool
-    newly_applied_qty: Decimal  # the DELTA quantity applied by this call - never the full requested qty
+    new_applied_executed_qty: Decimal
+    new_applied_cumulative_quote_qty: Decimal
+    new_applied_commission_quote: Decimal
+    new_applied_commission_base: Decimal
+    new_applied_commission_other: dict[str, Decimal]
     journal_event_type: str
     journal_payload: dict
-    realized_pnl_delta: Decimal | None  # only set when this call applied part of a SELL
+    realized_pnl_delta: Decimal | None
 
 
-def apply_order_result(
+def compute_order_application(
     order: OrderResult,
     side: Literal["BUY", "SELL"],
     quote_asset: str,
+    base_asset: str,
     portfolio: PortfolioState,
-    previously_applied_qty: Decimal,
+    applied_executed_qty: Decimal,
+    applied_cumulative_quote_qty: Decimal,
+    applied_commission_quote: Decimal,
+    applied_commission_base: Decimal,
+    applied_commission_other: dict[str, Decimal],
     fallback_fee_pct: Decimal,
-) -> OrderOutcome:
+) -> OrderApplicationResult:
     status = order.status
     is_terminal = status in TERMINAL_STATUSES
     event_type = _JOURNAL_EVENT_BY_STATUS.get(status, "ORDER_UNKNOWN_STATUS")
 
+    if order.executed_qty < applied_executed_qty:
+        raise InconsistentExecutionReportError(
+            f"executed_qty {order.executed_qty} is less than already-applied {applied_executed_qty} "
+            f"for order {order.client_order_id}"
+        )
+    if order.cumulative_quote_qty < applied_cumulative_quote_qty:
+        raise InconsistentExecutionReportError(
+            f"cumulative_quote_qty {order.cumulative_quote_qty} is less than already-applied "
+            f"{applied_cumulative_quote_qty} for order {order.client_order_id}"
+        )
+    if (order.executed_qty == 0) != (order.cumulative_quote_qty == 0):
+        raise InconsistentExecutionReportError(
+            f"executed_qty={order.executed_qty} and cumulative_quote_qty={order.cumulative_quote_qty} "
+            f"are inconsistent with each other for order {order.client_order_id}"
+        )
+
     if status == "NEW":
-        # Accepted, nothing executed yet - the portfolio must not change.
-        return OrderOutcome(
-            portfolio, False, Decimal(0), event_type,
-            {"status": status, "order_id": order.order_id}, None,
+        return OrderApplicationResult(
+            portfolio, False, applied_executed_qty, applied_cumulative_quote_qty,
+            applied_commission_quote, applied_commission_base, applied_commission_other,
+            event_type, {"status": status, "order_id": order.order_id}, None,
         )
 
-    delta_qty = order.executed_qty - previously_applied_qty
-    if delta_qty <= 0:
-        # No new execution to apply (e.g. CANCELED/REJECTED with zero fill,
-        # or a status we've already fully applied).
-        return OrderOutcome(
-            portfolio, is_terminal, Decimal(0), event_type,
-            {"status": status, "order_id": order.order_id, "executed_qty": str(order.executed_qty)}, None,
+    delta_base_qty = order.executed_qty - applied_executed_qty
+    delta_quote_qty = order.cumulative_quote_qty - applied_cumulative_quote_qty
+
+    if delta_base_qty <= 0:
+        return OrderApplicationResult(
+            portfolio, is_terminal, applied_executed_qty, applied_cumulative_quote_qty,
+            applied_commission_quote, applied_commission_base, applied_commission_other,
+            event_type, {"status": status, "order_id": order.order_id, "executed_qty": str(order.executed_qty)}, None,
         )
 
-    fraction_of_order = delta_qty / order.executed_qty if order.executed_qty > 0 else Decimal(1)
-    delta_quote = order.cumulative_quote_qty * fraction_of_order
-    fill_price = delta_quote / delta_qty
-
-    if previously_applied_qty == 0:
-        fee_quote, fee_is_estimated = compute_confirmed_fee_for_first_application(
-            order.fills, quote_asset, fallback_notional=delta_quote, fallback_fee_pct=fallback_fee_pct
-        )
-    else:
-        fee_quote, fee_is_estimated = estimate_fee_for_incremental_fill(delta_quote, fallback_fee_pct)
+    commission_quote_delta, commission_base_delta, commission_other_delta, is_estimated = compute_commission_buckets(
+        order.fills, quote_asset, base_asset, fallback_notional=delta_quote_qty, fallback_fee_pct=fallback_fee_pct
+    )
 
     realized_pnl_delta: Decimal | None = None
     if side == "BUY":
-        if previously_applied_qty == 0:
-            new_portfolio = apply_buy(portfolio, delta_qty, fill_price, fee_quote, fee_is_estimated)
-        else:
-            new_portfolio = apply_partial_fill_increase(portfolio, delta_qty, fill_price, fee_quote, fee_is_estimated)
+        new_portfolio = apply_fill_delta(
+            portfolio, "BUY", delta_base_qty, delta_quote_qty,
+            commission_quote_delta, commission_base_delta, is_estimated,
+        )
     else:
         pnl_before = portfolio.realized_pnl_quote
-        new_portfolio = apply_sell(portfolio, delta_qty, fill_price, fee_quote, fee_is_estimated)
+        new_portfolio = apply_fill_delta(
+            portfolio, "SELL", delta_base_qty, delta_quote_qty,
+            commission_quote_delta, commission_base_delta, is_estimated,
+        )
         realized_pnl_delta = new_portfolio.realized_pnl_quote - pnl_before
 
-    return OrderOutcome(
+    merged_other = dict(applied_commission_other)
+    for asset, amount in commission_other_delta.items():
+        merged_other[asset] = merged_other.get(asset, Decimal(0)) + amount
+
+    return OrderApplicationResult(
         portfolio=new_portfolio,
         is_terminal=is_terminal,
-        newly_applied_qty=delta_qty,
+        new_applied_executed_qty=order.executed_qty,
+        new_applied_cumulative_quote_qty=order.cumulative_quote_qty,
+        new_applied_commission_quote=applied_commission_quote + commission_quote_delta,
+        new_applied_commission_base=applied_commission_base + commission_base_delta,
+        new_applied_commission_other=merged_other,
         journal_event_type=event_type,
         journal_payload={
             "status": status,
             "order_id": order.order_id,
-            "applied_qty": str(delta_qty),
-            "fill_price": str(fill_price),
-            "fee_quote": str(fee_quote),
-            "fee_is_estimated": fee_is_estimated,
+            "applied_qty": str(delta_base_qty),
+            "applied_quote": str(delta_quote_qty),
+            "commission_quote": str(commission_quote_delta),
+            "commission_base": str(commission_base_delta),
+            "commission_other": {k: str(v) for k, v in commission_other_delta.items()},
+            "fee_is_estimated": is_estimated,
         },
         realized_pnl_delta=realized_pnl_delta,
     )

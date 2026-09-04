@@ -132,14 +132,20 @@ advice, and past simulated performance does not indicate future results.**
 trading-agent --mode testnet run
 ```
 
-This performs **one decision cycle**: reconcile any unresolved order from
-a previous run and check that local and exchange balances still agree,
-fetch the latest completed candles from the Testnet, generate a signal,
-and - for an EXIT only - size it, risk-check it, validate it against live
-exchange filters, and (if every check passes and the
-[kill switch](RISK_POLICY.md#kill-switch) is not engaged) place one real
-(but play-money) order on the Spot Testnet. It is meant to be invoked once
-per completed 4h candle, e.g. by a cron job or scheduled task:
+**Testnet operation is OBSERVATIONAL, not a general trading path.** Every
+cycle: reconciles any unresolved order from a previous run and checks that
+local and exchange balances still agree (either check failing blocks ALL
+new order submission this cycle - BUY and EXIT alike, since an untrusted
+local balance is exactly as unsafe for sizing a SELL as a BUY), fetches the
+latest completed candles from the Testnet, and generates a signal. A BUY
+signal is always logged and reported, never acted on - **this agent cannot
+initiate a position on Testnet at all.** Only for an EXIT does it size,
+risk-check, validate against live exchange filters, and (if every check
+passes and the [kill switch](RISK_POLICY.md#kill-switch) is not engaged)
+place one real (but play-money) order - and only to close, or help
+recover, a position that already exists and has been fully reconciled
+against the exchange. It is meant to be invoked once per completed 4h
+candle, e.g. by a cron job or scheduled task:
 
 ```cron
 # Run 5 minutes after every 4h candle closes (server time is UTC)
@@ -151,7 +157,8 @@ per completed 4h candle, e.g. by a cron job or scheduled task:
 > protective stop order - see [RISK_POLICY.md](RISK_POLICY.md#protective-exits-why-max_risk_per_trade_pct-now-means-what-it-says-and-why-testnet-entry-is-disabled)
 > for why. The `run` command will log and report a suppressed BUY signal
 > rather than silently ignoring it. EXIT (closing a position you opened
-> manually via the Testnet UI) still works normally.
+> manually via the Testnet UI, or that a previous cycle opened) still
+> works normally, provided local and exchange balances agree.
 
 On its very first run, the agent reconciles its starting portfolio from
 your actual Testnet account balance. If that account already holds a

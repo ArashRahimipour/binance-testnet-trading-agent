@@ -6,14 +6,25 @@ running its own polling loop. That keeps the process simple: it starts,
 resolves anything left unresolved by a previous run, makes at most one
 trade decision, records everything, and exits.
 
-Automatic entry (BUY) is disabled on Testnet in this revision - see
-RISK_POLICY.md's "Protective exits" section for why: this baseline
+Testnet operation is OBSERVATIONAL in this revision (round 2 finding #7):
+every cycle evaluates HOLD normally, but a BUY signal is always suppressed
+- the agent cannot initiate a position on Testnet at all. SELL exists only
+to close (or help recover) a position that already exists and has been
+fully reconciled against the exchange - it is not a general trading path.
+See RISK_POLICY.md's "Protective exits" section for why: this baseline
 strategy has no verified exchange-resident stop-loss order on Testnet yet,
 and shipping unexercised order-signing code for the one feature whose job
 is capital protection is not a risk this project is willing to take
 without first testing it against a live Testnet from an environment with
-real network access. EXIT (closing an existing position) remains enabled,
-consistent with the project-wide rule that de-risking is never blocked.
+real network access.
+
+Round 2 finding #2 correction: a SELL is never sized from a local base
+balance that reconciliation has flagged as untrustworthy. This is
+enforced twice, deliberately redundantly: the risk engine's universal
+`reconciliation_blocked` gate (risk/engine.py) would reject the resulting
+intent regardless, but this module does not even compute a sizing
+decision from local state while blocked - it short-circuits before ever
+calling `compute_sell_quantity`.
 
 Known simplifications, documented rather than hidden:
   - Cold start requires the testnet account to be flat (no base asset
@@ -21,9 +32,10 @@ Known simplifications, documented rather than hidden:
     have no way to know its cost basis from a balance query alone, and
     guessing would corrupt PnL accounting. The operator must flatten
     manually via the Testnet UI first.
-  - Fee accounting parses Binance's actual per-fill commission when the
-    order response includes `fills` and every fill's commission is
-    quote-denominated; otherwise it falls back to
+  - Fee accounting parses Binance's actual per-fill commission, bucketed
+    by asset, when the order response includes `fills` (only the direct
+    response to placing an order does - a reconciliation query never
+    returns fills); otherwise it falls back to
     `cumulative_quote_qty * taker_fee_pct` and marks the result as
     estimated (see execution/fees.py and portfolio/state.py's
     `pnl_is_estimated`).
@@ -43,7 +55,6 @@ from trading_agent.data.ingestion import fetch_completed_candles, require_non_em
 from trading_agent.data.market_data_public import TESTNET_HOST, BinancePublicMarketDataClient
 from trading_agent.data.validation import validate_candle_sequence, validate_not_stale
 from trading_agent.execution.client_order_id import generate_client_order_id
-from trading_agent.execution.order_outcome import apply_order_result
 from trading_agent.execution.order_validator import validate_order
 from trading_agent.execution.reconciliation import ReconciledStatus, reconcile_order, safe_to_retry
 from trading_agent.execution.startup_reconciliation import (
@@ -56,8 +67,7 @@ from trading_agent.execution.testnet_adapter import (
     TestnetBrokerAdapter,
 )
 from trading_agent.journal.journal import Journal
-from trading_agent.persistence.pending_orders_store import PendingOrdersStore
-from trading_agent.persistence.portfolio_store import PortfolioStore
+from trading_agent.persistence.execution_store import ExecutionStateStore
 from trading_agent.persistence.risk_state_store import RiskState, RiskStateStore
 from trading_agent.portfolio.state import PortfolioState
 from trading_agent.risk.engine import RiskEngine
@@ -69,6 +79,7 @@ from trading_agent.strategy.base import SignalType
 from trading_agent.strategy.trend_baseline import EmaCrossoverTrendStrategy
 
 TESTNET_ENTRY_DISABLED_REASON = "TESTNET_AUTO_ENTRY_DISABLED_PENDING_PROTECTIVE_ORDER"
+RECONCILIATION_BLOCKS_SELL_REASON = "RECONCILIATION_DISCREPANCY_BLOCKS_ALL_ORDERS"
 
 
 class ColdStartReconciliationError(Exception):
@@ -77,7 +88,7 @@ class ColdStartReconciliationError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class CycleResult:
-    action: str  # "HOLD", "BUY", "SELL", "NO_TRADE", "ERROR"
+    action: str  # "HOLD", "SELL", "NO_TRADE", "ERROR"
     reason_code: str
     detail: dict
 
@@ -119,9 +130,8 @@ def run_testnet_cycle(
     config: AppConfig,
     secrets: Secrets,
     journal: Journal,
-    portfolio_store: PortfolioStore,
+    execution_store: ExecutionStateStore,
     risk_state_store: RiskStateStore,
-    pending_orders_store: PendingOrdersStore,
 ) -> CycleResult:
     symbol = config.market.symbol
     interval = config.market.interval
@@ -150,24 +160,25 @@ def run_testnet_cycle(
 
     last_candle = candles[-1]
 
-    portfolio = portfolio_store.load(symbol)
+    portfolio = execution_store.load_portfolio(symbol)
     if portfolio is None:
         portfolio = reconcile_initial_portfolio(adapter, symbol, filters)
-        portfolio_store.save(symbol, portfolio, server_time_ms)
+        execution_store.save_portfolio(symbol, portfolio, server_time_ms)
 
-    # --- Finding 2: resolve anything left unresolved by a previous (possibly
-    # crashed) run BEFORE ever generating a new signal. ---
+    # --- Finding 2 (round 2): resolve anything left unresolved by a previous
+    # (possibly crashed) run BEFORE ever generating a new signal, atomically. ---
     pending_result = reconcile_pending_orders(
-        adapter, symbol, quote_asset, pending_orders_store, portfolio,
+        adapter, symbol, quote_asset, base_asset, execution_store,
         Decimal(str(config.fees.taker_fee_pct)), journal, server_time_ms,
     )
-    portfolio = pending_result.portfolio
-    portfolio_store.save(symbol, portfolio, server_time_ms)
     if pending_result.blocked:
         return CycleResult("NO_TRADE", "UNRESOLVED_ORDER_BLOCKS_NEW_SIGNAL", {"reason": pending_result.blocked_reason})
 
-    # --- Finding 5: continuous balance reconciliation, every cycle. ---
-    balances_ok, balances_reason = reconcile_balances(adapter, quote_asset, base_asset, portfolio)
+    portfolio = execution_store.load_portfolio(symbol)  # reload - reconciliation may have changed it
+    assert portfolio is not None, "portfolio was seeded above and reconciliation never deletes it"
+
+    # --- Finding 5 (round 2): continuous balance reconciliation, every cycle. ---
+    balances_ok, balances_reason = reconcile_balances(adapter, symbol, quote_asset, base_asset, execution_store)
     if not balances_ok:
         journal.record("RECONCILIATION_DISCREPANCY", {"reason": balances_reason}, server_time_ms)
     reconciliation_blocked = not balances_ok
@@ -203,7 +214,7 @@ def run_testnet_cycle(
         return CycleResult("HOLD", signal.reason_code, {})
 
     if signal.type == SignalType.BUY:
-        # Finding 4: automatic entry is disabled on Testnet in this revision.
+        # Observational mode (Finding 7): automatic entry is disabled entirely.
         journal.record(
             "SIGNAL_SUPPRESSED",
             {"reason": TESTNET_ENTRY_DISABLED_REASON},
@@ -211,6 +222,16 @@ def run_testnet_cycle(
         )
         risk_state_store.save(symbol, risk_state)
         return CycleResult("NO_TRADE", TESTNET_ENTRY_DISABLED_REASON, {})
+
+    # --- Finding 2 (round 2): never size a SELL from an untrusted local balance. ---
+    if reconciliation_blocked:
+        journal.record(
+            "SIGNAL_SUPPRESSED",
+            {"reason": RECONCILIATION_BLOCKS_SELL_REASON, "detail": balances_reason},
+            last_candle.close_time_ms,
+        )
+        risk_state_store.save(symbol, risk_state)
+        return CycleResult("NO_TRADE", RECONCILIATION_BLOCKS_SELL_REASON, {"reason": balances_reason})
 
     side: Literal["SELL"] = "SELL"
     sizing = compute_sell_quantity(portfolio.base_balance, last_candle.close, filters)
@@ -223,7 +244,7 @@ def run_testnet_cycle(
         return CycleResult("NO_TRADE", sizing.reason_code, {})
 
     client_order_id = generate_client_order_id(symbol, side, last_candle.close_time_ms)
-    already_submitted = pending_orders_store.get(client_order_id) is not None or any(
+    already_submitted = execution_store.get_pending(client_order_id) is not None or any(
         e["payload"].get("client_order_id") == client_order_id
         for e in journal.entries_by_type("ORDER_SUBMITTED")
     )
@@ -269,9 +290,9 @@ def run_testnet_cycle(
 
     quantity = validation.validated_quantity
 
-    # Finding 2: durably record the intent to submit BEFORE calling the
-    # exchange, so a crash at any point after this line is recoverable.
-    pending_orders_store.create(client_order_id, symbol, side, quantity, last_candle.close_time_ms, server_time_ms)
+    # Round 2 finding #1: durably record the intent to submit BEFORE calling
+    # the exchange, in the SAME database that will atomically apply the fill.
+    execution_store.create_pending(client_order_id, symbol, side, quantity, last_candle.close_time_ms, server_time_ms)
     journal.record(
         "ORDER_SUBMITTED",
         {"client_order_id": client_order_id, "side": side, "quantity": str(quantity)},
@@ -281,9 +302,7 @@ def run_testnet_cycle(
     try:
         order = adapter.place_market_order(symbol, side, quantity, client_order_id)
     except requests.exceptions.RequestException:
-        # Finding 9: ANY ambiguous network failure (timeout, connection
-        # reset, DNS failure, ...) - not just Timeout - means we don't know
-        # whether Binance received this order. Reconcile before retrying.
+        # Any ambiguous network failure (not just Timeout) - reconcile before retrying.
         status, reconciled_order = reconcile_order(adapter, symbol, client_order_id)
         journal.record("RECONCILIATION", {"status": status.value}, last_candle.close_time_ms)
         if safe_to_retry(status):
@@ -309,35 +328,33 @@ def run_testnet_cycle(
 
     risk_state.consecutive_api_errors = 0
 
-    # Finding 1: dispatch on the order's ACTUAL status. Never substitute the
-    # requested quantity for a missing/zero executed_qty.
-    outcome = apply_order_result(order, side, quote_asset, portfolio, Decimal(0), Decimal(str(config.fees.taker_fee_pct)))
-    portfolio = outcome.portfolio
-    journal.record(outcome.journal_event_type, outcome.journal_payload, last_candle.close_time_ms)
+    # Round 2 findings #1/#3/#4: one atomic transaction applies exactly the
+    # new execution delta (from Binance's cumulative fields, commission
+    # bucketed by asset) to portfolio state and the pending order's applied
+    # fields together, or not at all.
+    result = execution_store.apply_order_result_atomically(
+        symbol, quote_asset, base_asset, order, Decimal(str(config.fees.taker_fee_pct)), server_time_ms
+    )
+    journal.record(result.journal_event_type, result.journal_payload, last_candle.close_time_ms)
 
-    if outcome.is_terminal:
-        pending_orders_store.mark_resolved(client_order_id, order.status, server_time_ms)
-    else:
-        pending_orders_store.update_applied_qty(client_order_id, outcome.newly_applied_qty)
-
-    if outcome.newly_applied_qty > 0 or outcome.is_terminal:
+    newly_applied_qty = result.new_applied_executed_qty  # this pending order started at applied=0
+    if newly_applied_qty > 0 or result.is_terminal:
         risk_state.trades_today += 1
-    if outcome.realized_pnl_delta is not None:
+    if result.realized_pnl_delta is not None:
         if risk_state.daily_start_equity > 0:
-            risk_state.daily_realized_pnl_pct += float(outcome.realized_pnl_delta / risk_state.daily_start_equity)
-        if outcome.realized_pnl_delta < 0:
+            risk_state.daily_realized_pnl_pct += float(result.realized_pnl_delta / risk_state.daily_start_equity)
+        if result.realized_pnl_delta < 0:
             risk_state.cooldown_bars_remaining = config.risk.cooldown_bars_after_loss
 
-    portfolio_store.save(symbol, portfolio, server_time_ms)
     risk_state_store.save(symbol, risk_state)
 
-    if not outcome.is_terminal:
+    if not result.is_terminal:
         return CycleResult("NO_TRADE", "ORDER_STILL_OPEN", {"status": order.status, "client_order_id": client_order_id})
-    if outcome.newly_applied_qty == 0:
+    if newly_applied_qty == 0:
         return CycleResult("NO_TRADE", order.status, {"client_order_id": client_order_id})
 
     return CycleResult(
         side,
         order.status,
-        {"quantity": str(outcome.newly_applied_qty), "client_order_id": client_order_id},
+        {"quantity": str(newly_applied_qty), "client_order_id": client_order_id},
     )

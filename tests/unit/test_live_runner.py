@@ -8,14 +8,15 @@ import responses
 from tests.fixtures.exchange_info import make_exchange_info
 from trading_agent.config.models import AppConfig, Secrets
 from trading_agent.data.models import interval_to_ms
+from trading_agent.execution.client_order_id import generate_client_order_id
 from trading_agent.execution.live_runner import (
+    RECONCILIATION_BLOCKS_SELL_REASON,
     TESTNET_ENTRY_DISABLED_REASON,
     ColdStartReconciliationError,
     run_testnet_cycle,
 )
 from trading_agent.journal.journal import Journal
-from trading_agent.persistence.pending_orders_store import PendingOrdersStore
-from trading_agent.persistence.portfolio_store import PortfolioStore
+from trading_agent.persistence.execution_store import ExecutionStateStore
 from trading_agent.persistence.risk_state_store import RiskStateStore
 from trading_agent.portfolio.state import PortfolioState
 from trading_agent.risk.kill_switch import KillSwitch
@@ -96,13 +97,13 @@ def _mock_common(closes: list[float], server_time_ms: int | None = None, min_not
 
 
 def _seed_flat_portfolio(config, quote_balance="50"):
-    with PortfolioStore(config.paths.db_path) as store:
-        store.save("BTCUSDT", PortfolioState.initial(Decimal(quote_balance)), updated_at_ms=0)
+    with ExecutionStateStore(config.paths.db_path) as store:
+        store.save_portfolio("BTCUSDT", PortfolioState.initial(Decimal(quote_balance)), updated_at_ms=0)
 
 
 def _seed_long_portfolio(config, quote_balance="10", base_balance="0.0004", avg_price="50000"):
-    with PortfolioStore(config.paths.db_path) as store:
-        store.save(
+    with ExecutionStateStore(config.paths.db_path) as store:
+        store.save_portfolio(
             "BTCUSDT",
             PortfolioState(
                 quote_balance=Decimal(quote_balance),
@@ -118,11 +119,10 @@ def _seed_long_portfolio(config, quote_balance="10", base_balance="0.0004", avg_
 def _run(config, tmp_path):
     with (
         Journal(tmp_path / "journal.db") as journal,
-        PortfolioStore(config.paths.db_path) as pstore,
+        ExecutionStateStore(config.paths.db_path) as execution_store,
         RiskStateStore(tmp_path / "risk.db") as rstore,
-        PendingOrdersStore(tmp_path / "pending.db") as pendingstore,
     ):
-        return run_testnet_cycle(config, _secrets(), journal, pstore, rstore, pendingstore)
+        return run_testnet_cycle(config, _secrets(), journal, execution_store, rstore)
 
 
 @responses.activate
@@ -147,8 +147,8 @@ def test_buy_signal_is_suppressed_on_testnet(tmp_path):
     result = _run(config, tmp_path)
     assert result.action == "NO_TRADE"
     assert result.reason_code == TESTNET_ENTRY_DISABLED_REASON
-    with PortfolioStore(config.paths.db_path) as store:
-        portfolio = store.load("BTCUSDT")
+    with ExecutionStateStore(config.paths.db_path) as store:
+        portfolio = store.load_portfolio("BTCUSDT")
     assert portfolio.position_side == PositionSide.FLAT  # untouched
 
 
@@ -156,15 +156,16 @@ def test_buy_signal_is_suppressed_on_testnet(tmp_path):
 def test_exit_signal_places_sell_order_and_updates_portfolio(tmp_path):
     config = _config(tmp_path)
     closes = [70, 75, 80, 85, 90, 95, 100, 50]  # bearish crossover -> EXIT
-    _mock_common(closes)
+    rows = _mock_common(closes)
     _seed_long_portfolio(config, quote_balance="10", base_balance="0.0004", avg_price="50000")
     _mock_account(quote_free="10", base_free="0.0004")
+    client_order_id = generate_client_order_id("BTCUSDT", "SELL", rows[-1][6])
     responses.add(
         responses.POST,
         f"{HOST}/api/v3/order",
         json={
             "orderId": 1,
-            "clientOrderId": "ta-x",
+            "clientOrderId": client_order_id,
             "status": "FILLED",
             "executedQty": "0.0004",
             "cummulativeQuoteQty": "20.0",
@@ -175,8 +176,8 @@ def test_exit_signal_places_sell_order_and_updates_portfolio(tmp_path):
     )
     result = _run(config, tmp_path)
     assert result.action == "SELL"
-    with PortfolioStore(config.paths.db_path) as store:
-        portfolio = store.load("BTCUSDT")
+    with ExecutionStateStore(config.paths.db_path) as store:
+        portfolio = store.load_portfolio("BTCUSDT")
     assert portfolio.position_side == PositionSide.FLAT
     assert portfolio.base_balance == Decimal(0)
 
@@ -233,21 +234,21 @@ def test_cold_start_with_nonzero_base_balance_refuses_to_guess(tmp_path):
     _mock_account(quote_free="10", base_free="1")  # nonzero, well above min_qty
     with (
         Journal(tmp_path / "journal.db") as journal,
-        PortfolioStore(config.paths.db_path) as pstore,
+        ExecutionStateStore(config.paths.db_path) as execution_store,
         RiskStateStore(tmp_path / "risk.db") as rstore,
-        PendingOrdersStore(tmp_path / "pending.db") as pendingstore,
         pytest.raises(ColdStartReconciliationError),
     ):
-        run_testnet_cycle(config, _secrets(), journal, pstore, rstore, pendingstore)
+        run_testnet_cycle(config, _secrets(), journal, execution_store, rstore)
 
 
 @responses.activate
 def test_timeout_then_not_found_retries_and_succeeds(tmp_path):
     config = _config(tmp_path)
     closes = [70, 75, 80, 85, 90, 95, 100, 50]
-    _mock_common(closes)
+    rows = _mock_common(closes)
     _seed_long_portfolio(config)
     _mock_account(quote_free="10", base_free="0.0004")
+    client_order_id = generate_client_order_id("BTCUSDT", "SELL", rows[-1][6])
 
     responses.add(responses.POST, f"{HOST}/api/v3/order", body=requests.exceptions.Timeout())
     responses.add(
@@ -258,7 +259,7 @@ def test_timeout_then_not_found_retries_and_succeeds(tmp_path):
         responses.POST,
         f"{HOST}/api/v3/order",
         json={
-            "orderId": 2, "clientOrderId": "ta-x", "status": "FILLED",
+            "orderId": 2, "clientOrderId": client_order_id, "status": "FILLED",
             "executedQty": "0.0004", "cummulativeQuoteQty": "20.0", "transactTime": 1,
         },
         status=200,
@@ -273,9 +274,10 @@ def test_connection_error_is_treated_as_ambiguous_and_reconciled_before_retry(tm
     # reconciled before a retry is attempted.
     config = _config(tmp_path)
     closes = [70, 75, 80, 85, 90, 95, 100, 50]
-    _mock_common(closes)
+    rows = _mock_common(closes)
     _seed_long_portfolio(config)
     _mock_account(quote_free="10", base_free="0.0004")
+    client_order_id = generate_client_order_id("BTCUSDT", "SELL", rows[-1][6])
 
     responses.add(responses.POST, f"{HOST}/api/v3/order", body=requests.exceptions.ConnectionError())
     responses.add(
@@ -286,7 +288,7 @@ def test_connection_error_is_treated_as_ambiguous_and_reconciled_before_retry(tm
         responses.POST,
         f"{HOST}/api/v3/order",
         json={
-            "orderId": 2, "clientOrderId": "ta-x", "status": "FILLED",
+            "orderId": 2, "clientOrderId": client_order_id, "status": "FILLED",
             "executedQty": "0.0004", "cummulativeQuoteQty": "20.0", "transactTime": 1,
         },
         status=200,
@@ -320,26 +322,53 @@ def test_duplicate_order_already_journaled_blocks_resubmission(tmp_path):
 
 
 @responses.activate
-def test_balance_discrepancy_blocks_new_entries_but_exit_still_allowed(tmp_path):
-    # A BUY would already be suppressed regardless, but this proves the
-    # reconciliation-blocked gate is wired through RiskContext and that an
-    # EXIT is unaffected by a balance mismatch (Findings 2 & 5).
+def test_balance_discrepancy_blocks_sell_too(tmp_path):
+    # Round 2 finding #2: an untrusted local balance is exactly as unsafe
+    # for sizing a SELL as a BUY. Before the fix this asserted the opposite
+    # (that a SELL was still allowed despite a quote-balance mismatch) - that
+    # was the bug the reviewer found. No order should be placed at all.
     config = _config(tmp_path)
     closes = [70, 75, 80, 85, 90, 95, 100, 50]
     _mock_common(closes)
     _seed_long_portfolio(config, quote_balance="10", base_balance="0.0004")
     _mock_account(quote_free="999", base_free="0.0004")  # quote mismatch
-    responses.add(
-        responses.POST,
-        f"{HOST}/api/v3/order",
-        json={
-            "orderId": 1, "clientOrderId": "ta-x", "status": "FILLED",
-            "executedQty": "0.0004", "cummulativeQuoteQty": "20.0", "transactTime": 1,
-        },
-        status=200,
-    )
     result = _run(config, tmp_path)
-    assert result.action == "SELL"  # still allowed despite the discrepancy
+    assert result.action == "NO_TRADE"
+    assert result.reason_code == RECONCILIATION_BLOCKS_SELL_REASON
+    assert len(responses.calls) == 0 or all(
+        call.request.method != "POST" for call in responses.calls
+    )  # no order was ever submitted
+
+
+@responses.activate
+def test_local_base_balance_exceeding_exchange_blocks_sell(tmp_path):
+    # Explicit case required by finding #2: local BTC > exchange BTC must
+    # not size (or place) a SELL from the untrusted local figure.
+    config = _config(tmp_path)
+    closes = [70, 75, 80, 85, 90, 95, 100, 50]
+    _mock_common(closes)
+    _seed_long_portfolio(config, quote_balance="10", base_balance="0.0004")
+    _mock_account(quote_free="10", base_free="0.0001")  # exchange holds less BTC than local believes
+    result = _run(config, tmp_path)
+    assert result.action == "NO_TRADE"
+    assert result.reason_code == RECONCILIATION_BLOCKS_SELL_REASON
+    assert all(call.request.method != "POST" for call in responses.calls)
+
+
+@responses.activate
+def test_exchange_base_balance_exceeding_local_blocks_sell(tmp_path):
+    # The mirror case: exchange BTC > local BTC must equally block a SELL -
+    # the agent must never size from local state while it disagrees with
+    # the exchange in either direction.
+    config = _config(tmp_path)
+    closes = [70, 75, 80, 85, 90, 95, 100, 50]
+    _mock_common(closes)
+    _seed_long_portfolio(config, quote_balance="10", base_balance="0.0004")
+    _mock_account(quote_free="10", base_free="0.0020")  # exchange holds more BTC than local believes
+    result = _run(config, tmp_path)
+    assert result.action == "NO_TRADE"
+    assert result.reason_code == RECONCILIATION_BLOCKS_SELL_REASON
+    assert all(call.request.method != "POST" for call in responses.calls)
 
 
 @responses.activate
@@ -356,8 +385,8 @@ def test_pending_order_from_previous_crashed_run_is_resolved_before_new_signal(t
     _seed_long_portfolio(config, quote_balance="10", base_balance="0.0004")
     _mock_account(quote_free="10", base_free="0.0004")
 
-    with PendingOrdersStore(tmp_path / "pending.db") as store:
-        store.create("ta-crashed", "BTCUSDT", "SELL", Decimal("0.0004"), 1, 2)
+    with ExecutionStateStore(config.paths.db_path) as store:
+        store.create_pending("ta-crashed", "BTCUSDT", "SELL", Decimal("0.0004"), 1, 2)
 
     responses.add(
         responses.GET, f"{HOST}/api/v3/order",
@@ -371,11 +400,10 @@ def test_pending_order_from_previous_crashed_run_is_resolved_before_new_signal(t
     result = _run(config, tmp_path)
     assert result.action == "HOLD"
     assert result.reason_code == "HOLD_ALREADY_FLAT"
-    with PortfolioStore(config.paths.db_path) as pstore:
-        portfolio = pstore.load("BTCUSDT")
-    assert portfolio.base_balance == Decimal(0)  # crashed order's fill was applied, position now flat
-    with PendingOrdersStore(tmp_path / "pending.db") as store:
-        assert store.get("ta-crashed").status == "RESOLVED"
+    with ExecutionStateStore(config.paths.db_path) as store:
+        portfolio = store.load_portfolio("BTCUSDT")
+        assert portfolio.base_balance == Decimal(0)  # crashed order's fill was applied, position now flat
+        assert store.get_pending("ta-crashed").status == "RESOLVED"
 
 
 @responses.activate
@@ -386,8 +414,8 @@ def test_still_open_pending_order_blocks_new_signal_this_cycle(tmp_path):
     _seed_long_portfolio(config, quote_balance="10", base_balance="0.0008")
     _mock_account(quote_free="10", base_free="0.0008")
 
-    with PendingOrdersStore(tmp_path / "pending.db") as store:
-        store.create("ta-crashed", "BTCUSDT", "SELL", Decimal("0.0004"), 1, 2)
+    with ExecutionStateStore(config.paths.db_path) as store:
+        store.create_pending("ta-crashed", "BTCUSDT", "SELL", Decimal("0.0004"), 1, 2)
 
     responses.add(
         responses.GET, f"{HOST}/api/v3/order",
@@ -400,5 +428,5 @@ def test_still_open_pending_order_blocks_new_signal_this_cycle(tmp_path):
     result = _run(config, tmp_path)
     assert result.action == "NO_TRADE"
     assert result.reason_code == "UNRESOLVED_ORDER_BLOCKS_NEW_SIGNAL"
-    with PendingOrdersStore(tmp_path / "pending.db") as store:
-        assert store.get("ta-crashed").status == "SUBMITTED"  # remains open
+    with ExecutionStateStore(config.paths.db_path) as store:
+        assert store.get_pending("ta-crashed").status == "SUBMITTED"  # remains open

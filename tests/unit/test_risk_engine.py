@@ -134,11 +134,17 @@ def test_max_risk_per_trade_pct_is_not_a_notional_gate_here():
     assert decision.approved is True
 
 
-def test_reconciliation_blocked_blocks_buy_but_not_exit():
+def test_reconciliation_blocked_blocks_both_buy_and_exit():
+    # Round 2 finding #2: an untrusted local balance is unsafe for sizing
+    # a SELL too, so this is now a universal gate, not a buy-only one.
     engine = RiskEngine(DEFAULT_CONFIG)
     ctx = _context(reconciliation_blocked=True)
-    assert engine.evaluate(_buy_intent(), ctx).reason_code == "RECONCILIATION_DISCREPANCY_BLOCKS_ENTRY"
-    assert engine.evaluate(_exit_intent(), ctx).approved is True
+    buy_decision = engine.evaluate(_buy_intent(), ctx)
+    exit_decision = engine.evaluate(_exit_intent(), ctx)
+    assert buy_decision.approved is False
+    assert buy_decision.reason_code == "RECONCILIATION_DISCREPANCY_BLOCKS_ALL_ORDERS"
+    assert exit_decision.approved is False
+    assert exit_decision.reason_code == "RECONCILIATION_DISCREPANCY_BLOCKS_ALL_ORDERS"
 
 
 def test_exit_always_approved_when_no_universal_gate_triggered():

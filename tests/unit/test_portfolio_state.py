@@ -5,7 +5,9 @@ import pytest
 from trading_agent.portfolio.state import (
     InvalidTransitionError,
     PortfolioState,
+    UnsupportedCommissionError,
     apply_buy,
+    apply_fill_delta,
     apply_sell,
 )
 from trading_agent.strategy.base import PositionSide
@@ -111,6 +113,82 @@ def test_pnl_is_estimated_flag_propagates_from_entry_fee():
     assert state.pnl_is_estimated is True
     sold = apply_sell(state, quantity=Decimal("0.001"), price=Decimal(55000), fee_quote=Decimal(0))
     assert sold.pnl_is_estimated is False  # position fully closed, flag resets
+
+
+def test_apply_fill_delta_buy_with_quote_commission():
+    state = PortfolioState.initial(Decimal(100))
+    result = apply_fill_delta(
+        state, "BUY", delta_base_qty=Decimal("0.001"), delta_quote_qty=Decimal(50),
+        commission_quote=Decimal("0.05"), commission_base=Decimal(0),
+    )
+    assert result.base_balance == Decimal("0.001")
+    assert result.quote_balance == Decimal(100) - Decimal(50) - Decimal("0.05")
+    assert result.avg_entry_price == Decimal(50000)  # unaffected by a quote commission
+
+
+def test_apply_fill_delta_buy_with_base_commission_reduces_received_quantity():
+    state = PortfolioState.initial(Decimal(100))
+    result = apply_fill_delta(
+        state, "BUY", delta_base_qty=Decimal("0.001"), delta_quote_qty=Decimal(50),
+        commission_quote=Decimal(0), commission_base=Decimal("0.00001"),
+    )
+    net_qty = Decimal("0.001") - Decimal("0.00001")
+    assert result.base_balance == net_qty
+    assert result.quote_balance == Decimal(100) - Decimal(50)  # full quote paid regardless
+    assert result.avg_entry_price == Decimal(50) / net_qty  # higher effective cost per unit held
+
+
+def test_apply_fill_delta_buy_with_third_asset_commission_does_not_touch_balances():
+    state = PortfolioState.initial(Decimal(100))
+    result = apply_fill_delta(
+        state, "BUY", delta_base_qty=Decimal("0.001"), delta_quote_qty=Decimal(50),
+        commission_quote=Decimal(0), commission_base=Decimal(0),
+    )
+    # Third-asset (e.g. BNB) commission never reaches this function at all -
+    # the caller (fees.py/order_outcome.py) keeps it out of quote/base bucket
+    # computation entirely, so passing zero for both here IS the correct
+    # representation of "commission paid in a third asset".
+    assert result.base_balance == Decimal("0.001")
+    assert result.quote_balance == Decimal(100) - Decimal(50)
+
+
+def test_apply_fill_delta_buy_base_commission_consuming_entire_quantity_raises():
+    state = PortfolioState.initial(Decimal(100))
+    with pytest.raises(InvalidTransitionError):
+        apply_fill_delta(
+            state, "BUY", delta_base_qty=Decimal("0.001"), delta_quote_qty=Decimal(50),
+            commission_quote=Decimal(0), commission_base=Decimal("0.001"),
+        )
+
+
+def test_apply_fill_delta_sell_with_quote_commission():
+    state = apply_buy(PortfolioState.initial(Decimal(50)), Decimal("0.001"), Decimal(50000), Decimal(0))
+    result = apply_fill_delta(
+        state, "SELL", delta_base_qty=Decimal("0.001"), delta_quote_qty=Decimal(55),
+        commission_quote=Decimal("0.055"), commission_base=Decimal(0),
+    )
+    assert result.position_side == PositionSide.FLAT
+    assert result.quote_balance == state.quote_balance + Decimal(55) - Decimal("0.055")
+
+
+def test_apply_fill_delta_sell_with_base_commission_fails_closed():
+    state = apply_buy(PortfolioState.initial(Decimal(50)), Decimal("0.001"), Decimal(50000), Decimal(0))
+    with pytest.raises(UnsupportedCommissionError):
+        apply_fill_delta(
+            state, "SELL", delta_base_qty=Decimal("0.001"), delta_quote_qty=Decimal(55),
+            commission_quote=Decimal(0), commission_base=Decimal("0.00001"),
+        )
+
+
+def test_apply_fill_delta_buy_increases_existing_position_with_weighted_avg_price():
+    state = apply_buy(PortfolioState.initial(Decimal(200)), Decimal("0.001"), Decimal(50000), Decimal(0))
+    result = apply_fill_delta(
+        state, "BUY", delta_base_qty=Decimal("0.001"), delta_quote_qty=Decimal(60),
+        commission_quote=Decimal(0), commission_base=Decimal(0),
+    )
+    assert result.base_balance == Decimal("0.002")
+    # (50000*0.001 + 60000*0.001) / 0.002 = 55000
+    assert result.avg_entry_price == Decimal(55000)
 
 
 def test_pnl_is_estimated_flag_propagates_from_exit_fee():
