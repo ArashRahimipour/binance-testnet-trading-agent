@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from enum import Enum
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -94,6 +95,26 @@ class BacktestConfig(BaseModel):
     validation_fraction: float = Field(gt=0, lt=1, default=0.2)
     test_fraction: float = Field(gt=0, lt=1, default=0.2)
     min_trades_for_significance: int = Field(gt=0, default=20)
+
+    #: How a historical candle series with a confirmed gap is handled.
+    #: "reject" is the original strict behavior (any gap raises, exactly
+    #: like live/Testnet's validate_candle_sequence). "segment" - the
+    #: default for this research-only command - splits the series into
+    #: independent contiguous segments around each confirmed gap instead
+    #: of discarding the whole series; see backtest/engine.py's module
+    #: docstring. Live/Testnet signal generation never reads this field
+    #: and always behaves as "reject" - see execution/live_runner.py.
+    gap_policy: Literal["reject", "segment"] = "segment"
+
+    #: When True (the default), a segment that ends with a still-open
+    #: position (its exit lies beyond a confirmed gap, so this segment's
+    #: own data cannot resolve it) is excluded from the aggregate/overall
+    #: trade statistics - its open position is a genuinely unresolved
+    #: research condition, not a completed trade, and no exit price is
+    #: ever invented for it. Set False to include such a segment's
+    #: already-completed trades anyway (the unresolved open position
+    #: itself is still never given an invented exit).
+    exclude_open_position_segments: bool = True
 
     @model_validator(mode="after")
     def _fractions_sum_to_one(self) -> BacktestConfig:

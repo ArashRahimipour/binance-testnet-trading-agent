@@ -16,14 +16,17 @@ import click
 from trading_agent.backtest.engine import run_backtest
 from trading_agent.config import AppConfig, Mode, load_config
 from trading_agent.config.loader import load_secrets
-from trading_agent.data.historical_fetch import DEFAULT_MAX_RETRIES, fetch_historical_range
+from trading_agent.data.historical_fetch import (
+    DEFAULT_MAX_RETRIES,
+    confirm_gaps,
+    fetch_historical_range,
+)
 from trading_agent.data.ingestion import fetch_completed_candles, require_non_empty
 from trading_agent.data.market_data_public import (
     PRODUCTION_MARKET_DATA_HOST,
     BinancePublicMarketDataClient,
 )
 from trading_agent.data.storage import CandleStore
-from trading_agent.data.validation import validate_candle_sequence
 from trading_agent.execution.live_runner import ColdStartReconciliationError, run_testnet_cycle
 from trading_agent.execution.testnet_health import run_testnet_health_check
 from trading_agent.journal.journal import Journal
@@ -80,7 +83,7 @@ def config_check(ctx: click.Context) -> None:
 @click.option("--limit", default=1000, show_default=True, help="Number of most recent completed candles to fetch (ignored if --start is given).")
 @click.option("--start", "start_str", default=None, help="ISO8601 UTC start date, e.g. 2020-01-01 - triggers a paginated multi-year-capable download.")
 @click.option("--end", "end_str", default=None, help="ISO8601 UTC end date (default: now). Only used with --start.")
-@click.option("--max-retries", default=DEFAULT_MAX_RETRIES, show_default=True, help="Max retries per page before giving up.")
+@click.option("--max-retries", default=DEFAULT_MAX_RETRIES, show_default=True, help="Max retries per page (and per gap-recovery attempt) before giving up.")
 @click.pass_context
 def fetch_data(ctx: click.Context, limit: int, start_str: str | None, end_str: str | None, max_retries: int) -> None:
     """Fetch historical candles from the public read-only market-data host and store them.
@@ -88,6 +91,14 @@ def fetch_data(ctx: click.Context, limit: int, start_str: str | None, end_str: s
     Without --start, fetches the most recent `--limit` completed candles in
     a single request. With --start (optionally --end), pages through the
     full date range - suitable for downloading multiple years of history.
+
+    A CONFIRMED historical gap - a real, permanent hole in the exchange's
+    own record, never fabricated or interpolated over - does not abort the
+    download. Every gap is detected, given one focused narrow-range retry
+    to rule out a pagination artifact or a transient API response, and (if
+    still missing) recorded in a durable gap manifest alongside every
+    valid candle around it. See ARCHITECTURE.md and
+    `config.backtest.gap_policy` for how the backtest engine uses this.
     """
     config: AppConfig = ctx.obj["config"]
     client = BinancePublicMarketDataClient(PRODUCTION_MARKET_DATA_HOST)
@@ -99,19 +110,38 @@ def fetch_data(ctx: click.Context, limit: int, start_str: str | None, end_str: s
                 if end_str
                 else int(time.time() * 1000)
             )
-            candles = fetch_historical_range(
+            fetch_result = fetch_historical_range(
                 client, config.market.symbol, config.market.interval, start_ms, end_ms, max_retries=max_retries
             )
         else:
             candles = fetch_completed_candles(client, config.market.symbol, config.market.interval, limit=limit)
-        require_non_empty(candles)
-        validate_candle_sequence(candles, config.market.interval)
+            require_non_empty(candles)
+            fetch_result = confirm_gaps(
+                client, config.market.symbol, config.market.interval, candles, max_retries=max_retries
+            )
+        require_non_empty(fetch_result.candles)
     except Exception as exc:  # noqa: BLE001 - surfaced to the user, then exit
         click.echo(f"Failed to fetch valid candle data: {exc}", err=True)
         sys.exit(1)
+
     with CandleStore(config.paths.db_path) as store:
-        store.upsert_candles(candles)
-    click.echo(f"Stored {len(candles)} completed candles for {config.market.symbol} {config.market.interval}.")
+        store.store_candles_and_gaps(
+            fetch_result.candles, fetch_result.confirmed_gaps,
+            config.market.symbol, config.market.interval, detected_at_ms=int(time.time() * 1000),
+        )
+
+    gap_count = len(fetch_result.confirmed_gaps)
+    gap_word = "gap" if gap_count == 1 else "gaps"
+    click.echo(
+        f"Stored {len(fetch_result.candles)} completed candles with {gap_count} confirmed historical "
+        f"{gap_word}. No candles were fabricated."
+    )
+    for gap in fetch_result.confirmed_gaps:
+        click.echo(
+            f"  confirmed gap: expected_open_time_ms={gap.expected_open_time_ms} "
+            f"previous_open_time_ms={gap.previous_open_time_ms} next_open_time_ms={gap.next_open_time_ms} "
+            f"missing_intervals={gap.missing_intervals}"
+        )
 
 
 @cli.command("backtest")
@@ -143,6 +173,32 @@ def backtest_cmd(ctx: click.Context) -> None:
         except ValueError as exc:
             click.echo(f"Backtest failed: {exc}", err=True)
             sys.exit(1)
+
+    click.echo(
+        f"gap_policy={config.backtest.gap_policy}  "
+        f"segments={len(result.segments)}  confirmed_gaps={len(result.gaps)}"
+    )
+    for seg in result.segments:
+        status_bits = []
+        if seg.skipped_insufficient_candles:
+            status_bits.append("skipped - too few candles for indicator warm-up")
+        if seg.ends_with_open_position:
+            status_bits.append("ends with an open position (unresolved research condition)")
+        if seg.excluded_from_overall:
+            status_bits.append("EXCLUDED from aggregate stats")
+        status = f"  [{'; '.join(status_bits)}]" if status_bits else ""
+        start_date = datetime.fromtimestamp(seg.start_time_ms / 1000, tz=UTC).date()
+        end_date = datetime.fromtimestamp(seg.end_time_ms / 1000, tz=UTC).date()
+        click.echo(
+            f"  segment {seg.index}: {start_date} to {end_date} "
+            f"({seg.candle_count} candles, {seg.trade_count} trade(s)){status}"
+        )
+    if result.gaps:
+        click.echo(
+            "WARNING: results across gaps are NOT one continuous tradable equity history - "
+            "each segment above starts fresh from the same baseline equity; read its own "
+            "statistics independently rather than trusting only the overall row below."
+        )
 
     for split in ("train", "validation", "test", "overall"):
         report = result.reports[split]

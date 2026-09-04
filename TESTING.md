@@ -1,6 +1,6 @@
 # Testing
 
-282 tests, all offline: nothing in the suite makes a real network call or
+311 tests, all offline: nothing in the suite makes a real network call or
 requires real credentials. HTTP is mocked with the `responses` library at
 the point where `requests` would otherwise reach the network; time-
 sensitive behavior is tested by passing explicit reference timestamps
@@ -47,6 +47,11 @@ ruff check src tests       # lint
 | Cost-aware, risk-budget stop-loss position sizing | `tests/unit/test_risk_based_position_sizer.py`, `test_backtest_engine.py::test_ordinary_stop_hit_stays_within_risk_budget`, `::test_gap_through_stop_can_exceed_risk_budget`, `::test_risk_budget_sizing_produces_smaller_position_for_smaller_risk_pct` |
 | Server-time sync / clock drift | `tests/unit/test_testnet_adapter.py::test_sync_time_*`, `::test_timestamp_outside_recv_window_error_propagates`, `test_live_runner.py::test_excessive_clock_drift_fails_closed` |
 | Historical-data pagination, retries, rate limits, dedup | `tests/unit/test_historical_fetch.py` |
+| Historical gap detection/segmentation (pure) | `tests/unit/test_gap_detection.py` - the exact reported timestamps, one missing interval, several consecutive missing intervals, multiple gaps, duplicates/out-of-order still rejected, nothing ever fabricated |
+| Gap confirmation via focused narrow-range retry | `tests/unit/test_historical_fetch.py::test_the_exact_reported_gap_is_detected_and_confirmed_when_not_recoverable`, `::test_retry_successfully_recovers_a_temporarily_missing_candle`, `::test_retry_recovers_only_part_of_a_multi_candle_gap_leaving_a_smaller_confirmed_gap`, `::test_gap_at_a_pagination_boundary_is_detected_and_confirmed`, `::test_gap_at_pagination_boundary_recovered_by_retry_leaves_no_confirmed_gap` |
+| Gap manifest persistence, idempotent re-download, atomic candles+gaps write | `tests/unit/test_data_storage.py::test_store_candles_and_gaps_persists_both`, `::test_rerunning_the_same_download_is_idempotent`, `::test_a_failed_write_leaves_no_partially_inconsistent_state` |
+| Backtest gap segmentation: independent warm-up, cancelled pending signal, unresolved open position, `reject` vs `segment` policy | `tests/unit/test_backtest_engine.py::test_ema_warmup_restarts_after_a_gap`, `::test_pending_signal_is_cancelled_at_a_gap_not_executed_in_the_next_segment`, `::test_open_position_at_a_gap_is_marked_unresolved_and_excluded_by_default`, `::test_gap_policy_reject_raises_exactly_like_before`, `::test_gap_policy_defaults_to_segment` |
+| Live/Testnet gap validation remains strict, decoupled from the research gap-tolerance path | `tests/unit/test_backtest_engine.py::test_live_runner_never_references_gap_segmentation_machinery`, `tests/unit/test_data_validation.py` (unmodified, still fully strict) |
 | `testnet-health`: GET-only, no order-placement capability reachable | `tests/unit/test_testnet_health.py::test_happy_path_passes_and_only_get_requests_occur`, `::test_testnet_health_module_never_references_place_market_order`, `::test_testnet_readonly_module_never_references_place_market_order`, `test_testnet_readonly.py::test_has_no_order_placing_method_at_all`, `::test_no_request_is_ever_a_post_put_patch_or_delete` |
 | `testnet-health`: no local state created or modified | `tests/unit/test_testnet_health.py::test_no_database_or_local_state_file_created_when_none_exists`, `::test_existing_local_state_is_not_modified`, `::test_pending_orders_reported_but_not_reconciled`, `test_execution_store.py::test_open_read_only_returns_none_and_creates_nothing_when_file_absent`, `::test_open_read_only_connection_rejects_writes` |
 | `testnet-health`: secrets/signatures never leak | `tests/unit/test_testnet_health.py::test_secret_never_appears_in_report_on_happy_path`, `::test_secret_never_appears_on_invalid_credentials_failure`, `::test_secret_never_appears_in_cli_stdout_or_stderr` |

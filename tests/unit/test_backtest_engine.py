@@ -364,6 +364,148 @@ def test_losing_stop_at_first_candle_of_new_utc_day_is_attributed_to_new_day(tmp
     assert buy_decisions[-1]["payload"]["reason_code"] == "MAX_DAILY_LOSS_SHUTDOWN"
 
 
+# --- Historical-gap segmentation (fetch-data gap fix). ---
+#
+# `config.backtest.gap_policy` defaults to "segment": a confirmed gap in
+# the candle series (data/gap_detection.py) splits the backtest into
+# independent contiguous segments rather than raising and discarding
+# everything, per REQUIRED DESIGN section 3. "reject" preserves the
+# original strict behavior. Live/Testnet's own validation
+# (data/validation.py::validate_candle_sequence, used unchanged by
+# execution/live_runner.py) never reads this config and always rejects
+# any gap unconditionally - see the last test in this section.
+
+
+def _config_with_backtest_overrides(**backtest_overrides) -> AppConfig:
+    return AppConfig(
+        mode="backtest",
+        strategy={"ema_fast": 3, "ema_slow": 6},
+        backtest={
+            "train_fraction": 0.5, "validation_fraction": 0.25, "test_fraction": 0.25,
+            "min_trades_for_significance": 20, **backtest_overrides,
+        },
+    )
+
+
+def _candles_with_controlled_open_at(
+    closes: list[float], open_overrides: dict[int, float], start_time_ms: int
+) -> list[Candle]:
+    opens = [open_overrides.get(i, c) for i, c in enumerate(closes)]
+    return [
+        Candle(
+            symbol="BTCUSDT", interval=INTERVAL,
+            open_time_ms=start_time_ms + i * STEP, close_time_ms=start_time_ms + i * STEP + STEP - 1,
+            open=Decimal(str(opens[i])), high=Decimal(str(max(opens[i], c) + 5)),
+            low=Decimal(str(min(opens[i], c) - 5)), close=Decimal(str(c)), volume=Decimal(1),
+        )
+        for i, c in enumerate(closes)
+    ]
+
+
+def test_ema_warmup_restarts_after_a_gap():
+    # Segment 2, appearing after a gap, must produce IDENTICAL trades to an
+    # entirely standalone backtest of the same candles - proving no
+    # indicator state (or anything else) carries across the gap from
+    # segment 1's own, unrelated data.
+    segment1 = _candles(_zigzag_closes(segment_len=5, num_segments=2))  # 10 arbitrary candles
+    segment2_start = segment1[-1].open_time_ms + 2 * STEP  # skip exactly 1 interval -> 1 confirmed gap
+    segment2 = _candles_with_controlled_open_at(_BUY_THEN_EXIT_CLOSES, {7: 100}, segment2_start)
+
+    config = _config_with_backtest_overrides()
+    combined = run_backtest(segment1 + segment2, config, _filters())
+    standalone = run_backtest(segment2, config, _filters())
+
+    assert len(combined.gaps) == 1
+    assert len(combined.segments) == 2
+    assert combined.segments[1].trade_count == len(standalone.trades)
+    combined_segment2_trades = [t for t in combined.trades if t.entry_time_ms >= segment2_start]
+    assert combined_segment2_trades == standalone.trades
+
+
+def test_pending_signal_is_cancelled_at_a_gap_not_executed_in_the_next_segment():
+    # A BUY signal queued on segment 1's final candle has no following
+    # candle WITHIN this segment to fill against - it must be cancelled,
+    # never carried into (and silently filled by) segment 2's first candle.
+    segment1 = _candles_with_controlled_open(_BUY_THEN_EXIT_CLOSES[:7], {})  # BUY queued at the final candle (idx 6)
+    segment2_start = segment1[-1].open_time_ms + 2 * STEP
+    segment2 = _candles_with_controlled_open_at([100.0] * 8, {}, segment2_start)  # flat - no signals of its own
+
+    config = _config_with_backtest_overrides()
+    result = run_backtest(segment1 + segment2, config, _filters())
+
+    assert len(result.gaps) == 1
+    assert result.trades == []  # the queued BUY was never executed anywhere
+    assert result.unexecuted_final_signal is None  # segment 1 was NOT the final segment
+    assert any("Cancelled at the following confirmed gap" in w for w in result.warnings)
+    seg1_report, seg2_report = result.segments
+    assert seg1_report.cancelled_pending_signal is not None
+    assert seg2_report.trade_count == 0  # nothing leaked into segment 2
+
+
+def test_open_position_at_a_gap_is_marked_unresolved_and_excluded_by_default():
+    # Segment 1's BUY signal (idx 6) fills at candle 7's open and is never
+    # exited within this segment - the position spans the gap. Candle 7's
+    # own low is kept safely above the stop (the default +/-5 wick would
+    # otherwise breach a 5%-below-entry stop on the SAME candle as entry).
+    segment1 = _candles_with_controlled_open(_BUY_THEN_EXIT_CLOSES[:8], {7: 100})
+    segment1[7] = Candle(
+        symbol="BTCUSDT", interval=INTERVAL,
+        open_time_ms=segment1[7].open_time_ms, close_time_ms=segment1[7].close_time_ms,
+        open=Decimal(100), high=Decimal(110), low=Decimal(99), close=Decimal(105), volume=Decimal(1),
+    )
+    segment2_start = segment1[-1].open_time_ms + 2 * STEP
+    segment2 = _candles_with_controlled_open_at([100.0] * 8, {}, segment2_start)
+
+    config = _config_with_backtest_overrides()
+    result = run_backtest(segment1 + segment2, config, _filters())
+
+    assert len(result.gaps) == 1
+    seg1_report, _seg2_report = result.segments
+    assert seg1_report.ends_with_open_position is True
+    assert seg1_report.excluded_from_overall is True  # exclude_open_position_segments defaults True
+    assert any("unresolved research condition" in w for w in result.warnings)
+    assert any("no exit price was invented" in w for w in result.warnings)
+    # No trade was ever fabricated for the still-open position.
+    assert all(t.exit_time_ms < segment2_start for t in result.trades) or result.trades == []
+
+    # The override still never invents an exit - it only stops excluding
+    # this segment (which, here, had zero already-completed trades anyway).
+    config_include = _config_with_backtest_overrides(exclude_open_position_segments=False)
+    result_include = run_backtest(segment1 + segment2, config_include, _filters())
+    assert result_include.segments[0].excluded_from_overall is False
+    assert result_include.segments[0].trade_count == 0
+
+
+def test_gap_policy_reject_raises_exactly_like_before():
+    from trading_agent.data.exceptions import GapDetectedError
+
+    segment1 = _candles(_zigzag_closes(segment_len=5, num_segments=2))
+    segment2_start = segment1[-1].open_time_ms + 2 * STEP
+    segment2 = _candles_with_controlled_open_at(_BUY_THEN_EXIT_CLOSES, {}, segment2_start)
+    config = _config_with_backtest_overrides(gap_policy="reject")
+    with pytest.raises(GapDetectedError):
+        run_backtest(segment1 + segment2, config, _filters())
+
+
+def test_gap_policy_defaults_to_segment():
+    assert _config_with_backtest_overrides().backtest.gap_policy == "segment"
+
+
+def test_live_runner_never_references_gap_segmentation_machinery():
+    # Live/Testnet's own validation (validate_candle_sequence) always
+    # rejects a gap unconditionally - execution/live_runner.py has no
+    # coupling at all to the gap_policy/segmentation machinery above.
+    import inspect
+
+    from trading_agent.execution import live_runner
+
+    source = inspect.getsource(live_runner)
+    assert "gap_policy" not in source
+    assert "gap_detection" not in source
+    assert "partition_into_segments" not in source
+    assert "historical_fetch" not in source
+
+
 def test_risk_budget_sizing_produces_smaller_position_for_smaller_risk_pct():
     candles = _candles(_zigzag_closes())
     low_risk = run_backtest(candles, _config(max_risk_per_trade_pct=0.005), _filters())

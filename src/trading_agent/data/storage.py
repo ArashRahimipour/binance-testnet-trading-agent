@@ -1,7 +1,15 @@
-"""SQLite persistence for candles.
+"""SQLite persistence for candles and their confirmed historical gap manifest.
 
 Prices are stored as TEXT (Decimal's exact string form) rather than REAL, so
 no floating-point rounding is introduced between ingestion and later reads.
+
+The gap manifest (`candle_gaps`) records every CONFIRMED historical gap
+(see data/gap_detection.py, data/historical_fetch.py::confirm_gaps) -
+never a live/Testnet concern, since that path always fails closed on any
+gap and never reaches this store with one. Its primary key is
+(symbol, interval, expected_open_time_ms), so re-recording the same
+confirmed gap on a repeated download is a no-op update, not a duplicate
+row - this is what makes re-running the same download idempotent.
 """
 
 from __future__ import annotations
@@ -11,6 +19,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Self
 
+from trading_agent.data.gap_detection import GapRecord
 from trading_agent.data.models import Candle
 
 _SCHEMA = """
@@ -26,6 +35,17 @@ CREATE TABLE IF NOT EXISTS candles (
     volume TEXT NOT NULL,
     PRIMARY KEY (symbol, interval, open_time_ms)
 );
+
+CREATE TABLE IF NOT EXISTS candle_gaps (
+    symbol TEXT NOT NULL,
+    interval TEXT NOT NULL,
+    expected_open_time_ms INTEGER NOT NULL,
+    previous_open_time_ms INTEGER NOT NULL,
+    next_open_time_ms INTEGER NOT NULL,
+    missing_intervals INTEGER NOT NULL,
+    detected_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (symbol, interval, expected_open_time_ms)
+);
 """
 
 
@@ -34,7 +54,7 @@ class CandleStore:
         path = Path(db_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(path))
-        self._conn.execute(_SCHEMA)
+        self._conn.executescript(_SCHEMA)
         self._conn.commit()
 
     def close(self) -> None:
@@ -47,6 +67,53 @@ class CandleStore:
         self.close()
 
     def upsert_candles(self, candles: list[Candle]) -> None:
+        self._upsert_candles_no_commit(candles)
+        self._conn.commit()
+
+    def store_candles_and_gaps(
+        self,
+        candles: list[Candle],
+        gaps: list[GapRecord],
+        symbol: str,
+        interval: str,
+        detected_at_ms: int,
+    ) -> None:
+        """Persist a historical download's candles and its confirmed gap
+        manifest together, in ONE transaction - a failure partway through
+        rolls back both writes rather than leaving candles committed
+        without their gap record (or the reverse). Both writes are
+        idempotent (`ON CONFLICT ... DO UPDATE`, keyed so a re-detected
+        candle or gap just re-asserts the same fact), so re-running the
+        same download twice leaves the database in the same state as
+        running it once.
+        """
+        try:
+            self._upsert_candles_no_commit(candles)
+            self._upsert_gaps_no_commit(gaps, symbol, interval, detected_at_ms)
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def get_gaps(self, symbol: str, interval: str) -> list[GapRecord]:
+        cursor = self._conn.execute(
+            """
+            SELECT expected_open_time_ms, previous_open_time_ms, next_open_time_ms, missing_intervals
+            FROM candle_gaps WHERE symbol = ? AND interval = ? ORDER BY expected_open_time_ms ASC
+            """,
+            (symbol, interval),
+        )
+        return [
+            GapRecord(
+                expected_open_time_ms=row[0],
+                previous_open_time_ms=row[1],
+                next_open_time_ms=row[2],
+                missing_intervals=row[3],
+            )
+            for row in cursor.fetchall()
+        ]
+
+    def _upsert_candles_no_commit(self, candles: list[Candle]) -> None:
         rows = [
             (
                 c.symbol,
@@ -76,7 +143,36 @@ class CandleStore:
             """,
             rows,
         )
-        self._conn.commit()
+
+    def _upsert_gaps_no_commit(
+        self, gaps: list[GapRecord], symbol: str, interval: str, detected_at_ms: int
+    ) -> None:
+        rows = [
+            (
+                symbol,
+                interval,
+                gap.expected_open_time_ms,
+                gap.previous_open_time_ms,
+                gap.next_open_time_ms,
+                gap.missing_intervals,
+                detected_at_ms,
+            )
+            for gap in gaps
+        ]
+        self._conn.executemany(
+            """
+            INSERT INTO candle_gaps
+                (symbol, interval, expected_open_time_ms, previous_open_time_ms,
+                 next_open_time_ms, missing_intervals, detected_at_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(symbol, interval, expected_open_time_ms) DO UPDATE SET
+                previous_open_time_ms=excluded.previous_open_time_ms,
+                next_open_time_ms=excluded.next_open_time_ms,
+                missing_intervals=excluded.missing_intervals,
+                detected_at_ms=excluded.detected_at_ms
+            """,
+            rows,
+        )
 
     def get_candles(
         self,

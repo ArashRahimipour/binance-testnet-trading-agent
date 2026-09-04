@@ -101,9 +101,25 @@ trading-agent fetch-data --start 2020-01-01 --end 2024-01-01
 ```
 
 This pages through the full range automatically, with bounded retries and
-backoff on rate limits, de-duplicates overlapping candles, and validates
-the assembled series before storing it (see
-`src/trading_agent/data/historical_fetch.py`).
+backoff on rate limits, and de-duplicates overlapping candles. Real
+multi-year history occasionally has a genuine gap - a candle the exchange
+itself never recorded. This is never fabricated or interpolated over:
+every gap is detected, given one focused narrow-range retry to rule out a
+pagination artifact or a transient API response, and - if still missing -
+CONFIRMED and recorded in a durable gap manifest alongside every valid
+candle around it (see `src/trading_agent/data/historical_fetch.py` and
+`data/gap_detection.py`). The command reports what it found:
+
+```
+Stored 43811 completed candles with 1 confirmed historical gap. No candles were fabricated.
+  confirmed gap: expected_open_time_ms=1582113600000 previous_open_time_ms=1582099200000 next_open_time_ms=1582128000000 missing_intervals=1
+```
+
+Re-running the same download is idempotent - candles and gap records are
+both keyed for upsert, so nothing is duplicated. This gap tolerance is
+**historical-research-only**: live/Testnet signal generation
+(`execution/live_runner.py`) always rejects any gap outright via a
+completely separate, unmodified validation path - see ARCHITECTURE.md.
 
 ## Backtesting
 
@@ -125,6 +141,28 @@ documented), win rate, profit factor, exposure, turnover, trade count, and
 a buy-and-hold comparison. A warning is printed whenever a split has too few trades to
 be statistically meaningful. **This is a research report, not investment
 advice, and past simulated performance does not indicate future results.**
+
+If the stored history contains a confirmed gap, `config.backtest.gap_policy`
+(default `"segment"`) splits the backtest into independent contiguous
+segments at each gap rather than discarding the whole series - each
+segment gets its own fresh indicator warm-up, portfolio, and day/cooldown
+state, so nothing carries across the gap. A signal still queued at a
+segment's end is cancelled, never carried into the next segment; a
+position still open at a segment boundary caused by a gap is marked an
+unresolved research condition (no exit price is ever invented for it) and
+is, by default, excluded from the aggregate trade statistics
+(`exclude_open_position_segments`). The command reports the breakdown:
+
+```
+gap_policy=segment  segments=2  confirmed_gaps=1
+  segment 0: 2020-01-01 to 2020-02-19 (312 candles, 4 trade(s))
+  segment 1: 2020-02-19 to 2024-01-01 (43495 candles, 61 trade(s))
+WARNING: results across gaps are NOT one continuous tradable equity history - ...
+```
+
+Set `gap_policy: reject` to restore the original strict behavior (any gap
+raises and aborts the backtest) if you would rather investigate a gap
+manually before trusting a segmented result.
 
 ## Running on the Spot Testnet
 

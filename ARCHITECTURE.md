@@ -35,7 +35,7 @@ fact.
 | Module | Responsibility |
 |---|---|
 | `config/` | Typed, validated settings (`AppConfig`, `Mode`) and secrets (`Secrets`), loaded from YAML + environment |
-| `data/` | Candle model, read-only market-data client, completed-candle filtering, fail-closed validation, SQLite candle storage |
+| `data/` | Candle model, read-only market-data client, completed-candle filtering, fail-closed validation (live/Testnet), gap-tolerant historical fetch with confirmation retries and segmentation (research-only), SQLite candle + gap-manifest storage |
 | `indicators/` | Causal EMA/SMA (no look-ahead) |
 | `strategy/` | `Signal` contract and the baseline EMA-crossover strategy - pure functions of (candles, position) |
 | `sizing/` | Exchange filter parsing/rounding and fixed-fractional position sizing |
@@ -94,6 +94,60 @@ signature or the literal secret values before being stored or printed,
 and it never calls `str()` on an exception type that could embed a full
 signed URL (e.g. a `requests` connection error) - see SECURITY.md for the
 complete list of guarantees this command carries.
+
+## Two separate candle-validation paths: live/Testnet vs. historical research
+
+`data/validation.py::validate_candle_sequence` is the ONLY validation
+`execution/live_runner.py` ever calls, and it is completely unmodified by
+anything below: any gap, duplicate, or out-of-order candle in a live/
+Testnet fetch raises immediately and blocks the cycle. Nothing in
+`data/gap_detection.py` or `data/historical_fetch.py` is imported by
+`live_runner.py` - `tests/unit/test_backtest_engine.py::
+test_live_runner_never_references_gap_segmentation_machinery` proves this
+at the source level.
+
+A multi-year historical download is a different problem: the exchange's
+own record can have a genuine, permanent gap (discovered in production -
+see CHANGELOG.md), and discarding an entire multi-year download because
+of one missing candle is worse than handling it explicitly. So a second,
+deliberately separate path exists for research data only:
+
+1. `data/gap_detection.py::partition_into_segments` - pure, no I/O. Still
+   raises immediately on a duplicate or out-of-order candle (never
+   tolerated, either path), but a GAP is recorded as a `GapRecord` and
+   starts a new contiguous segment instead of raising.
+2. `data/historical_fetch.py::confirm_gaps` - for every gap `partition_
+   into_segments` finds, makes ONE focused, narrow-range re-query for
+   exactly the suspected missing interval(s) before ever concluding the
+   exchange itself is missing the data (a gap can also result from this
+   project's own pagination cursor math landing awkwardly at a page
+   boundary, or a transient API response - never assume the worse
+   explanation first). Recovered candles are merged in and the series is
+   re-partitioned; whatever gap(s) remain after that are CONFIRMED.
+   `fetch_historical_range` (the `--start`/`--end` paginated path) calls
+   this automatically; the plain recent-`--limit` path does too.
+3. `persistence` (`data/storage.py::CandleStore.store_candles_and_gaps`)
+   persists the candles and the confirmed-gap manifest (`candle_gaps`
+   table) in ONE transaction - a failure partway through rolls back both,
+   never leaving candles committed without their gap record or the
+   reverse. Both writes are idempotent (`ON CONFLICT ... DO UPDATE`,
+   keyed by symbol/interval/timestamp), so re-running the same download
+   twice leaves the database exactly as running it once would.
+4. `backtest/engine.py::run_backtest` reads `config.backtest.gap_policy`
+   ("segment" by default for this research-only command, "reject" to
+   restore the original strict behavior) and, in "segment" mode, runs
+   each contiguous segment as its own fully independent backtest - fresh
+   portfolio, fresh indicator warm-up, fresh day/cooldown state. A signal
+   still queued at a non-final segment's end is cancelled, not carried
+   into the next segment; a position still open at a gap-adjacent segment
+   boundary is marked an unresolved research condition (no exit price is
+   ever invented for it) and is, by default, excluded from the aggregate
+   trade statistics. The overall concatenated equity curve is explicitly
+   NOT claimed to be one continuous tradable history whenever any gap was
+   found - see the engine's module docstring and `BacktestResult.warnings`.
+
+At no point does anything in this path fabricate, interpolate, or guess
+an OHLCV value - a confirmed gap is recorded and preserved, never filled.
 
 ## Data flow for a single decision cycle (testnet mode)
 
@@ -267,14 +321,16 @@ transaction, and are not claimed to be atomic with it:
 
 ## Why SQLite, why no ORM
 
-A small number of independent SQLite files - candles, the unified
-execution store (portfolio state + pending orders, held together
-specifically so they share one transaction - see above), risk state, the
-journal - keep the system inspectable with nothing more than the `sqlite3`
-CLI. There is no concurrent-writer scenario in V0.1 (one CLI invocation
-runs at a time), so a lightweight, hand-written schema is preferred over an
-ORM's abstraction for a project whose priority is auditability over
-developer convenience at scale.
+A small number of independent SQLite files - candles (plus their confirmed
+historical gap manifest, `candle_gaps`, held in the SAME file specifically
+so a download's candles and its gap record share one transaction - see
+above), the unified execution store (portfolio state + pending orders,
+held together specifically so they share one transaction - see above),
+risk state, the journal - keep the system inspectable with nothing more
+than the `sqlite3` CLI. There is no concurrent-writer scenario in V0.1 (one
+CLI invocation runs at a time), so a lightweight, hand-written schema is
+preferred over an ORM's abstraction for a project whose priority is
+auditability over developer convenience at scale.
 
 That single-invocation assumption is exactly what does NOT hold once
 automatic scheduling exists (a cron job, a daemon) - see

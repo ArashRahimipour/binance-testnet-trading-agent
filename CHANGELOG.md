@@ -2,6 +2,73 @@
 
 All notable changes to this project are documented here.
 
+## [0.1.4] - Historical-data gap handling
+
+The first real multi-year download (`trading-agent fetch-data --start
+2020-01-01 --end 2026-09-04`) failed with `expected 14400000ms between
+candles, got 28800000ms between open_time_ms=1582099200000 and
+1582128000000` - a genuine, permanent gap in Binance's own historical
+record (one missing 4h BTCUSDT candle around 2020-02-19), correctly
+detected by the strict validation this project has always used, but with
+no way to proceed short of discarding the entire download. Historical
+research and live/Testnet trading now have separate validation paths.
+Adds 29 tests (282 -> 311 total).
+
+### Added
+
+- `data/gap_detection.py::partition_into_segments`: pure gap detection and
+  segmentation. Still rejects a duplicate or out-of-order candle
+  immediately, exactly like the original strict validation - only a GAP
+  is now recorded (`GapRecord`: expected/previous/next open time,
+  missing interval count) and starts a new contiguous segment, instead of
+  raising.
+- `data/historical_fetch.py::confirm_gaps`: for every detected gap, makes
+  ONE focused, narrow-range retry for exactly the suspected missing
+  interval(s) before ever concluding the exchange itself is missing the
+  data - a gap can also result from this project's own pagination cursor
+  math landing at an awkward page boundary, or a transient API response.
+  `fetch_historical_range` (the `--start`/`--end` path) and the plain
+  `--limit` path both go through this automatically.
+- `data/storage.py::CandleStore.store_candles_and_gaps`: persists a
+  download's candles and its confirmed-gap manifest (new `candle_gaps`
+  table) in ONE transaction - a failure partway through rolls back both;
+  neither write is ever committed without the other. Both are idempotent
+  (`ON CONFLICT ... DO UPDATE`), so re-running the same download twice
+  leaves the database exactly as running it once would.
+- `config.backtest.gap_policy` (`"segment"` by default for this
+  research-only command, `"reject"` to restore the original strict
+  behavior) and `config.backtest.exclude_open_position_segments`
+  (default `True`). In `"segment"` mode, `backtest/engine.py::
+  run_backtest` splits a gapped series into independent contiguous
+  segments, each run as its own fully independent backtest - fresh
+  portfolio, fresh indicator warm-up (never reaching back across the
+  gap), fresh day/cooldown state. A signal still queued at a non-final
+  segment's end is cancelled, never carried into the next segment. A
+  position still open at a gap-adjacent segment boundary is marked an
+  unresolved research condition - no exit price is ever invented for it
+  - and is, by default, excluded from the aggregate trade statistics.
+  `BacktestResult` gains `gaps` and `segments` fields, and `warnings`
+  explicitly states that results across gaps are not one continuous
+  tradable equity history whenever any gap was found.
+- `trading-agent fetch-data` now reports `Stored N completed candles with
+  M confirmed historical gap(s). No candles were fabricated.` plus one
+  line per confirmed gap; `trading-agent backtest` reports segment count,
+  gap count, each segment's date range/candle/trade counts and
+  exclusion status, and the continuity warning.
+
+### Unchanged, deliberately
+
+- `data/validation.py::validate_candle_sequence` - the ONLY validation
+  `execution/live_runner.py` ever calls - was not modified at all, and
+  live/Testnet signal generation still rejects any gap, duplicate, or
+  out-of-order candle outright. Nothing in `data/gap_detection.py` or
+  `data/historical_fetch.py`'s new gap-confirmation logic is imported by
+  `live_runner.py` - proven at the source level by
+  `tests/unit/test_backtest_engine.py::
+  test_live_runner_never_references_gap_segmentation_machinery`.
+- No OHLCV value is ever fabricated or interpolated anywhere in this
+  change - a confirmed gap is recorded and preserved, never filled.
+
 ## [0.1.3] - Read-only Testnet connectivity check
 
 Added `trading-agent --mode testnet testnet-health`: a strictly read-only
