@@ -27,7 +27,12 @@ fees:
 
 risk:
   max_position_pct: 0.90           # max fraction of equity in one position
-  max_risk_per_trade_pct: 0.02     # fraction of equity treated as "at risk" per trade
+  # The baseline strategy has no stop-loss price, so there is no principled
+  # stop-distance-based "risk" to measure. max_risk_per_trade_pct is instead
+  # enforced as another cap on the trade's notional value as a fraction of
+  # equity (see risk/engine.py docstring). It defaults to the same value as
+  # max_position_pct; lower it independently for a stricter per-trade cap.
+  max_risk_per_trade_pct: 0.90
   max_daily_loss_pct: 0.05         # trading halts for the day if exceeded
   max_drawdown_pct: 0.15           # trading halts entirely if exceeded (needs manual reset)
   max_trades_per_day: 4

@@ -11,7 +11,22 @@ import sys
 
 import click
 
+from trading_agent.backtest.engine import run_backtest
 from trading_agent.config import AppConfig, Mode, load_config
+from trading_agent.config.loader import load_secrets
+from trading_agent.data.ingestion import fetch_completed_candles, require_non_empty
+from trading_agent.data.market_data_public import (
+    PRODUCTION_MARKET_DATA_HOST,
+    BinancePublicMarketDataClient,
+)
+from trading_agent.data.storage import CandleStore
+from trading_agent.data.validation import validate_candle_sequence
+from trading_agent.execution.live_runner import ColdStartReconciliationError, run_testnet_cycle
+from trading_agent.journal.journal import Journal
+from trading_agent.persistence.portfolio_store import PortfolioStore
+from trading_agent.persistence.risk_state_store import RiskStateStore
+from trading_agent.risk.kill_switch import KillSwitch
+from trading_agent.sizing.exchange_filters import SymbolFilters
 
 
 @click.group()
@@ -55,6 +70,154 @@ def config_check(ctx: click.Context) -> None:
     )
     click.echo(f"risk.max_drawdown_pct: {config.risk.max_drawdown_pct}")
     click.echo("Configuration is valid.")
+
+
+@cli.command("fetch-data")
+@click.option("--limit", default=1000, show_default=True, help="Number of most recent completed candles to fetch.")
+@click.pass_context
+def fetch_data(ctx: click.Context, limit: int) -> None:
+    """Fetch historical candles from the public read-only market-data host and store them."""
+    config: AppConfig = ctx.obj["config"]
+    client = BinancePublicMarketDataClient(PRODUCTION_MARKET_DATA_HOST)
+    try:
+        candles = fetch_completed_candles(client, config.market.symbol, config.market.interval, limit=limit)
+        require_non_empty(candles)
+        validate_candle_sequence(candles, config.market.interval)
+    except Exception as exc:  # noqa: BLE001 - surfaced to the user, then exit
+        click.echo(f"Failed to fetch valid candle data: {exc}", err=True)
+        sys.exit(1)
+    with CandleStore(config.paths.db_path) as store:
+        store.upsert_candles(candles)
+    click.echo(f"Stored {len(candles)} completed candles for {config.market.symbol} {config.market.interval}.")
+
+
+@cli.command("backtest")
+@click.pass_context
+def backtest_cmd(ctx: click.Context) -> None:
+    """Run the backtest engine over previously fetched candles."""
+    config: AppConfig = ctx.obj["config"]
+    if config.mode != Mode.BACKTEST:
+        click.echo("The backtest command requires --mode backtest.", err=True)
+        sys.exit(1)
+
+    with CandleStore(config.paths.db_path) as store:
+        candles = store.get_candles(config.market.symbol, config.market.interval)
+    if not candles:
+        click.echo("No candles found. Run `fetch-data` first.", err=True)
+        sys.exit(1)
+
+    client = BinancePublicMarketDataClient(PRODUCTION_MARKET_DATA_HOST)
+    try:
+        filters = SymbolFilters.from_exchange_info(client.get_exchange_info(config.market.symbol))
+    except Exception as exc:  # noqa: BLE001 - surfaced to the user, then exit
+        click.echo(f"Failed to fetch exchange filters: {exc}", err=True)
+        sys.exit(1)
+
+    journal_path = config.paths.data_dir / "journal.db"
+    with Journal(journal_path) as journal:
+        try:
+            result = run_backtest(candles, config, filters, journal)
+        except ValueError as exc:
+            click.echo(f"Backtest failed: {exc}", err=True)
+            sys.exit(1)
+
+    for split in ("train", "validation", "test", "overall"):
+        report = result.reports[split]
+        click.echo(f"--- {split} ---")
+        click.echo(
+            f"trades={report.trade_count} total_return_pct={report.total_return_pct:.2f} "
+            f"buy_and_hold_pct={report.buy_and_hold_return_pct} max_drawdown_pct={report.max_drawdown_pct:.2f}"
+        )
+        click.echo(
+            f"sharpe={report.sharpe_ratio} sortino={report.sortino_ratio} "
+            f"win_rate={report.win_rate} profit_factor={report.profit_factor} "
+            f"exposure_pct={report.exposure_pct:.1f} turnover={report.turnover:.2f}"
+        )
+    for warning in result.warnings:
+        click.echo(f"WARNING: {warning}", err=True)
+    click.echo(
+        "Note: this is a research backtest on simulated fills, not a claim of live profitability. "
+        "Do not select a strategy based solely on the best historical return."
+    )
+
+
+@cli.command("run")
+@click.pass_context
+def run_cmd(ctx: click.Context) -> None:
+    """Run a single testnet decision cycle (intended to be invoked once per completed candle)."""
+    config: AppConfig = ctx.obj["config"]
+    if config.mode != Mode.TESTNET:
+        click.echo("The run command requires --mode testnet.", err=True)
+        sys.exit(1)
+    try:
+        secrets = load_secrets()
+    except Exception as exc:  # noqa: BLE001 - surfaced to the user, then exit
+        click.echo(f"Failed to load testnet credentials: {exc}", err=True)
+        sys.exit(1)
+
+    journal_path = config.paths.data_dir / "journal.db"
+    risk_state_path = config.paths.data_dir / "risk_state.db"
+    with (
+        Journal(journal_path) as journal,
+        PortfolioStore(config.paths.db_path) as portfolio_store,
+        RiskStateStore(risk_state_path) as risk_state_store,
+    ):
+        try:
+            result = run_testnet_cycle(config, secrets, journal, portfolio_store, risk_state_store)
+        except ColdStartReconciliationError as exc:
+            click.echo(f"Cannot start: {exc}", err=True)
+            sys.exit(1)
+    click.echo(f"action={result.action} reason={result.reason_code} detail={result.detail}")
+
+
+@cli.command("status")
+@click.pass_context
+def status_cmd(ctx: click.Context) -> None:
+    """Show current mode, kill switch state, and portfolio state (no secrets)."""
+    config: AppConfig = ctx.obj["config"]
+    click.echo(f"mode: {config.mode.value}  symbol: {config.market.symbol}")
+    switch = KillSwitch(config.paths.data_dir / "KILL_SWITCH")
+    click.echo(f"kill_switch: {'ENGAGED (' + (switch.reason() or '') + ')' if switch.is_engaged() else 'disengaged'}")
+    with PortfolioStore(config.paths.db_path) as store:
+        portfolio = store.load(config.market.symbol)
+    if portfolio is None:
+        click.echo("portfolio: not initialized")
+    else:
+        click.echo(
+            f"portfolio: quote_balance={portfolio.quote_balance} base_balance={portfolio.base_balance} "
+            f"position_side={portfolio.position_side.value} realized_pnl_quote={portfolio.realized_pnl_quote}"
+        )
+
+
+@cli.group("kill-switch")
+def kill_switch_group() -> None:
+    """Manually controlled kill switch - halts ALL order submission when engaged."""
+
+
+@kill_switch_group.command("engage")
+@click.option("--reason", default="", help="Why the kill switch is being engaged.")
+@click.pass_context
+def kill_switch_engage(ctx: click.Context, reason: str) -> None:
+    config: AppConfig = ctx.obj["config"]
+    switch = KillSwitch(config.paths.data_dir / "KILL_SWITCH")
+    switch.engage(reason)
+    click.echo(f"Kill switch ENGAGED: {switch.reason()}")
+
+
+@kill_switch_group.command("disengage")
+@click.pass_context
+def kill_switch_disengage(ctx: click.Context) -> None:
+    config: AppConfig = ctx.obj["config"]
+    KillSwitch(config.paths.data_dir / "KILL_SWITCH").disengage()
+    click.echo("Kill switch DISENGAGED.")
+
+
+@kill_switch_group.command("status")
+@click.pass_context
+def kill_switch_status(ctx: click.Context) -> None:
+    config: AppConfig = ctx.obj["config"]
+    switch = KillSwitch(config.paths.data_dir / "KILL_SWITCH")
+    click.echo(f"ENGAGED: {switch.reason()}" if switch.is_engaged() else "disengaged")
 
 
 if __name__ == "__main__":

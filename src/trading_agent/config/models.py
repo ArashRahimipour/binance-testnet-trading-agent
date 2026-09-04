@@ -64,7 +64,7 @@ class FeesConfig(BaseModel):
 
 class RiskConfig(BaseModel):
     max_position_pct: float = Field(gt=0, le=1, default=0.90)
-    max_risk_per_trade_pct: float = Field(gt=0, le=1, default=0.02)
+    max_risk_per_trade_pct: float = Field(gt=0, le=1, default=0.90)
     max_daily_loss_pct: float = Field(gt=0, le=1, default=0.05)
     max_drawdown_pct: float = Field(gt=0, le=1, default=0.15)
     max_trades_per_day: int = Field(gt=0, default=4)
