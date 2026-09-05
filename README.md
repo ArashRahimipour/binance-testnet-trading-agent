@@ -100,6 +100,15 @@ needs more than one 1000-candle request - use `--start`/`--end`:
 trading-agent fetch-data --start 2020-01-01 --end 2024-01-01
 ```
 
+`--start`/`--end` define a genuine half-open `[--start, --end)` range:
+`--end` is EXCLUSIVE, so a candle opening exactly at `2024-01-01T00:00:00Z`
+above is never fetched or stored - this holds even though Binance's own
+API treats its `endTime` kline parameter as inclusive (see
+`src/trading_agent/data/historical_fetch.py`'s module docstring for a real
+incident this is enforced against: an earlier version of this command
+stored one candle exactly at a requested `--end` date, one instant inside
+the immutable research cutoff).
+
 This pages through the full range automatically, with bounded retries and
 backoff on rate limits, and de-duplicates overlapping candles. Real
 multi-year history occasionally has a genuine gap - a candle the exchange

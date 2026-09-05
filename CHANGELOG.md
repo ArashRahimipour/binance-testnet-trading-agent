@@ -2,6 +2,80 @@
 
 All notable changes to this project are documented here.
 
+## [0.5.2] - Fix: fetch-pipeline half-open [start, end) boundary defect
+
+**Critical fix**, found from real database metadata (not from inspecting
+any market price/signal/result): a `fetch-data --end 2025-05-16` run had
+stored a BTCUSDT/1h candle with `open_time_ms == RESEARCH_CUTOFF_MS`
+(1747353600000) - one instant INSIDE the immutable, permanently-consumed
+research-cutoff period. Root cause: Binance's own `/api/v3/klines`
+`endTime` parameter is INCLUSIVE (a candle opening exactly at `endTime`
+CAN be returned), and `data/historical_fetch.py` forwarded a caller's
+intended-exclusive `end_time_ms` straight through as that inclusive
+boundary with no filter of its own. `research-round3` was NOT run against
+this or any other real data as part of this fix, no market data was
+fetched, and no strategy/threshold/scorecard/risk/fee/execution/candidate
+logic was touched - this is exclusively a data-acquisition boundary fix.
+Adds 14 new regression tests (613 total).
+
+### Fixed
+
+- **`data/historical_fetch.py`**: every function taking an `end_time_ms`
+  (`fetch_historical_range`, `confirm_gaps`, `_attempt_narrow_recovery`,
+  `_fetch_page_with_retries`) now enforces it as a genuine exclusive upper
+  bound at two independent layers: (1) the HTTP request itself asks
+  Binance for `end_time_ms - 1` (`_exclusive_upper_bound_for_request`),
+  and (2) every returned candle list - each page, the full accumulated
+  list, and every gap-recovery result - is filtered again to
+  `open_time_ms < end_time_ms` regardless (`_below_exclusive_end`), so a
+  changed or non-compliant exchange response can never reintroduce a
+  boundary candle. `fetch_historical_range` also runs a final fail-closed
+  postcondition check (`_assert_no_candle_at_or_after`) immediately before
+  handing its result back for storage. `confirm_gaps`/
+  `_attempt_narrow_recovery` gained an optional `end_time_ms` parameter
+  (default `None`, fully backward compatible with the non-ranged
+  `--limit` fetch path, which has no such bound) so gap recovery cannot
+  reintroduce a candle beyond the caller's overall requested end even if a
+  gap's own internal bound were ever wrong.
+- **`data/ingestion.py::fetch_completed_candles`**: the same two-layer
+  exclusive-end enforcement, for consistency and to close the same latent
+  defect class in this sibling entry point (not currently wired to any
+  CLI command with an end bound, but part of the same fetch pipeline).
+- **`data/market_data_public.py::get_klines`**: docstring now documents
+  Binance's real inclusive `endTime` semantics explicitly, so this
+  incident's root cause cannot silently recur in a future caller.
+- **`cli/main.py::fetch-data`**: `--end`'s help text and the command's own
+  docstring now state the half-open, exclusive-of-`--end` contract
+  explicitly, naming this incident.
+
+### Added
+
+- **`tests/unit/test_fetch_end_boundary.py`** (14 tests): proves (1) a
+  candle exactly at a requested `end` is never returned even when a
+  deliberately worst-case mock exchange (ignoring `endTime` entirely)
+  offers it; (2) a candle one interval before `end` is returned; (3)
+  small-page-limit pagination cannot reintroduce the boundary candle
+  across several round trips, including the exact "final page is both
+  short and boundary-adjacent" shape; (4) narrow gap recovery cannot
+  return a candle at or after an explicit `end_time_ms` even when the
+  gap's own internal bound would have allowed it, and is fully backward
+  compatible when `end_time_ms` is omitted; (5) `split_at_cutoff`/
+  `assert_pre_cutoff` exclude the exact reported offending value
+  (`RESEARCH_CUTOFF_MS == 1747353600000`), and a `fetch_historical_range`
+  call reproducing the exact incident (`end_time_ms = RESEARCH_CUTOFF_MS`
+  against a worst-case exchange) structurally cannot produce it in the
+  first place; (6) the CLI's `--end` help text and command docstring, and
+  the `get_klines`/`historical_fetch` module docstrings, all state the
+  inclusive-exchange/exclusive-client contract in words, not just code.
+  `research-round3` is never invoked anywhere in this file.
+- Two pre-existing pagination-boundary-gap tests in
+  `tests/unit/test_historical_fetch.py` had their own fixture's second
+  page ending exactly at the tested range's `end` - previously tolerated
+  only because of the very bug this release fixes. Widened their
+  requested range by one interval (their actual subject, gap-at-a-
+  pagination-boundary detection, is unaffected) rather than weakening the
+  new boundary guarantee to keep them passing unchanged.
+
 ## [0.5.1] - Pre-evaluation data-integrity audit for commit 47a353a
 
 An audit, not a fix: inspected (never queried the real database, fetched

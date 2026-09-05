@@ -109,7 +109,7 @@ def config_check(ctx: click.Context) -> None:
 @cli.command("fetch-data")
 @click.option("--limit", default=1000, show_default=True, help="Number of most recent completed candles to fetch (ignored if --start is given).")
 @click.option("--start", "start_str", default=None, help="ISO8601 UTC start date, e.g. 2020-01-01 - triggers a paginated multi-year-capable download.")
-@click.option("--end", "end_str", default=None, help="ISO8601 UTC end date (default: now). Only used with --start.")
+@click.option("--end", "end_str", default=None, help="ISO8601 UTC end date, EXCLUSIVE (default: now) - candles opening at or after this date are never fetched or stored. Only used with --start.")
 @click.option("--max-retries", default=DEFAULT_MAX_RETRIES, show_default=True, help="Max retries per page (and per gap-recovery attempt) before giving up.")
 @click.pass_context
 def fetch_data(ctx: click.Context, limit: int, start_str: str | None, end_str: str | None, max_retries: int) -> None:
@@ -118,6 +118,16 @@ def fetch_data(ctx: click.Context, limit: int, start_str: str | None, end_str: s
     Without --start, fetches the most recent `--limit` completed candles in
     a single request. With --start (optionally --end), pages through the
     full date range - suitable for downloading multiple years of history.
+
+    --start/--end together define a genuine half-open, EXCLUSIVE-of-`--end`
+    [--start, --end) range: a candle opening exactly AT --end is never
+    fetched or stored, even though Binance's own API treats its `endTime`
+    parameter as inclusive - this is enforced at both the HTTP request
+    itself and by filtering every result again regardless (see
+    `data/historical_fetch.py`'s module docstring for the incident this
+    guards against: an earlier version of this command stored a BTCUSDT/1h
+    candle exactly at the immutable 2025-05-16 research cutoff after a
+    `--end 2025-05-16` run).
 
     A CONFIRMED historical gap - a real, permanent hole in the exchange's
     own record, never fabricated or interpolated over - does not abort the

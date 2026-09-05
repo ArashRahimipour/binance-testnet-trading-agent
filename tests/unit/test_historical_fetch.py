@@ -239,7 +239,11 @@ def test_gap_at_a_pagination_boundary_is_detected_and_confirmed():
     client = BinancePublicMarketDataClient(TESTNET_HOST)
     reference_time_ms = page2[-1][6] + 1
     result = fetch_historical_range(
-        client, "BTCUSDT", INTERVAL, START, START + 5 * STEP,
+        # Requested end is exclusive - one full STEP past page2's own last
+        # candle (START + 5*STEP) so that legitimate candle is actually
+        # in range, distinct from testing the exclusive-end boundary itself
+        # (see test_data_integrity_round3_audit.py / test_fetch_end_boundary.py).
+        client, "BTCUSDT", INTERVAL, START, START + 6 * STEP,
         page_limit=3, reference_time_ms=reference_time_ms,
         max_retries=1, sleep_fn=lambda s: None,
     )
@@ -260,7 +264,8 @@ def test_gap_at_pagination_boundary_recovered_by_retry_leaves_no_confirmed_gap()
     client = BinancePublicMarketDataClient(TESTNET_HOST)
     reference_time_ms = page2[-1][6] + 1
     result = fetch_historical_range(
-        client, "BTCUSDT", INTERVAL, START, START + 5 * STEP,
+        # See the sibling test above for why this is 6*STEP, not 5*STEP.
+        client, "BTCUSDT", INTERVAL, START, START + 6 * STEP,
         page_limit=3, reference_time_ms=reference_time_ms,
         max_retries=1, sleep_fn=lambda s: None,
     )

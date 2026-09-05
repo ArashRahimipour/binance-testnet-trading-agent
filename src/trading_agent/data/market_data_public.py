@@ -53,6 +53,19 @@ class BinancePublicMarketDataClient:
         end_time_ms: int | None = None,
         limit: int = 1000,
     ) -> list[Candle]:
+        """Fetch raw klines. `start_time_ms`/`end_time_ms` are forwarded
+        VERBATIM as Binance's own `startTime`/`endTime` kline parameters,
+        which are BOTH INCLUSIVE on the exchange side (a candle opening
+        exactly at `end_time_ms` CAN be returned) - this thin wrapper does
+        not adjust or filter that boundary itself. Any caller that needs a
+        genuinely exclusive upper bound (e.g. the immutable research
+        cutoff, or a requested `--end` date) must both request a
+        pre-adjusted boundary and independently filter the result - see
+        `data/historical_fetch.py` and `data/ingestion.py::
+        fetch_completed_candles`, which is what a real historical-fetch
+        boundary defect (a candle stored exactly at the research cutoff)
+        was traced back to.
+        """
         params: dict[str, str | int] = {"symbol": symbol, "interval": interval, "limit": limit}
         if start_time_ms is not None:
             params["startTime"] = start_time_ms
