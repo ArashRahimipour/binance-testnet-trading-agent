@@ -588,6 +588,7 @@ def _print_block_result(block_result: BlockResult) -> None:
             f"    fixed_1_to_2_risk_reward_policy: entries_approved={rr.entries_approved} "
             f"rejected_net_rr_below_2={rr.entries_rejected_net_rr_below_minimum} "
             f"rejected_exchange_filter_within_risk_budget={rr.entries_rejected_exchange_filter_within_risk_budget} "
+            f"rejected_post_fill_revalidation={rr.entries_rejected_post_fill_revalidation} "
             f"stop_loss_exits={rr.stop_loss_exits} take_profit_exits={rr.take_profit_exits} "
             f"gap_losses_exceeding_planned_risk={rr.gap_losses_exceeding_planned_risk}"
         )

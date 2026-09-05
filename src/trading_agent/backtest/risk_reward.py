@@ -6,74 +6,82 @@ evaluation and never tuned from a result.
 Account baseline (fixed, not configurable per candidate):
   - starting equity: whatever `config.backtest.starting_equity` is (e.g.
     $50) - this module reads it from the caller, it is not hardcoded here.
-  - maximum planned loss per trade: `FIXED_MAX_RISK_PER_TRADE_PCT` (1%) of
-    CURRENT equity at decision time - e.g. $0.50 on $50 equity.
-  - minimum planned net reward: `MIN_NET_REWARD_TO_RISK` (2.0) times that
-    planned risk, AFTER estimated entry fee, exit fee, and slippage - e.g.
-    at least $1.00 on a $0.50 planned risk.
+  - maximum planned NET loss per trade: `FIXED_MAX_RISK_PER_TRADE_PCT` (1%)
+    of CURRENT equity at decision time - e.g. $0.50 on $50 equity - AFTER
+    estimated entry fee, stop-exit fee, and adverse slippage.
+  - minimum planned NET reward: `MIN_NET_REWARD_TO_RISK` (2.0) times that
+    planned NET loss, AFTER estimated entry fee, target-exit fee, and
+    adverse slippage - e.g. at least $1.00 on a $0.50 planned risk.
   - no leverage (sizing never exceeds available quote balance; fees are
-    reserved so a fill can never overspend it - see
-    `_affordability_cap_quantity`).
+    reserved so a fill can never overspend it - see the affordability
+    cap below).
   - one open position maximum (enforced structurally by the engine's
     single-position `PortfolioState`, unchanged by this module).
   - the exchange's minimum notional/lot-size is NEVER satisfied by
     increasing the risk-based quantity - `plan_risk_reward_entry` only ever
-    rounds DOWN and REJECTS (`RR_REJECTED_BELOW_MIN_LOT_SIZE` /
+    rounds the QUANTITY down and REJECTS (`RR_REJECTED_BELOW_MIN_LOT_SIZE` /
     `RR_REJECTED_BELOW_MIN_NOTIONAL`) a trade that fails a filter after
     rounding, exactly like every other sizing function in this project
     (`sizing/position_sizer.py`).
 
-Stop and target are BOTH planned as a fixed price distance from the entry:
-the stop at `stop_distance_pct` below entry (`config.stop_loss.
-stop_distance_pct`, the SAME field the pre-existing stop-only policy uses -
-not a new tunable), and the target at exactly
-`GROSS_REWARD_TO_RISK_MULTIPLE` (2.0) times that same distance ABOVE entry.
-This makes the GROSS (pre-cost) reward/risk ratio exactly 2.0 by
-construction, always. Entry/exit fees and slippage are then applied on
-BOTH the loss side and the reward side (mirroring `sizing/
-position_sizer.py::compute_risk_based_buy_quantity`'s existing cost-aware
-loss calculation, extended symmetrically to the reward side) to get the
-NET reward/risk ratio - which costs can and do push below 2.0, especially
-for a tight stop distance where fees/slippage are a larger fraction of the
-planned move. A net ratio below `MIN_NET_REWARD_TO_RISK` is a real,
-expected outcome of this policy, not a bug: the entry is REJECTED
-(`RR_REJECTED_NET_REWARD_TO_RISK_BELOW_MINIMUM`), never forced through and
-never "fixed" by loosening the 2.0 threshold after seeing a result.
+HOW THE STOP AND TARGET ARE PLANNED (corrected design - see CHANGELOG for
+why the prior "target = 2x stop distance" design was wrong): the stop
+remains a fixed price distance below entry (`stop_distance_pct`,
+`config.stop_loss.stop_distance_pct` - the SAME field the pre-existing
+stop-only policy uses, not a new tunable). The TARGET is not a fixed
+multiple of that distance - it is SOLVED ALGEBRAICALLY (`_solve_target_price`)
+so that the NET (cost-adjusted, after estimated entry fee, target-exit fee,
+and adverse slippage) planned reward is exactly `MIN_NET_REWARD_TO_RISK`
+(2.0) times the NET planned risk. This is an exact Decimal computation -
+no floating point, no tolerance. Consequently the GROSS (pre-cost)
+reward/risk ratio comes out AT OR ABOVE 2.0 - exactly 2.0 when fees and
+slippage are both zero, and strictly ABOVE 2.0 whenever either is
+positive (the target has to reach slightly further to still deliver a net
+2R after round-trip costs eat into it). Both the gross and net ratios are
+reported on every entry (`gross_reward_to_risk`, `net_reward_to_risk`).
 
-IMPORTANT, DISCLOSED PROPERTY of fixing the gross ratio at EXACTLY
-`MIN_NET_REWARD_TO_RISK` (both are 2.0): algebraically, whenever the
-taker fee or slippage rate is strictly positive, the net ratio is
-STRICTLY LESS than the gross ratio for every possible `stop_distance_pct`
-in (0, 1) - net can approach 2.0 arbitrarily closely as the stop distance
-widens, but can never reach or exceed it. This means that under this
-policy, given ANY nonzero fee/slippage, `stop_distance_pct` alone can
-never be widened or narrowed to make an entry pass - EVERY entry is
-rejected for the SAME structural reason under the project's current
-non-zero fee/slippage defaults. This is the direct, intended consequence
-of a maximally conservative, user-mandated pre-real-evaluation policy that
-never forces a trade and never loosens its own bar to manufacture one -
-"Do not force trades" - not evidence of a bug in this module. If a future,
-explicitly-authorized policy revision wants entries to be approvable under
-realistic costs, the fix is to raise `GROSS_REWARD_TO_RISK_MULTIPLE` above
-`MIN_NET_REWARD_TO_RISK` (never to lower `MIN_NET_REWARD_TO_RISK` itself,
-and never based on having observed real evaluation results).
+This means realistic, nonzero fees and slippage do NOT make this policy
+reject every entry - a normal trade is approved once its stop distance
+produces a large enough per-unit price move that costs remain a small
+enough fraction of it. Only a stop distance so tight that this project's
+own PRICE_FILTER tick size cannot represent a target close enough to the
+algebraic solution (see rounding, below) actually fails on cost grounds.
 
-The plan is computed twice per approved entry:
+TICK ROUNDING (`_round_target_up_to_tick`): the exact algebraic target is
+rounded to the exchange's price tick size in the direction that PRESERVES
+the 2.0 net minimum - i.e. UP for a long position's take-profit level
+(a higher target can only ever increase the reward). This is a narrow,
+deliberate, and clearly-scoped exception to `sizing/exchange_filters.py`'s
+project-wide "round down only" convention: that convention exists to keep
+QUANTITY (and hence risk) from ever being enlarged past a budget, which is
+the opposite problem from rounding a REWARD target in the direction that
+protects a stated minimum guarantee. The net ratio is still recomputed
+from the ROUNDED target and re-checked against `MIN_NET_REWARD_TO_RISK`
+after rounding (never assumed) - the entry is REJECTED
+(`RR_REJECTED_NET_REWARD_TO_RISK_BELOW_MINIMUM`) if, in some edge case
+(e.g. the rounded target would exceed the symbol's max price), rounding
+cannot preserve it. This is a real, testable code path, not a placebo.
+
+The plan is computed, and separately VALIDATED, twice per entry:
   1. `plan_risk_reward_entry` - BEFORE the fill, from the reference price
      (the next candle's open, per this project's existing next-open-fill
-     rule), used only to decide quantity and whether to approve the entry
-     at all.
-  2. `build_realized_plan` - AFTER the fill, from the REAL simulated fill
-     price (not the reference price, and not the earlier signal's close) -
-     this is the plan that is actually PERSISTED with the simulated
-     position (`backtest/engine.py::_OpenTrade`) and used to check the
-     stop/take-profit on every subsequent candle.
+     rule). Decides quantity and whether to approve the entry at all.
+  2. `build_realized_plan` - AFTER the simulated fill, from the REAL fill
+     price (not the reference price, and not the earlier signal's close).
+     Re-solves the target from the fill price and RE-VALIDATES both
+     conditions (planned NET loss <= 1% of the ORIGINAL pre-entry equity;
+     planned NET reward/risk >= 2.0) from scratch. If EITHER fails, the
+     returned plan has `approved=False`
+     (`RR_REJECTED_POST_FILL_REVALIDATION_FAILED`) and
+     `backtest/engine.py::run_segment` FAILS CLOSED: the position is never
+     created at all (the simulated buy fill is computed but never applied
+     to the portfolio) rather than left open without a validated plan.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
 
 from trading_agent.sizing.exchange_filters import (
     SymbolFilters,
@@ -89,14 +97,13 @@ from trading_agent.sizing.exchange_filters import (
 #: governs the unrelated, unmodified frozen-baseline stop-only path.
 FIXED_MAX_RISK_PER_TRADE_PCT = 0.01
 
-#: The gross (pre-cost) target distance is always exactly this multiple of
-#: the stop distance - see module docstring.
-GROSS_REWARD_TO_RISK_MULTIPLE = 2.0
-
-#: The NET (cost-adjusted) reward/risk ratio an entry must clear to be
-#: approved. Identical value to `GROSS_REWARD_TO_RISK_MULTIPLE` by design -
-#: a tight stop whose costs erode the gross 2.0 below this is rejected.
-MIN_NET_REWARD_TO_RISK = 2.0
+#: The single, fixed minimum NET reward/risk ratio this policy enforces -
+#: used both as the multiplier when SOLVING for the target price and as
+#: the gate every entry (pre-fill and post-fill) must clear. Never lowered
+#: to make a trade pass; never raised past what "the fixed 1:2 policy"
+#: means. See module docstring for why the GROSS ratio can be, and often
+#: is, above this value while the NET ratio is held at exactly this floor.
+MIN_NET_REWARD_TO_RISK = Decimal("2.0")
 
 RR_APPROVED = "RR_APPROVED"
 RR_REJECTED_INVALID_PRICE = "RR_REJECTED_INVALID_PRICE"
@@ -105,15 +112,20 @@ RR_REJECTED_INSUFFICIENT_QUOTE_BALANCE = "RR_REJECTED_INSUFFICIENT_QUOTE_BALANCE
 RR_REJECTED_INVALID_STOP_DISTANCE = "RR_REJECTED_INVALID_STOP_DISTANCE"
 RR_REJECTED_BELOW_MIN_LOT_SIZE = "RR_REJECTED_BELOW_MIN_LOT_SIZE"
 RR_REJECTED_BELOW_MIN_NOTIONAL = "RR_REJECTED_BELOW_MIN_NOTIONAL"
+RR_REJECTED_INVALID_TARGET = "RR_REJECTED_INVALID_TARGET"
 RR_REJECTED_NET_REWARD_TO_RISK_BELOW_MINIMUM = "RR_REJECTED_NET_REWARD_TO_RISK_BELOW_MINIMUM"
+RR_REJECTED_POST_FILL_REVALIDATION_FAILED = "RR_REJECTED_POST_FILL_REVALIDATION_FAILED"
 
 #: Reason codes meaning "this trade could only have been made possible by
-#: risking more than the fixed budget" - i.e. the exchange's own minimum
-#: notional/lot-size, not this policy's 2R gate, is what blocked it. Kept
-#: as an explicit set so callers/reports can separate "rejected for R/R"
-#: from "rejected because risk-safe sizing cannot meet exchange filters"
-#: per the reporting requirement.
-EXCHANGE_FILTER_REJECTION_REASONS = frozenset({RR_REJECTED_BELOW_MIN_LOT_SIZE, RR_REJECTED_BELOW_MIN_NOTIONAL})
+#: risking more than the fixed budget, or by pricing outside what the
+#: exchange's own PRICE_FILTER/LOT_SIZE/NOTIONAL filters allow" - i.e. an
+#: exchange constraint, not this policy's 2R gate, is what blocked it.
+#: Kept as an explicit set so callers/reports can separate "rejected for
+#: R/R" from "rejected because risk-safe sizing cannot meet exchange
+#: filters" per the reporting requirement.
+EXCHANGE_FILTER_REJECTION_REASONS = frozenset(
+    {RR_REJECTED_BELOW_MIN_LOT_SIZE, RR_REJECTED_BELOW_MIN_NOTIONAL, RR_REJECTED_INVALID_TARGET}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,30 +142,77 @@ class RiskRewardPlan:
     planned_risk_pct: float | None
     planned_reward_quote: Decimal | None
     planned_reward_pct: float | None
-    #: Always exactly `GROSS_REWARD_TO_RISK_MULTIPLE` when defined - the
-    #: reward/risk ratio BEFORE fees and slippage.
+    #: The reward/risk ratio BEFORE fees and slippage - always >= 2.0,
+    #: exactly 2.0 only when fees and slippage are both zero.
     gross_reward_to_risk: float | None
-    #: The reward/risk ratio AFTER fees and slippage - the figure actually
-    #: checked against `MIN_NET_REWARD_TO_RISK`.
+    #: The reward/risk ratio AFTER fees and slippage - always >= 2.0 for
+    #: an APPROVED plan (this is the figure actually gated on, via exact
+    #: Decimal comparison - this float is for reporting only).
     net_reward_to_risk: float | None
 
 
-def _loss_and_gain_per_unit(
-    entry_price: Decimal, stop_price: Decimal, target_price: Decimal, taker_fee_pct: float, slippage_pct: float
-) -> tuple[Decimal, Decimal]:
-    """Cost-aware planned loss/gain per unit of quantity, mirroring
+def _to_decimal(value: float) -> Decimal:
+    return Decimal(str(value))
+
+
+def _loss_per_unit(effective_entry: Decimal, stop_price: Decimal, fee: Decimal, slippage: Decimal) -> Decimal:
+    """NET (cost-inclusive) planned loss per unit of quantity if the stop
+    is hit under ordinary (non-gap) conditions - identical formula to
     `sizing/position_sizer.py::compute_risk_based_buy_quantity`'s existing
-    loss-side calculation and extending it symmetrically to the reward
-    side (fees and adverse slippage REDUCE a gain exactly as they INCREASE
-    a loss)."""
-    slippage = Decimal(str(slippage_pct))
-    fee = Decimal(str(taker_fee_pct))
-    effective_entry = entry_price * (1 + slippage)
+    loss calculation. `effective_entry` must ALREADY be the slippage-
+    adjusted price actually paid (or, pre-fill, the same estimate
+    `broker/backtest_broker.py::simulate_buy` will independently compute
+    from the same reference price and slippage rate) - callers must never
+    apply `(1 + slippage)` to it again here, or slippage is double-counted."""
     effective_stop_exit = stop_price * (1 - slippage)
+    return (effective_entry - effective_stop_exit) + effective_entry * fee + effective_stop_exit * fee
+
+
+def _gain_per_unit(effective_entry: Decimal, target_price: Decimal, fee: Decimal, slippage: Decimal) -> Decimal:
+    """NET (cost-inclusive) planned gain per unit of quantity if the
+    target is hit - the symmetric mirror of `_loss_per_unit`: fees and
+    adverse slippage REDUCE a gain exactly as they INCREASE a loss. See
+    `_loss_per_unit` for the `effective_entry` contract."""
     effective_target_exit = target_price * (1 - slippage)
-    loss_per_unit = (effective_entry - effective_stop_exit) + effective_entry * fee + effective_stop_exit * fee
-    gain_per_unit = (effective_target_exit - effective_entry) - effective_entry * fee - effective_target_exit * fee
-    return loss_per_unit, gain_per_unit
+    return (effective_target_exit - effective_entry) - effective_entry * fee - effective_target_exit * fee
+
+
+def _solve_target_price(effective_entry: Decimal, loss_per_unit: Decimal, fee: Decimal, slippage: Decimal) -> Decimal:
+    """Solve, EXACTLY (Decimal, no floating point), for the target price
+    T such that `_gain_per_unit(effective_entry, T, fee, slippage) ==
+    MIN_NET_REWARD_TO_RISK * loss_per_unit` - i.e. the NET planned reward
+    is exactly the fixed minimum multiple of the NET planned risk, before
+    any tick-size rounding. Derivation (E = effective_entry):
+
+        gain_per_unit(T) = T*(1-s)*(1-f) - E*(1+f)
+        required_reward  = MIN_NET_REWARD_TO_RISK * loss_per_unit
+        => T = (required_reward + E*(1+f)) / ((1-s)*(1-f))
+
+    See `_loss_per_unit` for the `effective_entry` contract.
+    """
+    required_reward = MIN_NET_REWARD_TO_RISK * loss_per_unit
+    numerator = required_reward + effective_entry * (1 + fee)
+    denominator = (1 - slippage) * (1 - fee)
+    return numerator / denominator
+
+
+def _round_target_up_to_tick(target_price: Decimal, filters: SymbolFilters) -> Decimal | None:
+    """Round `target_price` to the exchange's price tick size in the
+    direction that can only ever INCREASE the reward (ceiling) - the
+    conservative direction for protecting the stated minimum net
+    reward/risk guarantee (see module docstring). Returns None if no
+    valid tick-aligned price at or above `target_price` fits within the
+    symbol's max price - a genuine "exchange filter" NO TRADE, not a
+    silent clamp."""
+    tick = filters.tick_size
+    if tick > 0:
+        steps = (target_price / tick).to_integral_value(rounding=ROUND_CEILING)
+        rounded = (steps * tick).quantize(tick, rounding=ROUND_CEILING)
+    else:
+        rounded = target_price
+    if filters.max_price > 0 and rounded > filters.max_price:
+        return None
+    return rounded
 
 
 def _rejected(
@@ -185,11 +244,12 @@ def plan_risk_reward_entry(
     slippage_pct: float,
     filters: SymbolFilters,
 ) -> RiskRewardPlan:
-    """Decide whether a BUY may proceed under the fixed 1:2 policy, and if
-    so, how much to buy. `reference_price` is the PRE-fill reference (the
-    next candle's open) - this plan is provisional and MUST be replaced by
-    `build_realized_plan` once the real fill price is known; only
-    `quantity` and the approve/reject decision made here are final."""
+    """Decide whether a BUY may proceed under the fixed 1:2 NET policy,
+    and if so, how much to buy and where the take-profit target must sit.
+    `reference_price` is the PRE-fill reference (the next candle's open) -
+    this plan is provisional and MUST be replaced by `build_realized_plan`
+    once the real fill price is known; only `quantity` and the
+    approve/reject decision made here are final."""
     if reference_price <= 0:
         return _rejected(RR_REJECTED_INVALID_PRICE)
     if equity <= 0:
@@ -199,47 +259,57 @@ def plan_risk_reward_entry(
     if not (0 < stop_distance_pct < 1):
         return _rejected(RR_REJECTED_INVALID_STOP_DISTANCE)
 
-    stop_price = reference_price * (1 - Decimal(str(stop_distance_pct)))
-    target_price = reference_price * (1 + Decimal(str(stop_distance_pct)) * Decimal(str(GROSS_REWARD_TO_RISK_MULTIPLE)))
+    fee = _to_decimal(taker_fee_pct)
+    slippage = _to_decimal(slippage_pct)
+    stop_price = reference_price * (1 - _to_decimal(stop_distance_pct))
+    # The PRE-fill estimate of the slippage-adjusted price actually paid -
+    # identical formula to `execution/backtest_broker.py::BacktestBroker.
+    # simulate_buy`, so this matches the real fill exactly in this
+    # project's deterministic fill model. Passed to `_loss_per_unit`/
+    # `_gain_per_unit`/`_solve_target_price` as `effective_entry` - never
+    # re-multiplied by `(1 + slippage)` again inside them.
+    effective_entry = reference_price * (1 + slippage)
 
-    loss_per_unit, gain_per_unit = _loss_and_gain_per_unit(
-        reference_price, stop_price, target_price, taker_fee_pct, slippage_pct
-    )
+    loss_per_unit = _loss_per_unit(effective_entry, stop_price, fee, slippage)
     if loss_per_unit <= 0:
-        return _rejected(RR_REJECTED_INVALID_STOP_DISTANCE, stop_price, target_price)
-
-    risk_budget = equity * Decimal(str(FIXED_MAX_RISK_PER_TRADE_PCT))
-    risk_based_quantity = risk_budget / loss_per_unit
+        return _rejected(RR_REJECTED_INVALID_STOP_DISTANCE, stop_price=stop_price)
 
     # Fees must be RESERVED, never causing overspending: the affordability
     # cap divides available quote balance by (effective, slippage-adjusted
     # entry price) inflated by the entry fee rate, so quantity * that
     # denominator never exceeds `quote_balance` - no leverage, ever.
-    slippage = Decimal(str(slippage_pct))
-    fee = Decimal(str(taker_fee_pct))
-    effective_entry = reference_price * (1 + slippage)
+    risk_budget = equity * _to_decimal(FIXED_MAX_RISK_PER_TRADE_PCT)
+    risk_based_quantity = risk_budget / loss_per_unit
     affordability_cap_quantity = quote_balance / (effective_entry * (1 + fee))
-
     raw_quantity = min(risk_based_quantity, affordability_cap_quantity)
     quantity = round_quantity(raw_quantity, filters)
 
     # Never increase risk to satisfy Binance's minimum notional/lot-size -
-    # round DOWN only, and REJECT rather than bump up. This is a "risk
-    # cannot meet exchange filters" NO TRADE, reported separately from a
-    # below-2R rejection (see `EXCHANGE_FILTER_REJECTION_REASONS`).
+    # round the QUANTITY down only, and REJECT rather than bump up. This
+    # is a "risk-safe sizing cannot meet exchange filters" NO TRADE,
+    # reported separately from a below-2R rejection.
     if quantity <= 0 or not meets_lot_size(quantity, filters):
-        return _rejected(RR_REJECTED_BELOW_MIN_LOT_SIZE, stop_price, target_price)
+        return _rejected(RR_REJECTED_BELOW_MIN_LOT_SIZE, stop_price=stop_price)
     if not meets_min_notional(reference_price, quantity, filters):
-        return _rejected(RR_REJECTED_BELOW_MIN_NOTIONAL, stop_price, target_price)
+        return _rejected(RR_REJECTED_BELOW_MIN_NOTIONAL, stop_price=stop_price)
 
+    raw_target = _solve_target_price(effective_entry, loss_per_unit, fee, slippage)
+    target_price = _round_target_up_to_tick(raw_target, filters)
+    if target_price is None or target_price <= reference_price:
+        return _rejected(RR_REJECTED_INVALID_TARGET, stop_price=stop_price)
+
+    gain_per_unit = _gain_per_unit(effective_entry, target_price, fee, slippage)
     planned_risk_quote = quantity * loss_per_unit
     planned_reward_quote = quantity * gain_per_unit
-    planned_risk_pct = float(planned_risk_quote / equity)
-    planned_reward_pct = float(planned_reward_quote / equity)
     gross_reward_to_risk = float((target_price - reference_price) / (reference_price - stop_price))
     net_reward_to_risk = float(planned_reward_quote / planned_risk_quote) if planned_risk_quote > 0 else None
+    planned_risk_pct = float(planned_risk_quote / equity)
+    planned_reward_pct = float(planned_reward_quote / equity)
 
-    if net_reward_to_risk is None or net_reward_to_risk < MIN_NET_REWARD_TO_RISK:
+    # The gate itself: EXACT Decimal cross-multiplication, never a float
+    # division or an epsilon tolerance - tick rounding above is expected
+    # to keep this satisfied, but it is always re-checked, never assumed.
+    if planned_reward_quote < MIN_NET_REWARD_TO_RISK * planned_risk_quote:
         return _rejected(
             RR_REJECTED_NET_REWARD_TO_RISK_BELOW_MINIMUM, stop_price, target_price,
             planned_risk_quote, planned_risk_pct, planned_reward_quote, planned_reward_pct,
@@ -262,30 +332,63 @@ def build_realized_plan(
     taker_fee_pct: float,
     slippage_pct: float,
     equity: Decimal,
+    filters: SymbolFilters,
 ) -> RiskRewardPlan:
-    """Recompute the FINAL stop/target price levels (and every dollar/
-    percentage figure that follows from them) from the REAL simulated
-    entry fill price - never from the earlier reference price or the
-    signal's close. `plan` must be an APPROVED plan (quantity already
-    decided); only the price anchor changes here, never the quantity or
-    the approve/reject decision. `equity` is the SAME pre-fill equity
-    `plan_risk_reward_entry` was given (percentages are always relative to
-    equity at decision time, not equity after the fill). This is the plan
-    that gets persisted with the open position and checked on every
-    subsequent candle."""
+    """Re-solve and RE-VALIDATE the plan from the REAL simulated entry
+    fill price - never from the earlier reference price or the signal's
+    close. `plan` must be an APPROVED plan (quantity already decided);
+    the quantity itself never changes here, only the price anchor and the
+    approve/reject decision, which is checked FRESH from scratch:
+
+      - planned NET loss must still be <= 1% of `equity` (the SAME
+        pre-entry equity `plan_risk_reward_entry` was given - not equity
+        after the fill);
+      - planned NET reward/risk must still be >= `MIN_NET_REWARD_TO_RISK`.
+
+    If EITHER check fails, the returned plan has `approved=False`
+    (`RR_REJECTED_POST_FILL_REVALIDATION_FAILED`) and the caller
+    (`backtest/engine.py::run_segment`) MUST fail closed: never create the
+    position at all. This is the plan that, when approved, gets persisted
+    with the open position and checked on every subsequent candle.
+    """
     if not plan.approved or plan.quantity is None:
         raise ValueError("build_realized_plan requires an approved plan with a decided quantity")
 
-    stop_price = fill_price * (1 - Decimal(str(stop_distance_pct)))
-    target_price = fill_price * (1 + Decimal(str(stop_distance_pct)) * Decimal(str(GROSS_REWARD_TO_RISK_MULTIPLE)))
-    loss_per_unit, gain_per_unit = _loss_and_gain_per_unit(fill_price, stop_price, target_price, taker_fee_pct, slippage_pct)
+    fee = _to_decimal(taker_fee_pct)
+    slippage = _to_decimal(slippage_pct)
+    quantity = plan.quantity
+    stop_price = fill_price * (1 - _to_decimal(stop_distance_pct))
 
-    planned_risk_quote = plan.quantity * loss_per_unit
-    planned_reward_quote = plan.quantity * gain_per_unit
-    planned_risk_pct = float(planned_risk_quote / equity) if equity > 0 else None
-    planned_reward_pct = float(planned_reward_quote / equity) if equity > 0 else None
+    loss_per_unit = _loss_per_unit(fill_price, stop_price, fee, slippage)
+    if loss_per_unit <= 0:
+        return replace(plan, approved=False, reason_code=RR_REJECTED_POST_FILL_REVALIDATION_FAILED, stop_price=stop_price, target_price=None)
+
+    raw_target = _solve_target_price(fill_price, loss_per_unit, fee, slippage)
+    target_price = _round_target_up_to_tick(raw_target, filters)
+    if target_price is None or target_price <= fill_price:
+        return replace(plan, approved=False, reason_code=RR_REJECTED_POST_FILL_REVALIDATION_FAILED, stop_price=stop_price, target_price=None)
+
+    gain_per_unit = _gain_per_unit(fill_price, target_price, fee, slippage)
+    planned_risk_quote = quantity * loss_per_unit
+    planned_reward_quote = quantity * gain_per_unit
+    risk_budget = equity * _to_decimal(FIXED_MAX_RISK_PER_TRADE_PCT)
+
     gross_reward_to_risk = float((target_price - fill_price) / (fill_price - stop_price))
     net_reward_to_risk = float(planned_reward_quote / planned_risk_quote) if planned_risk_quote > 0 else None
+    planned_risk_pct = float(planned_risk_quote / equity) if equity > 0 else None
+    planned_reward_pct = float(planned_reward_quote / equity) if equity > 0 else None
+
+    risk_within_budget = planned_risk_quote <= risk_budget
+    reward_meets_minimum = planned_reward_quote >= MIN_NET_REWARD_TO_RISK * planned_risk_quote
+
+    if not (risk_within_budget and reward_meets_minimum):
+        return replace(
+            plan, approved=False, reason_code=RR_REJECTED_POST_FILL_REVALIDATION_FAILED,
+            stop_price=stop_price, target_price=target_price,
+            planned_risk_quote=planned_risk_quote, planned_risk_pct=planned_risk_pct,
+            planned_reward_quote=planned_reward_quote, planned_reward_pct=planned_reward_pct,
+            gross_reward_to_risk=gross_reward_to_risk, net_reward_to_risk=net_reward_to_risk,
+        )
 
     return replace(
         plan,
@@ -311,6 +414,12 @@ class RiskRewardDiagnostics:
     entries_approved: int = 0
     entries_rejected_net_rr_below_minimum: int = 0
     entries_rejected_exchange_filter_within_risk_budget: int = 0
+    #: A post-fill revalidation failure (see `build_realized_plan`) - the
+    #: buy fill was computed but the position was never created. Expected
+    #: to be rare (this project's fill model is deterministic, so the
+    #: pre-fill and post-fill plans normally agree exactly), but is a
+    #: real, always-checked fail-closed safety net, not a placebo.
+    entries_rejected_post_fill_revalidation: int = 0
     stop_loss_exits: int = 0
     take_profit_exits: int = 0
     gap_losses_exceeding_planned_risk: int = 0

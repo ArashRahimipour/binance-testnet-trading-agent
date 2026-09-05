@@ -338,6 +338,7 @@ class _DiagBuilder:
     rr_entries_approved: int = 0
     rr_rejected_net_rr_below_minimum: int = 0
     rr_rejected_exchange_filter: int = 0
+    rr_rejected_post_fill_revalidation: int = 0
     rr_gap_losses_exceeding_planned_risk: int = 0
     rr_planned_risk_quote_total: Decimal = field(default_factory=lambda: Decimal(0))
     rr_planned_reward_quote_total: Decimal = field(default_factory=lambda: Decimal(0))
@@ -913,6 +914,7 @@ def run_segment(
             entries_approved=diag.rr_entries_approved,
             entries_rejected_net_rr_below_minimum=diag.rr_rejected_net_rr_below_minimum,
             entries_rejected_exchange_filter_within_risk_budget=diag.rr_rejected_exchange_filter,
+            entries_rejected_post_fill_revalidation=diag.rr_rejected_post_fill_revalidation,
             stop_loss_exits=stop_exits,
             take_profit_exits=take_profit_exits,
             gap_losses_exceeding_planned_risk=diag.rr_gap_losses_exceeding_planned_risk,
@@ -1041,8 +1043,14 @@ def _resolve_pending_signal(
     quantity = validation.validated_quantity
 
     if signal_type == SignalType.BUY:
+        # `broker.simulate_buy` is a pure computation (no portfolio
+        # mutation) - calling it here, BEFORE `apply_buy`, lets the fixed
+        # risk/reward policy re-validate the plan against the REAL fill
+        # price and FAIL CLOSED (never create the position at all) if it
+        # no longer holds, rather than having to unwind an already-applied
+        # buy.
         fill = broker.simulate_buy(quantity, reference_price)
-        state.portfolio = apply_buy(state.portfolio, quantity, fill.fill_price, fill.fee_quote)
+        realized_plan: RiskRewardPlan | None = None
         if use_fixed_risk_reward_policy and risk_reward_plan is not None:
             # Persist the FINAL plan computed from the REAL fill price
             # (never the earlier reference price or signal close), anchored
@@ -1052,8 +1060,15 @@ def _resolve_pending_signal(
             )
             realized_plan = build_realized_plan(
                 plan_for_fill, fill.fill_price, config.stop_loss.stop_distance_pct,
-                config.fees.taker_fee_pct, config.fees.slippage_pct, equity,
+                config.fees.taker_fee_pct, config.fees.slippage_pct, equity, filters,
             )
+            if not realized_plan.approved:
+                diag.record_rejected_entry(realized_plan.reason_code)
+                diag.rr_rejected_post_fill_revalidation += 1
+                return state, trades, peak_equity
+
+        state.portfolio = apply_buy(state.portfolio, quantity, fill.fill_price, fill.fee_quote)
+        if use_fixed_risk_reward_policy and realized_plan is not None:
             state.stop_price = realized_plan.stop_price
             state.target_price = realized_plan.target_price
             state.entry_candle_open_time_ms = candle.open_time_ms

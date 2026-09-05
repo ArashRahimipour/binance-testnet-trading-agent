@@ -71,6 +71,30 @@ def _run(candles: list[Candle], buy_at_index: int, config: AppConfig | None = No
     )
 
 
+# --- Not a universal rejection: a normal trade with realistic nonzero
+# fees and slippage is approved and executes end-to-end through the engine.
+
+
+def test_normal_trade_with_realistic_costs_is_approved_and_executes():
+    config = _config(fees={"taker_fee_pct": 0.001, "slippage_pct": 0.0005})
+    candles = [
+        _candle(0, open_=100, high=100, low=100, close=100),
+        _candle(1, open_=100, high=100, low=100, close=100),  # entry candle - inert
+        _candle(2, open_=100, high=200, low=99, close=105),  # comfortably clears any realistic target
+    ]
+    result = _run(candles, buy_at_index=0, config=config)
+    assert result.risk_reward is not None
+    assert result.risk_reward.entries_approved == 1
+    assert result.risk_reward.entries_rejected_net_rr_below_minimum == 0
+    assert result.risk_reward.entries_rejected_post_fill_revalidation == 0
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.exit_reason == EXIT_REASON_TAKE_PROFIT
+    # Gross R/R exceeds 2.0 (costs are nonzero) but net stays at the fixed floor.
+    assert result.risk_reward.gross_reward_to_risk_values[0] > 2.0
+    assert result.risk_reward.net_reward_to_risk_values[0] >= 2.0 - 1e-6
+
+
 # --- Take-profit execution + no same-candle entry/exit lookahead. ---
 
 

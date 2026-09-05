@@ -2,6 +2,71 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.3] - Correction to the fixed 1:2 risk/reward policy's target design
+
+The 0.2.2 fixed 1:2 risk/reward policy correctly disclosed that fixing the
+GROSS target at exactly 2x the stop distance meant that, combined with
+ANY nonzero fee or slippage, the NET reward/risk ratio was mathematically
+guaranteed to fall below the 2.0 floor for every possible stop distance -
+a real, algebraically-provable property, but not the user's intended
+policy: it made every single entry unconditionally unapprovable under
+this project's own non-zero fee/slippage defaults, which is not what "a
+fixed minimum 1:2 policy" is supposed to mean. Corrected here, again
+BEFORE the first real candidate evaluation - **no real candidate result
+was inspected before or during this release.** Adds 5 tests (452 -> 457
+total). No PR was opened, no Testnet connection was made, and no order
+was placed as part of this work.
+
+### Fixed
+
+- **Cost-adjusted gross target, not a flat 2x multiple**
+  (`backtest/risk_reward.py`): the take-profit price is no longer set at
+  a fixed 2x the stop distance. It is now SOLVED ALGEBRAICALLY, in exact
+  Decimal arithmetic (no floating point, no tolerance), so the planned
+  NET reward (after entry fee, target-exit fee, and adverse slippage)
+  comes out to EXACTLY `MIN_NET_REWARD_TO_RISK` (2.0) times the planned
+  NET loss (after entry fee, stop-exit fee, and adverse slippage) -
+  before tick-size rounding. The GROSS (pre-cost) ratio is therefore
+  cost-adjusted UPWARD to compensate for round-trip costs: exactly 2.0
+  only when fees and slippage are both zero, and strictly above 2.0
+  whenever either is positive - both ratios are computed exactly and
+  reported per entry. This means a normal trade with realistic nonzero
+  fees and slippage IS approvable; the policy is no longer a universal
+  rejection.
+- **Target tick-rounding rounds UP, not down**: the exact algebraic
+  target is rounded to the exchange's price tick size in the direction
+  that can only ever INCREASE the reward (ceiling) - the conservative
+  direction for protecting the stated 2.0 NET minimum, as a deliberate,
+  narrowly-scoped exception to `sizing/exchange_filters.py`'s project-
+  wide "round down only" convention (which exists to keep quantity/risk
+  from being enlarged, the opposite concern). The net ratio is
+  recomputed from the rounded target and re-checked against 2.0 - never
+  assumed - so a genuinely too-coarse tick size (or a target that would
+  exceed the symbol's max price) still correctly rejects
+  (`RR_REJECTED_INVALID_TARGET`, bucketed as an exchange-filter NO TRADE).
+- **Fixed a slippage double-counting bug** surfaced while implementing
+  the fix above: `build_realized_plan`'s post-fill recomputation was
+  re-applying the adverse-slippage markup to the already slippage-
+  adjusted fill price (the fill price from `execution/backtest_broker.py`
+  is already `reference_price * (1 + slippage)`), silently inflating the
+  post-fill planned risk on every approved entry and causing spurious
+  post-fill revalidation failures even under the project's own
+  deterministic, non-adversarial fill model. The shared loss/gain/target-
+  solving helpers now take the already-effective entry price explicitly
+  and never re-derive or re-apply slippage to it.
+- **Post-fill revalidation still fails closed** (`RR_REJECTED_POST_FILL_REVALIDATION_FAILED`):
+  after the simulated fill, the stop and cost-adjusted target are rebuilt
+  from the REAL fill price and both conditions - planned NET loss <= 1%
+  of the ORIGINAL pre-entry equity, and NET reward/risk >= 2.0 - are
+  re-checked from scratch. If either fails, `backtest/engine.py::
+  run_segment` never creates the position at all (the simulated fill is
+  computed via the broker's pure function but never applied to the
+  portfolio) rather than leaving an unprotected position open.
+- Documentation (`README.md`, `ARCHITECTURE.md`, this file) corrected to
+  remove the prior claim that universal rejection was an intended
+  property of this policy, and now explains the cost-adjusted gross
+  target design that preserves the fixed 2.0 NET minimum instead.
+
 ## [0.2.2] - Second pre-real-evaluation code review correction
 
 A further code review of the 0.2.1 correction found one more pre-

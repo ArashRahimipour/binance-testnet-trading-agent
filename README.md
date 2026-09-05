@@ -313,18 +313,30 @@ including zero-trade and skipped blocks - never only the best one.
 Every candidate is also gated by a **fixed minimum 1:2 planned reward/risk
 policy** (`backtest/risk_reward.py`), a user-mandated pre-real-evaluation
 risk policy applied identically to all nine without changing any declared
-signal parameter: each planned entry is sized to a fixed 1% of current
-equity maximum planned loss, with an explicit stop AND take-profit plan
-(target at exactly 2x the stop distance) computed from the REAL simulated
-fill price and persisted with the position; an entry is REJECTED outright
-if the NET (cost-adjusted) reward/risk ratio falls below 2.0, or if a
-risk-safe size cannot satisfy the exchange's minimum notional/lot-size
-(never satisfied by increasing risk). No leverage, one open position
-maximum, and fees are reserved so a fill can never overspend available
-balance. Under this project's current non-zero fee/slippage defaults this
-policy structurally rejects every entry (a disclosed, intended consequence
-of a maximally conservative policy that is never loosened to manufacture a
-trade) - see that module's docstring for the algebra.
+signal parameter: each planned entry is sized so its planned NET loss
+(after estimated entry fee, stop-exit fee, and adverse slippage) is at
+most 1% of current equity, and the take-profit target is SOLVED
+ALGEBRAICALLY - not fixed at a flat multiple of the stop distance - so the
+planned NET reward (after entry fee, target-exit fee, and adverse
+slippage) comes out to exactly the fixed 2.0 minimum before tick-size
+rounding. This means the GROSS (pre-cost) reward/risk ratio is cost-
+adjusted upward to compensate for round-trip costs - exactly 2.0 only when
+fees and slippage are both zero, and slightly ABOVE 2.0 whenever either is
+positive - while the NET ratio stays pinned at the fixed 2.0 floor. Both
+ratios are computed with exact Decimal arithmetic (no floating-point
+tolerance) and reported per entry. The target is then rounded to the
+exchange's price tick in the direction that can only increase the reward,
+and the net ratio is re-checked against the rounded target before
+approval - an entry is REJECTED outright only if a valid tick-aligned
+target still can't clear 2.0, or if a risk-safe size cannot satisfy the
+exchange's minimum notional/lot-size (never satisfied by increasing risk).
+After the simulated fill, the whole plan is rebuilt and RE-VALIDATED from
+the real fill price; if either the 1%-of-equity risk cap or the 2.0 net
+floor no longer holds, the position is never created (fail closed) rather
+than left open unprotected. No leverage, one open position maximum, and
+fees are reserved so a fill can never overspend available balance. A
+normal trade with realistic nonzero fees and slippage is approvable under
+this policy - see that module's docstring for the full algebra.
 
 Each candidate then gets a **scorecard** (`research/scorecard.py`) - a
 rule-based, pre-declared pass/fail test, scored on REALIZED closed-trade

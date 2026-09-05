@@ -314,12 +314,24 @@ reach or influence any of that.
   `backtest/engine.py::run_segment` via `use_fixed_risk_reward_policy`
   (always enabled for every research candidate via
   `run_candidate_blocked_chronological_evaluation`, never for the frozen
-  baseline). Every planned BUY is sized to a fixed 1% of current equity
-  maximum planned loss with an explicit stop AND take-profit plan (target
-  at exactly 2x the stop distance) computed from the REAL simulated fill
-  price and persisted with the position; an entry is rejected outright if
-  the NET (cost-adjusted) reward/risk ratio falls below 2.0, or if a
-  risk-safe size cannot satisfy the exchange's minimum notional/lot-size.
+  baseline). Every planned BUY is sized so its planned NET loss (after
+  entry fee, stop-exit fee, and adverse slippage) is at most 1% of current
+  equity; the take-profit target is SOLVED ALGEBRAICALLY (exact Decimal
+  arithmetic, no float tolerance) so the planned NET reward comes out to
+  exactly the fixed 2.0 minimum before tick rounding - the GROSS
+  (pre-cost) ratio is therefore cost-adjusted upward (exactly 2.0 only
+  when costs are zero, slightly above otherwise) while the NET ratio
+  stays pinned at the fixed floor, and both are reported per entry. The
+  target is then rounded to the exchange's price tick in the direction
+  that can only increase the reward, and the net ratio is re-checked
+  against the rounded target before approval. An entry is rejected
+  outright only if a valid tick-aligned target still can't clear 2.0
+  net, or if a risk-safe size cannot satisfy the exchange's minimum
+  notional/lot-size. After the simulated fill, the plan is rebuilt and
+  RE-VALIDATED from the real fill price (both the 1% risk cap and the 2.0
+  net floor checked fresh); if either fails, the position is never
+  created (fail closed) rather than left open unprotected - realistic
+  nonzero fees and slippage do not make this policy reject every entry.
   If both the stop and take-profit are touched within one candle, STOP is
   assumed to occur first; a gap through the stop fills at the worse
   available price; a gap beyond the take-profit target is never credited
