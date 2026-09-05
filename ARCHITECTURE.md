@@ -362,6 +362,35 @@ reach or influence any of that.
   runtime assertion (`_assert_identical_trading_windows`) re-verifies this
   on every call rather than merely trusting it. Never alters B1's own
   round-1 status.
+- `research/candidates/multitimeframe_breakout.py` (`MultiTimeframeBreakoutStrategy`,
+  round-3 candidate family E) - D1's own round-2 result (OFFICIAL
+  REJECTED) motivates a round-3 hypothesis: a weekly regime gate above
+  D1/B1's own 4h breakout+EMA200 setup, confirmed on a 1h timeframe.
+  Weekly and 4h candles are never fetched or stored separately - they are
+  derived, on every call, purely by aggregating the already-causal,
+  already gap-validated 1h candles the call receives
+  (`_aggregate_completed_buckets`: a bucket is included only with
+  EXACTLY its expected hourly candles, contiguously spaced - a gap or
+  misalignment simply produces no bucket, never a fabricated partial
+  one). A confirmed 4h setup arms a 4-completed-1h-candle entry window
+  (identical parameters/arithmetic to `breakout_regime_gate.py`, reusing
+  the SAME `ema`/`atr`/`rolling_max` primitives) and expires unrenewed;
+  the FIRST 1h candle within the window closing above both the
+  triggering breakout level and its own open produces the one entry that
+  setup will ever produce (a pure function of price history, generalizing
+  `trend_regime.py`'s own one-entry-per-cycle pattern to a 4-candle
+  window). Participates in the SAME unmodified risk/reward policy and
+  engine execution as every other candidate. `research/
+  candidate_registry_round3.py` declares exactly this one candidate,
+  `ROUND_NUMBER=3`, `CUMULATIVE_CANDIDATE_CONFIGURATIONS_EXAMINED=11`,
+  `REQUIRED_MARKET_INTERVAL="1h"`, and a warning disclosing that round 1's
+  nine candidates and round 2's D1 (preserved unchanged) were already
+  observed. `research/round3_report.py` + `cli/main.py::research-round3`
+  evaluate it ONLY on pre-cutoff 1h data via the SAME unmodified
+  fixed-duration blocks and scorecard, overriding the market interval to
+  "1h" and reading only `interval="1h"` rows from the candle database
+  (multiple intervals of the same symbol already coexist there, keyed by
+  `(symbol, interval, open_time_ms)` - see `data/storage.py`).
 - `research/fingerprint.py` - deterministic SHA-256 fingerprints for
   reproducible candidate freezing: a strategy-implementation fingerprint
   (the candidate's own source module plus the shared causal

@@ -218,6 +218,65 @@ def test_research_round2_command_requires_backtest_mode(tmp_path):
     assert "requires --mode backtest" in result.output
 
 
+def _write_config_1h(tmp_path) -> str:
+    config = {
+        "mode": "backtest",
+        "market": {"symbol": "BTCUSDT", "interval": "1h"},
+        "strategy": {"ema_fast": 3, "ema_slow": 6},
+        "paths": {
+            "data_dir": str(tmp_path),
+            "logs_dir": str(tmp_path),
+            "db_path": str(tmp_path / "agent.db"),
+        },
+    }
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(config))
+    return str(path)
+
+
+@responses.activate
+def test_research_round3_command_end_to_end(tmp_path):
+    config_path = _write_config_1h(tmp_path)
+    # 500 1h candles - far short of E1's own ~7564-hour weekly-EMA warm-up
+    # (reported as a fragment, not silently dropped), but enough to prove
+    # the command reads interval="1h" rows and reports E1's structure.
+    rows = make_kline_series(START, "1h", 500)
+    responses.add(responses.GET, f"{PROD_HOST}/api/v3/time", json={"serverTime": rows[-1][6] + 1}, status=200)
+    responses.add(responses.GET, f"{PROD_HOST}/api/v3/klines", json=rows, status=200)
+    fetch_result = CliRunner().invoke(cli, ["--config", config_path, "fetch-data", "--limit", "500"])
+    assert fetch_result.exit_code == 0, fetch_result.output
+
+    responses.add(
+        responses.GET, f"{PROD_HOST}/api/v3/exchangeInfo", json=make_exchange_info(min_notional="1"), status=200,
+    )
+    result = CliRunner().invoke(cli, ["--config", config_path, "research-round3"])
+    assert result.exit_code == 0, result.output
+    assert "research cutoff: 2025-05-16T00:00:00Z" in result.output
+    assert "multitimeframe_breakout_E1_round3" in result.output
+    assert "ROUND 3 HYPOTHESIS" in result.output
+    assert "cumulative_candidate_configurations_examined=11" in result.output
+    assert "NOT AN UNTOUCHED TEST" in result.output
+    assert "OFFICIAL REJECTED" in result.output
+    assert "INSUFFICIENT-DURATION FRAGMENT" in result.output
+    assert "not a claim of profitability and not approval for live or Testnet trading" in result.output
+
+
+def test_research_round3_command_requires_backtest_mode(tmp_path):
+    config_path = _write_config_1h(tmp_path)
+    result = CliRunner().invoke(cli, ["--config", config_path, "--mode", "testnet", "research-round3"])
+    assert result.exit_code != 0
+    assert "requires --mode backtest" in result.output
+
+
+def test_research_round3_command_errors_without_1h_data(tmp_path):
+    # A config/database that only ever had 4h candles fetched - research-
+    # round3 must fail closed (not silently fall back to 4h data).
+    config_path = _write_config(tmp_path)  # 4h config
+    result = CliRunner().invoke(cli, ["--config", config_path, "research-round3"])
+    assert result.exit_code != 0
+    assert "1h" in result.output
+
+
 def test_backtest_command_requires_backtest_mode(tmp_path):
     config_path = _write_config(tmp_path)
     result = CliRunner().invoke(cli, ["--config", config_path, "--mode", "testnet", "backtest"])

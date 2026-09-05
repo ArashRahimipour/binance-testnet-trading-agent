@@ -476,6 +476,47 @@ a fair comparison - without altering B1's own round-1 status. **Even a
 `RESEARCH_SURVIVOR` verdict for D1 is not a claim of profitability and not
 approval for live or Testnet trading.**
 
+### Round 3: a multi-timeframe hypothesis (read-only, pre-cutoff only, 1h data)
+
+```bash
+trading-agent --mode backtest research-round3
+```
+
+D1's OFFICIAL round-2 verdict was REJECTED - already observed, and
+preserved unchanged (this command never touches `research/
+candidate_registry_round2.py`, `research/candidates/breakout_regime_gate.py`,
+or `research/round2_report.py`). Round 3 evaluates exactly **one** new
+candidate - `multitimeframe_breakout_E1_round3` (`research/candidates/
+multitimeframe_breakout.py`) - built on three timeframes: a **weekly**
+regime gate (last completed weekly close above a rising 40-period weekly
+EMA - BUY is categorically prohibited otherwise), D1/B1's own **4h**
+breakout+EMA200-regime setup (identical parameters, unchanged), which arms
+a 4-completed-1h-candle entry window and then expires unrenewed, and a
+**1h** confirmation layer - the first completed 1h candle within that
+window closing above both the triggering breakout level and its own open
+produces the one entry that setup will ever produce. Weekly and 4h
+candles are never fetched separately; they are derived by aggregating
+whatever 1h candles the strategy is given, and a real gap or misalignment
+simply excludes that bucket rather than fabricating one.
+
+This command requires **1h candles specifically** - it overrides the
+market interval to `1h` regardless of your config file's own default, and
+reads only `interval="1h"` rows from your candle database (multiple
+intervals of the same symbol can coexist there; fetch them first with a
+config whose `market.interval` is `1h`). E1 is evaluated ONLY on
+pre-cutoff data via the same duration-normalized blocks and scorecard
+thresholds rounds 1-2 use - nothing loosened or tightened. The report
+discloses the round number, the cumulative candidate configurations
+examined across all three rounds (**11**), and E1's own funnel
+diagnostics (weekly-filter rejections, 4h setups detected/armed/expired,
+1h confirmations, entries) alongside the same detailed post-mortem every
+other candidate gets. A full multi-year 1h evaluation can take a
+considerable amount of time (E1's weekly-EMA-40 warm-up alone needs
+roughly 45 weeks of 1h candles, re-derived on every single decision) -
+an accepted cost of the required multi-timeframe design. **Even a
+`RESEARCH_SURVIVOR` verdict for E1 is not a claim of profitability and
+not approval for live or Testnet trading.**
+
 ## Running on the Spot Testnet
 
 ```bash

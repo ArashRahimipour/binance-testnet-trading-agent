@@ -2,6 +2,62 @@
 
 All notable changes to this project are documented here.
 
+## [0.5.0] - Round 3: multi-timeframe breakout candidate (multitimeframe_breakout_E1_round3)
+
+Round 2's `breakout_regime_D1_round2` received its OFFICIAL evaluation
+result: REJECTED - already observed, and preserved unchanged (nothing in
+this release touches `research/candidate_registry_round2.py`, `research/
+candidates/breakout_regime_gate.py`, or `research/round2_report.py`).
+This release adds exactly one round-3 hypothesis: a weekly-regime-filtered
+version of D1/B1's own 4h breakout, confirmed on a 1h timeframe. Adds 28
+tests (569 total). No PR was opened, no Testnet connection was made, no
+order was placed, and no real candle database was queried as part of this
+work - all development used synthetic fixtures only.
+
+### Added
+
+- **`research/candidates/multitimeframe_breakout.py`**
+  (`MultiTimeframeBreakoutStrategy`, candidate family E,
+  `multitimeframe_breakout_E1_round3`): a three-timeframe structure -
+  (1) a weekly regime gate (last completed weekly close above a 40-period
+  weekly EMA, itself higher than its own value 4 completed weekly candles
+  earlier - prohibits BUY outright when false); (2) D1/B1's own causal
+  breakout+EMA200-regime 4h setup (IDENTICAL parameters and arithmetic,
+  reusing the same shared `ema`/`atr`/`rolling_max` primitives), which
+  arms a 4-completed-1h-candle entry window and then expires,
+  un-renewable without a fresh 4h setup; (3) a 1h confirmation - the
+  FIRST completed 1h candle within the window closing above both the
+  triggering 4h breakout level and its own open produces the ONE entry
+  that setup will ever produce (deterministically, a pure function of
+  price history, exactly like `research/candidates/trend_regime.py`'s own
+  one-entry-per-cycle pattern generalized to a 4-candle window). Weekly
+  and 4h candles are never fetched or stored separately - they are
+  derived, on every call, purely by aggregating the already-causal,
+  already gap-validated 1h candles the call receives
+  (`_aggregate_completed_buckets`): a bucket is included only with
+  EXACTLY its expected hourly candles, contiguously spaced - a real gap
+  or misalignment simply produces no bucket for that stretch, never a
+  fabricated partial one. Participates in the SAME unmodified fixed 1:2
+  risk/reward policy, next-open fill, and one-position-maximum discipline
+  as every other candidate - this module never computes a stop, target,
+  quantity, fee, or slippage value of any kind.
+- **`research/candidate_registry_round3.py`**: exactly one round-3
+  candidate, `ROUND_NUMBER=3`, `CUMULATIVE_CANDIDATE_CONFIGURATIONS_EXAMINED=11`
+  (9 round-1 + 1 round-2 + 1 round-3), `REQUIRED_MARKET_INTERVAL="1h"`,
+  and `ROUND3_MULTIPLE_TESTING_WARNING` disclosing that round 1's nine
+  candidates and round 2's D1 (OFFICIAL REJECTED, preserved unchanged)
+  were already observed before this hypothesis was chosen.
+- **`research/round3_report.py`** + **`cli/main.py::research-round3`**:
+  evaluates E1 ONLY on pre-cutoff 1h data via the SAME unmodified
+  duration-normalized fixed-duration blocks and scorecard thresholds
+  rounds 1-2 use, with a full `research/post_mortem.py`-based report plus
+  E1's own multi-timeframe funnel counters (weekly-filter rejections, 4h
+  setups detected/armed/expired, 1h confirmations, entries). The CLI
+  command overrides the market interval to "1h" regardless of the loaded
+  config's own default and reads ONLY `interval="1h"` rows from the same
+  candle database (multiple intervals of the same symbol already coexist
+  there, keyed by `(symbol, interval, open_time_ms)`).
+
 ## [0.4.1] - Fix D1-vs-B1 date misalignment in the round-2 comparison
 
 Code review found a real defect in 0.4.0 (commit 50a5a5b), caught BEFORE

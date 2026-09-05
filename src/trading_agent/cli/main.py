@@ -44,12 +44,16 @@ from trading_agent.research.blocked_chronological_evaluation import (
     run_candidate_blocked_chronological_evaluation,
 )
 from trading_agent.research.candidate_registry import CANDIDATE_REGISTRY, TOTAL_CANDIDATE_COUNT
+from trading_agent.research.candidate_registry_round3 import (
+    REQUIRED_MARKET_INTERVAL as ROUND3_MARKET_INTERVAL,
+)
 from trading_agent.research.cutoff import RESEARCH_CUTOFF_ISO, split_at_cutoff
 from trading_agent.research.fixed_duration_evaluation import DEFAULT_BLOCK_DURATION_DAYS
 from trading_agent.research.freeze import freeze_candidate, save_frozen_candidate
 from trading_agent.research.frozen_baseline import reproduce_frozen_baseline_report
 from trading_agent.research.post_mortem import CandidatePostMortem, build_post_mortem_report
 from trading_agent.research.round2_report import Round2Comparison, build_round2_report
+from trading_agent.research.round3_report import Round3CandidateReport, build_round3_report
 from trading_agent.research.scorecard import ScorecardEntry, ScorecardStatus, build_scorecard
 from trading_agent.research.sensitivity_comparison import (
     CandidateSensitivityComparison,
@@ -952,6 +956,107 @@ def research_round2_cmd(ctx: click.Context) -> None:
     _print_scorecard_entry_summary(comparison.b1_scorecard_on_identical_dates)
     _print_candidate_post_mortem(comparison.b1_post_mortem_on_identical_dates)
 
+    click.echo(
+        "\nNote: this is exploratory research on simulated fills over historical data, not a claim of "
+        "profitability and not approval for live or Testnet trading."
+    )
+
+
+@cli.command("research-round3")
+@click.pass_context
+def research_round3_cmd(ctx: click.Context) -> None:
+    """ROUND-3 report: `multitimeframe_breakout_E1_round3`'s complete
+    pre-cutoff result (see `research/round3_report.py`, `research/
+    candidate_registry_round3.py`, and `research/candidates/
+    multitimeframe_breakout.py`).
+
+    E1 is a round-3 hypothesis examined AFTER round 1's nine candidates
+    and round 2's D1 (OFFICIAL REJECTED verdict, preserved unchanged)
+    were already observed - NEVER presented as an untouched, pre-
+    registered test. It requires 1h candles specifically (its own weekly
+    and 4h context is derived by aggregating that 1h stream - see that
+    module's docstring) - this command overrides the configured market
+    interval to "1h" regardless of the loaded config file's own default,
+    and reads ONLY interval="1h" rows from the SAME candle database
+    (candles for multiple intervals of the same symbol coexist there,
+    keyed by (symbol, interval, open_time_ms) - see `data/storage.py`).
+    Evaluated ONLY on pre-cutoff data using the duration-normalized
+    fixed-duration blocks; the consumed post-cutoff period is never
+    touched. Scored against the SAME conservative, pre-declared scorecard
+    thresholds as rounds 1 and 2 - nothing loosened or tightened. Reports
+    every full-duration block (including any that failed), never only
+    the best. Even a RESEARCH_SURVIVOR verdict here is NOT a claim of
+    profitability and NOT approval for live or Testnet trading.
+
+    A full multi-year 1h evaluation can take a considerable amount of
+    time (this candidate's weekly-EMA-40 warm-up alone requires roughly
+    45 weeks of 1h candles, and its weekly/4h context is re-derived from
+    the 1h stream on every single decision) - this is an accepted,
+    disclosed cost of the required multi-timeframe design, not a defect.
+    """
+    config: AppConfig = ctx.obj["config"]
+    if config.mode != Mode.BACKTEST:
+        click.echo("The research-round3 command requires --mode backtest.", err=True)
+        sys.exit(1)
+    config = config.model_copy(update={"market": config.market.model_copy(update={"interval": ROUND3_MARKET_INTERVAL})})
+
+    with CandleStore(config.paths.db_path) as store:
+        candles = store.get_candles(config.market.symbol, ROUND3_MARKET_INTERVAL)
+    if not candles:
+        click.echo(
+            f"No interval={ROUND3_MARKET_INTERVAL!r} candles found. Run `fetch-data --config <config-with-"
+            f"market.interval={ROUND3_MARKET_INTERVAL}>` first (see this command's own docstring).",
+            err=True,
+        )
+        sys.exit(1)
+
+    client = BinancePublicMarketDataClient(PRODUCTION_MARKET_DATA_HOST)
+    try:
+        filters = SymbolFilters.from_exchange_info(client.get_exchange_info(config.market.symbol))
+    except Exception as exc:  # noqa: BLE001 - surfaced to the user, then exit
+        click.echo(f"Failed to fetch exchange filters: {exc}", err=True)
+        sys.exit(1)
+
+    pre_cutoff, consumed = split_at_cutoff(candles)
+    click.echo(
+        f"research cutoff: {RESEARCH_CUTOFF_ISO}  pre_cutoff_candles={len(pre_cutoff)}  "
+        f"consumed_candles={len(consumed)} (NEVER used below - E1 is pre-cutoff development data only)"
+    )
+    if not pre_cutoff:
+        click.echo("No pre-cutoff candles available - cannot evaluate E1.", err=True)
+        sys.exit(1)
+
+    report: Round3CandidateReport = build_round3_report(pre_cutoff, config, filters)
+    click.echo(f"\n=== ROUND {report.round_number} HYPOTHESIS: {report.candidate_id} ({report.family}) params={report.params} ===")
+    click.echo(f"cumulative_candidate_configurations_examined={report.cumulative_candidate_configurations_examined}")
+    click.echo(report.multiple_testing_warning)
+
+    click.echo("\n--- E1 scorecard (same conservative thresholds as rounds 1 and 2) ---")
+    _print_scorecard_entry_summary(report.scorecard)
+
+    click.echo(
+        "\n--- E1 multi-timeframe funnel diagnostics ---\n"
+        f"weekly_filter_rejections={report.weekly_filter_rejections} "
+        f"four_h_setups_detected={report.four_h_setups_detected} setups_armed={report.setups_armed} "
+        f"setups_expired={report.setups_expired} one_h_confirmations={report.one_h_confirmations} "
+        f"strategy_entries={report.strategy_entries}"
+    )
+
+    for fragment in report.fragments:
+        click.echo(
+            f"INSUFFICIENT-DURATION FRAGMENT: segment={fragment.segment_index} candles={fragment.candle_count} "
+            f"available_tradable_duration_days={fragment.available_tradable_duration_days:.1f} - {fragment.reason}"
+        )
+    for leftover in report.leftovers:
+        click.echo(
+            f"LEFTOVER PARTIAL WINDOW: segment={leftover.segment_index} candles={leftover.candle_count} "
+            f"duration_days={leftover.duration_days:.1f} (excluded from all pass/fail calculations)"
+        )
+
+    click.echo("\n--- E1 detailed post-mortem (every full-duration block, no hidden failures) ---")
+    _print_candidate_post_mortem(report.post_mortem)
+
+    click.echo(f"\n{report.not_approved_note}")
     click.echo(
         "\nNote: this is exploratory research on simulated fills over historical data, not a claim of "
         "profitability and not approval for live or Testnet trading."
