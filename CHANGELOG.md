@@ -2,6 +2,74 @@
 
 All notable changes to this project are documented here.
 
+## [0.6.0] - Research-data gap forensic and recovery tool
+
+A new, OPTIONAL tool for the 28 confirmed BTCUSDT 1h gaps: forensically
+classifies every missing hour and, only when safe, reconstructs it from
+Binance's own official 1-minute klines. Changes NOTHING about any
+strategy, candidate, parameter, scorecard, risk rule, fee, slippage,
+sizing, or execution logic, runs NO candidate evaluation, and makes NO
+Testnet connection or order of any kind - all development and testing
+used synthetic fixtures only; no real database or Binance host was
+touched. Adds 48 new tests (661 total).
+
+### Added
+
+- **`data/boundary.py`**: the half-open `[start, end)` boundary-safety
+  helpers (`exclusive_upper_bound_for_request`, `below_exclusive_end`)
+  extracted out of `data/historical_fetch.py` into their own shared
+  module (imported back into `historical_fetch.py` under their original
+  private names, so nothing there changes behavior) so `data/
+  gap_recovery.py`'s own 1-minute-kline fetches reuse the exact same
+  two-layer exclusive-boundary guarantee rather than re-implementing it.
+- **`data/gap_recovery.py`**: for each confirmed 1h gap, and for each
+  individually missing hour within it, queries Binance's official
+  1-minute klines for exactly that hour and classifies it as one of four
+  mutually exclusive outcomes: `FULLY_RECOVERABLE` (all 60 expected
+  1-minute candles present, continuous, and validated - reconstructed by
+  aggregating EXACTLY `open`=first 1m open, `high`=max 1m high, `low`=min
+  1m low, `close`=last 1m close, `volume`=sum of 1m volumes, Binance's
+  own documented 1h-from-1m convention), `PARTIALLY_RECOVERABLE` (some
+  but not all 60 exist - never reconstructed, never interpolated),
+  `GENUINE_NO_DATA` (the exchange has nothing at all for that hour - a
+  real, permanent outage), or `UNRESOLVED` (a validation failure - e.g. a
+  1m-aggregate that unexpectedly disagrees with Binance's own native 1h
+  kline for that hour when one is available - or a candle at or after the
+  immutable research cutoff, which is never even fetched). Every
+  reconstructed candle carries full provenance (source, retrieval time,
+  component count, first/last component timestamp, validation result,
+  and a deterministic SHA-256 content hash). `run_gap_forensics` is
+  purely read-only; `count_round3_complete_blocks` answers "how many
+  complete Round-3 fixed-duration blocks would exist after recovery" with
+  the exact same candle-counting arithmetic
+  `research/fixed_duration_evaluation.py` uses, WITHOUT ever running a
+  candidate, a signal, or the backtest engine (the only candidate-related
+  fact read is `MultiTimeframeBreakoutStrategy().min_required_candles`, a
+  static, side-effect-free constant). `apply_gap_recovery` is the ONLY
+  function that writes anything - atomically (one transaction) and
+  idempotently (re-running it re-derives and re-asserts the identical
+  result).
+- **`data/storage.py::CandleStore.store_candles_and_gaps`**: new optional
+  `stale_gap_expected_open_times` parameter (default `None`, fully
+  backward compatible) that additionally deletes the named `candle_gaps`
+  rows in the same atomic transaction - used by `apply_gap_recovery` so a
+  gap that is now fully or partially resolved never leaves a stale
+  manifest row behind.
+- **`cli/main.py::research-gap-audit`**: READ-ONLY forensic report -
+  never writes to any database. Reports total gaps/missing hours, the
+  four outcome-bucket counts, full per-hour detail with provenance, the
+  resulting gap-free segment lengths if every fully-recoverable hour were
+  stored, and the Round-3 complete-block count after recovery.
+- **`cli/main.py::research-gap-recover --confirm`**: runs the identical
+  analysis and prints the identical report, then - ONLY given the
+  explicit `--confirm` flag - stores every `FULLY_RECOVERABLE`
+  reconstructed candle. Without `--confirm`, behaves exactly like
+  `research-gap-audit` and stores nothing.
+- **`tests/unit/test_gap_recovery.py`** (36 tests) + 8 new
+  `research-gap-audit`/`research-gap-recover` tests in
+  `tests/unit/test_cli_commands.py` + 4 new `stale_gap_expected_open_times`
+  tests in `tests/unit/test_data_storage.py`.
+
 ## [0.5.2] - Fix: fetch-pipeline half-open [start, end) boundary defect
 
 **Critical fix**, found from real database metadata (not from inspecting

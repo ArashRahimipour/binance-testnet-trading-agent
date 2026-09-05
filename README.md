@@ -130,6 +130,47 @@ both keyed for upsert, so nothing is duplicated. This gap tolerance is
 (`execution/live_runner.py`) always rejects any gap outright via a
 completely separate, unmodified validation path - see ARCHITECTURE.md.
 
+### Optional gap forensics and recovery (read-only, then explicitly confirmed)
+
+A confirmed 1h gap above is preserved, never filled - but it can
+sometimes still be reconstructed from Binance's own official 1-minute
+klines, if all 60 expected 1-minute candles for that hour actually exist.
+This is a separate, OPTIONAL, two-step tool (`src/trading_agent/data/
+gap_recovery.py`) - never automatic, and never touching any
+strategy/candidate/parameter/scorecard/risk/fee/slippage/sizing/execution
+logic or running a candidate evaluation:
+
+```bash
+trading-agent research-gap-audit
+```
+
+READ-ONLY. For every confirmed 1h gap already in your database, queries
+Binance's 1-minute klines for each missing hour and classifies it
+`FULLY_RECOVERABLE` (all 60 minutes present, continuous, and validated),
+`PARTIALLY_RECOVERABLE` (some but not all 60), `GENUINE_NO_DATA` (the
+exchange has nothing at all - a real outage), or `UNRESOLVED` (a
+validation failure, or a candle at/after the immutable research cutoff,
+which is never even fetched). Reports the resulting gap-free segment
+lengths and the Round-3 complete-block count if every fully-recoverable
+hour were stored - nothing is written to any database by this command.
+
+```bash
+trading-agent research-gap-recover --confirm
+```
+
+Runs the identical analysis and prints the identical report, then - ONLY
+because `--confirm` was passed - stores every `FULLY_RECOVERABLE`
+candle (aggregated exactly as Binance's own 1h candles are built:
+`open`=first open, `high`=max high, `low`=min low, `close`=last close,
+`volume`=sum of volumes; never interpolated, never fabricated) atomically
+alongside a freshly recomputed gap manifest. Without `--confirm`, this
+command performs the exact same analysis and stores nothing at all -
+`--confirm` is the only thing that makes it write. Both commands require
+`market.interval: "1h"` (see `config/round3_1h.yaml`) and print full
+provenance (source, retrieval time, component count, first/last
+timestamp, validation result, deterministic SHA-256 content hash) for
+every candle they classify as recoverable.
+
 ## Backtesting
 
 ```bash

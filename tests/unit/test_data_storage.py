@@ -107,6 +107,65 @@ def test_rerunning_the_same_download_is_idempotent(tmp_path):
     assert fetched_gaps[0].missing_intervals == 1
 
 
+# --- Stale-gap deletion (gap_recovery.py's own storage requirement). ---
+
+
+def test_stale_gap_expected_open_times_deletes_the_old_gap_row(tmp_path):
+    db_path = tmp_path / "candles.db"
+    original_gap = _gap(START, START + 2 * STEP, 1)  # expected_open_time_ms = START + STEP
+    with CandleStore(db_path) as store:
+        store.store_candles_and_gaps([], [original_gap], "BTCUSDT", INTERVAL, detected_at_ms=1000)
+        assert len(store.get_gaps("BTCUSDT", INTERVAL)) == 1
+        # The gap is now fully resolved - no replacement gap, but the old
+        # row must be deleted, not merely left stale alongside nothing new.
+        store.store_candles_and_gaps(
+            [_candle(START + STEP)], [], "BTCUSDT", INTERVAL, detected_at_ms=2000,
+            stale_gap_expected_open_times=[original_gap.expected_open_time_ms],
+        )
+        assert store.get_gaps("BTCUSDT", INTERVAL) == []
+
+
+def test_stale_gap_expected_open_times_replaces_with_a_narrower_gap(tmp_path):
+    db_path = tmp_path / "candles.db"
+    original_gap = _gap(START, START + 3 * STEP, 2)  # missing START+STEP and START+2*STEP
+    narrower_gap = _gap(START + STEP, START + 3 * STEP, 1)  # only START+2*STEP still missing
+    with CandleStore(db_path) as store:
+        store.store_candles_and_gaps([], [original_gap], "BTCUSDT", INTERVAL, detected_at_ms=1000)
+        store.store_candles_and_gaps(
+            [_candle(START + STEP)], [narrower_gap], "BTCUSDT", INTERVAL, detected_at_ms=2000,
+            stale_gap_expected_open_times=[original_gap.expected_open_time_ms],
+        )
+        fetched_gaps = store.get_gaps("BTCUSDT", INTERVAL)
+    assert len(fetched_gaps) == 1
+    assert fetched_gaps[0].expected_open_time_ms == narrower_gap.expected_open_time_ms
+    assert fetched_gaps[0].missing_intervals == 1
+
+
+def test_stale_gap_expected_open_times_deleting_a_nonexistent_row_is_a_noop(tmp_path):
+    db_path = tmp_path / "candles.db"
+    with CandleStore(db_path) as store:
+        # No prior gap at all - deleting a "stale" row that was never
+        # there must not raise or otherwise misbehave.
+        store.store_candles_and_gaps(
+            [_candle(START)], [], "BTCUSDT", INTERVAL, detected_at_ms=1000,
+            stale_gap_expected_open_times=[START + STEP],
+        )
+        assert store.get_gaps("BTCUSDT", INTERVAL) == []
+
+
+def test_omitting_stale_gap_expected_open_times_preserves_old_behavior(tmp_path):
+    # Default (None) must behave EXACTLY like before this parameter
+    # existed - re-running fetch-data's own normal path is unaffected.
+    db_path = tmp_path / "candles.db"
+    gap = _gap(START, START + 2 * STEP, 1)
+    with CandleStore(db_path) as store:
+        store.store_candles_and_gaps([_candle(START)], [gap], "BTCUSDT", INTERVAL, detected_at_ms=1000)
+        store.store_candles_and_gaps([_candle(START)], [gap], "BTCUSDT", INTERVAL, detected_at_ms=2000)
+        fetched_gaps = store.get_gaps("BTCUSDT", INTERVAL)
+    assert len(fetched_gaps) == 1
+    assert fetched_gaps[0].missing_intervals == 1
+
+
 def test_a_failed_write_leaves_no_partially_inconsistent_state(tmp_path):
     db_path = tmp_path / "candles.db"
     candles = [_candle(START), _candle(START + 2 * STEP)]

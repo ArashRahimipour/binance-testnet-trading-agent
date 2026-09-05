@@ -156,6 +156,51 @@ deliberately separate path exists for research data only:
 At no point does anything in this path fabricate, interpolate, or guess
 an OHLCV value - a confirmed gap is recorded and preserved, never filled.
 
+### Optional 1-minute-based gap recovery (`data/gap_recovery.py`)
+
+A confirmed gap above is preserved, never filled - but a genuinely
+confirmed 1h gap can sometimes still be reconstructed from Binance's own
+official 1-minute klines, IF all 60 expected 1-minute candles for that
+hour actually exist. `data/gap_recovery.py` is a separate, OPTIONAL tool
+for exactly this, deliberately decoupled from the always-automatic
+`confirm_gaps` path above (a human decides whether and when to run it,
+never automatic):
+
+1. For each missing hour of each confirmed gap, fetch Binance's 1-minute
+   klines for exactly `[hour, hour + 1h)`, reusing `data/boundary.py`'s
+   same two-layer exclusive-end guarantee `data/historical_fetch.py`
+   uses for its own paginated fetches.
+2. Classify the hour into exactly one of four outcomes:
+   `FULLY_RECOVERABLE` (all 60 present, continuous, hour-aligned, and -
+   if Binance's own native 1h kline for that hour is unexpectedly also
+   available - matching it), `PARTIALLY_RECOVERABLE` (some but not all
+   60), `GENUINE_NO_DATA` (zero found - a real exchange-side outage), or
+   `UNRESOLVED` (a validation failure, or a candle at/after the immutable
+   research cutoff, which is never even fetched).
+3. A `FULLY_RECOVERABLE` hour is reconstructed by aggregating the 60 real
+   1-minute candles exactly as Binance's own klines are built:
+   `open`=first open, `high`=max high, `low`=min low, `close`=last close,
+   `volume`=sum of volumes - never interpolated, never fabricated.
+4. `run_gap_forensics` is purely read-only. Only `apply_gap_recovery`
+   writes anything, and only ever candles this same run already
+   classified `FULLY_RECOVERABLE` - atomically (one `CandleStore.
+   store_candles_and_gaps` transaction, using its `stale_gap_expected_
+   open_times` parameter to delete the old, now-inaccurate gap row in the
+   same transaction) and idempotently (a second pass re-derives and
+   re-asserts the identical result).
+5. This module never runs a candidate, a signal, or the backtest engine
+   - the only candidate-related fact it ever reads is
+   `MultiTimeframeBreakoutStrategy().min_required_candles` (a static,
+   side-effect-free constant), used purely to answer "how many complete
+   Round-3 fixed-duration blocks would exist after recovery" with the
+   exact same candle-counting arithmetic `research/
+   fixed_duration_evaluation.py` uses - never to score, rank, or alter
+   any historical verdict.
+
+`cli/main.py::research-gap-audit` prints this analysis read-only;
+`research-gap-recover --confirm` is the only command that stores
+anything, and only with that explicit flag.
+
 ## Data flow for a single decision cycle (testnet mode)
 
 1. Fetch server time; call `TestnetBrokerAdapter.sync_time()` with it so

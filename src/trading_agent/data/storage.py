@@ -77,6 +77,7 @@ class CandleStore:
         symbol: str,
         interval: str,
         detected_at_ms: int,
+        stale_gap_expected_open_times: list[int] | None = None,
     ) -> None:
         """Persist a historical download's candles and its confirmed gap
         manifest together, in ONE transaction - a failure partway through
@@ -86,9 +87,24 @@ class CandleStore:
         candle or gap just re-asserts the same fact), so re-running the
         same download twice leaves the database in the same state as
         running it once.
+
+        `stale_gap_expected_open_times`, when given, additionally DELETES
+        any `candle_gaps` row at that `(symbol, interval, expected_open_time_ms)`
+        within this SAME transaction, before `gaps` is upserted - used when
+        a previously-confirmed gap has since been fully or partially
+        resolved (e.g. by `data/gap_recovery.py`) and its OLD manifest row
+        must not survive alongside (or instead of) a freshly recomputed,
+        narrower or absent gap record. Deleting a row that no longer
+        exists is a no-op, so this stays idempotent. `None` (the default)
+        preserves the exact prior behavior - the normal `fetch-data`
+        re-download path never needs this, since a fresh full-range
+        fetch's own `confirmed_gaps` already reflects the complete,
+        current gap set for everything it just covered.
         """
         try:
             self._upsert_candles_no_commit(candles)
+            if stale_gap_expected_open_times:
+                self._delete_gaps_no_commit(symbol, interval, stale_gap_expected_open_times)
             self._upsert_gaps_no_commit(gaps, symbol, interval, detected_at_ms)
             self._conn.commit()
         except Exception:
@@ -141,6 +157,15 @@ class CandleStore:
                 close=excluded.close,
                 volume=excluded.volume
             """,
+            rows,
+        )
+
+    def _delete_gaps_no_commit(
+        self, symbol: str, interval: str, expected_open_time_mss: list[int]
+    ) -> None:
+        rows = [(symbol, interval, t) for t in expected_open_time_mss]
+        self._conn.executemany(
+            "DELETE FROM candle_gaps WHERE symbol = ? AND interval = ? AND expected_open_time_ms = ?",
             rows,
         )
 

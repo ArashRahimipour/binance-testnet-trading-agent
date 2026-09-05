@@ -37,6 +37,10 @@ still filtered to `open_time_ms < end_time_ms` regardless (see
 `_below_exclusive_end`) - so even if Binance's inclusive-`endTime`
 behavior ever changed, or a future caller forgot layer (1), no candle at
 or after a requested `end_time_ms` can ever reach validation or storage.
+Both helpers now live in `data/boundary.py` (imported here under their
+original private names for backward compatibility) so `data/
+gap_recovery.py`'s own 1-minute-kline fetches can reuse the exact same
+two-layer guarantee rather than re-implementing it.
 """
 
 from __future__ import annotations
@@ -47,6 +51,10 @@ from dataclasses import dataclass, field
 
 import requests
 
+from trading_agent.data.boundary import below_exclusive_end as _below_exclusive_end
+from trading_agent.data.boundary import (
+    exclusive_upper_bound_for_request as _exclusive_upper_bound_for_request,
+)
 from trading_agent.data.exceptions import EmptyDataError
 from trading_agent.data.gap_detection import GapRecord, partition_into_segments
 from trading_agent.data.market_data_public import BinancePublicMarketDataClient
@@ -65,22 +73,6 @@ class HistoricalFetchError(Exception):
 class HistoricalFetchResult:
     candles: list[Candle]
     confirmed_gaps: list[GapRecord] = field(default_factory=list)
-
-
-def _exclusive_upper_bound_for_request(end_time_ms: int) -> int:
-    """Binance's kline `endTime` is INCLUSIVE - subtract 1ms so the HTTP
-    request itself asks for a genuinely exclusive upper bound, rather than
-    relying solely on post-hoc filtering to enforce `end_time_ms`."""
-    return end_time_ms - 1
-
-
-def _below_exclusive_end(candles: list[Candle], end_time_ms: int | None) -> list[Candle]:
-    """Defense-in-depth filter: drop any candle at or after `end_time_ms`,
-    regardless of what the exchange returned. A no-op when `end_time_ms`
-    is None (no upper bound was ever requested)."""
-    if end_time_ms is None:
-        return candles
-    return [c for c in candles if c.open_time_ms < end_time_ms]
 
 
 def _assert_no_candle_at_or_after(candles: list[Candle], end_time_ms: int) -> None:

@@ -1,13 +1,17 @@
+import json
 from decimal import Decimal
+from urllib.parse import parse_qs, urlparse
 
 import responses
 import yaml
 from click.testing import CliRunner
 
 from tests.fixtures.exchange_info import make_exchange_info
-from tests.fixtures.klines import make_kline_series
+from tests.fixtures.klines import make_kline_row, make_kline_series
 from trading_agent.cli.main import cli
-from trading_agent.data.models import interval_to_ms
+from trading_agent.data.gap_detection import GapRecord
+from trading_agent.data.models import Candle, interval_to_ms
+from trading_agent.data.storage import CandleStore
 from trading_agent.persistence.execution_store import ExecutionStateStore
 from trading_agent.portfolio.state import PortfolioState
 
@@ -273,6 +277,156 @@ def test_research_round3_command_errors_without_1h_data(tmp_path):
     # round3 must fail closed (not silently fall back to 4h data).
     config_path = _write_config(tmp_path)  # 4h config
     result = CliRunner().invoke(cli, ["--config", config_path, "research-round3"])
+    assert result.exit_code != 0
+    assert "1h" in result.output
+
+
+def _seed_1h_gap(db_path, existing_open_times: list[int], gap: GapRecord) -> None:
+    step = interval_to_ms("1h")
+    candles = [
+        Candle(
+            symbol="BTCUSDT", interval="1h", open_time_ms=t, close_time_ms=t + step - 1,
+            open=Decimal(100), high=Decimal(101), low=Decimal(99), close=Decimal(100), volume=Decimal(1),
+        )
+        for t in existing_open_times
+    ]
+    with CandleStore(db_path) as store:
+        store.upsert_candles(candles)
+        store.store_candles_and_gaps([], [gap], "BTCUSDT", "1h", detected_at_ms=1)
+
+
+def _gap_recovery_klines_callback(minute_rows: dict[int, list]):
+    """Serves 1m rows for the reconstruction fetch; anything else
+    (including the native-1h cross-check) returns empty, matching the
+    real expected shape of a genuinely confirmed gap."""
+
+    def _callback(request):
+        query = parse_qs(urlparse(request.url).query)
+        interval = query.get("interval", [None])[0]
+        if interval != "1m":
+            return (200, {"Content-Type": "application/json"}, json.dumps([]))
+        start = int(query["startTime"][0]) if "startTime" in query else min(minute_rows)
+        end = int(query["endTime"][0]) if "endTime" in query else max(minute_rows)
+        rows = [row for t, row in sorted(minute_rows.items()) if start <= t <= end]
+        return (200, {"Content-Type": "application/json"}, json.dumps(rows))
+
+    return _callback
+
+
+@responses.activate
+def test_research_gap_audit_command_is_read_only_and_reports_a_recoverable_hour(tmp_path):
+    config_path = _write_config_1h(tmp_path)
+    db_path = tmp_path / "agent.db"
+    step = interval_to_ms("1h")
+    minute_step = interval_to_ms("1m")
+    gap_hour = START + step
+    gap = GapRecord(expected_open_time_ms=gap_hour, previous_open_time_ms=START, next_open_time_ms=START + 2 * step, missing_intervals=1)
+    _seed_1h_gap(db_path, [START, START + 2 * step], gap)
+
+    minute_rows = {gap_hour + i * minute_step: make_kline_row(gap_hour + i * minute_step, "1m") for i in range(60)}
+    responses.add_callback(responses.GET, f"{PROD_HOST}/api/v3/klines", callback=_gap_recovery_klines_callback(minute_rows))
+
+    result = CliRunner().invoke(cli, ["--config", config_path, "research-gap-audit"])
+    assert result.exit_code == 0, result.output
+    assert "total_confirmed_gaps=1" in result.output
+    assert "fully_recoverable_hours=1" in result.output
+    assert "FULLY_RECOVERABLE" in result.output
+    assert "READ-ONLY audit - nothing was stored" in result.output
+    assert "Round-3" in result.output
+
+    with CandleStore(db_path) as store:
+        assert len(store.get_candles("BTCUSDT", "1h")) == 2  # untouched
+        assert len(store.get_gaps("BTCUSDT", "1h")) == 1  # untouched
+
+
+def test_research_gap_audit_command_requires_backtest_mode(tmp_path):
+    config_path = _write_config_1h(tmp_path)
+    result = CliRunner().invoke(cli, ["--config", config_path, "--mode", "testnet", "research-gap-audit"])
+    assert result.exit_code != 0
+    assert "requires --mode backtest" in result.output
+
+
+def test_research_gap_audit_command_requires_1h_interval(tmp_path):
+    config_path = _write_config(tmp_path)  # 4h config
+    result = CliRunner().invoke(cli, ["--config", config_path, "research-gap-audit"])
+    assert result.exit_code != 0
+    assert "1h" in result.output
+
+
+def test_research_gap_audit_command_with_no_confirmed_gaps(tmp_path):
+    config_path = _write_config_1h(tmp_path)
+    db_path = tmp_path / "agent.db"
+    step = interval_to_ms("1h")
+    with CandleStore(db_path) as store:
+        store.upsert_candles(
+            [
+                Candle(
+                    symbol="BTCUSDT", interval="1h", open_time_ms=START, close_time_ms=START + step - 1,
+                    open=Decimal(100), high=Decimal(101), low=Decimal(99), close=Decimal(100), volume=Decimal(1),
+                )
+            ]
+        )
+    result = CliRunner().invoke(cli, ["--config", config_path, "research-gap-audit"])
+    assert result.exit_code == 0, result.output
+    assert "nothing to audit" in result.output
+
+
+@responses.activate
+def test_research_gap_recover_without_confirm_stores_nothing(tmp_path):
+    config_path = _write_config_1h(tmp_path)
+    db_path = tmp_path / "agent.db"
+    step = interval_to_ms("1h")
+    minute_step = interval_to_ms("1m")
+    gap_hour = START + step
+    gap = GapRecord(expected_open_time_ms=gap_hour, previous_open_time_ms=START, next_open_time_ms=START + 2 * step, missing_intervals=1)
+    _seed_1h_gap(db_path, [START, START + 2 * step], gap)
+
+    minute_rows = {gap_hour + i * minute_step: make_kline_row(gap_hour + i * minute_step, "1m") for i in range(60)}
+    responses.add_callback(responses.GET, f"{PROD_HOST}/api/v3/klines", callback=_gap_recovery_klines_callback(minute_rows))
+
+    result = CliRunner().invoke(cli, ["--config", config_path, "research-gap-recover"])
+    assert result.exit_code == 0, result.output
+    assert "No --confirm flag given - NOTHING was stored" in result.output
+
+    with CandleStore(db_path) as store:
+        assert len(store.get_candles("BTCUSDT", "1h")) == 2
+        assert len(store.get_gaps("BTCUSDT", "1h")) == 1
+
+
+@responses.activate
+def test_research_gap_recover_confirm_stores_the_recovered_candle_atomically(tmp_path):
+    config_path = _write_config_1h(tmp_path)
+    db_path = tmp_path / "agent.db"
+    step = interval_to_ms("1h")
+    minute_step = interval_to_ms("1m")
+    gap_hour = START + step
+    gap = GapRecord(expected_open_time_ms=gap_hour, previous_open_time_ms=START, next_open_time_ms=START + 2 * step, missing_intervals=1)
+    _seed_1h_gap(db_path, [START, START + 2 * step], gap)
+
+    minute_rows = {gap_hour + i * minute_step: make_kline_row(gap_hour + i * minute_step, "1m") for i in range(60)}
+    responses.add_callback(responses.GET, f"{PROD_HOST}/api/v3/klines", callback=_gap_recovery_klines_callback(minute_rows))
+
+    result = CliRunner().invoke(cli, ["--config", config_path, "research-gap-recover", "--confirm"])
+    assert result.exit_code == 0, result.output
+    assert "STORED 1 recovered candle(s)" in result.output
+    assert "0 confirmed 1h gap(s) remain" in result.output
+
+    with CandleStore(db_path) as store:
+        candles = store.get_candles("BTCUSDT", "1h")
+        assert [c.open_time_ms for c in candles] == [START, gap_hour, START + 2 * step]
+        assert store.get_gaps("BTCUSDT", "1h") == []
+
+
+def test_research_gap_recover_command_requires_backtest_mode(tmp_path):
+    config_path = _write_config_1h(tmp_path)
+    result = CliRunner().invoke(cli, ["--config", config_path, "--mode", "testnet", "research-gap-recover", "--confirm"])
+    assert result.exit_code != 0
+    assert "requires --mode backtest" in result.output
+
+
+def test_research_gap_recover_command_requires_1h_interval(tmp_path):
+    config_path = _write_config(tmp_path)  # 4h config
+    result = CliRunner().invoke(cli, ["--config", config_path, "research-gap-recover", "--confirm"])
     assert result.exit_code != 0
     assert "1h" in result.output
 

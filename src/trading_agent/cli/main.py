@@ -21,6 +21,12 @@ from trading_agent.backtest.engine import (
 )
 from trading_agent.config import AppConfig, Mode, load_config
 from trading_agent.config.loader import load_secrets
+from trading_agent.data.gap_recovery import (
+    GapForensicReport,
+    RecoveryOutcome,
+    apply_gap_recovery,
+    run_gap_forensics,
+)
 from trading_agent.data.historical_fetch import (
     DEFAULT_MAX_RETRIES,
     confirm_gaps,
@@ -176,6 +182,187 @@ def fetch_data(ctx: click.Context, limit: int, start_str: str | None, end_str: s
     for gap in fetch_result.confirmed_gaps:
         click.echo(
             f"  confirmed gap: expected_open_time_ms={gap.expected_open_time_ms} "
+            f"previous_open_time_ms={gap.previous_open_time_ms} next_open_time_ms={gap.next_open_time_ms} "
+            f"missing_intervals={gap.missing_intervals}"
+        )
+
+
+def _print_gap_forensic_report(report: GapForensicReport) -> None:
+    click.echo(
+        f"symbol={report.symbol} interval={report.interval} generated_at_ms={report.generated_at_ms}\n"
+        f"total_confirmed_gaps={report.total_gaps} total_missing_hours={report.total_missing_hours}\n"
+        f"  fully_recoverable_hours={report.fully_recoverable_hours}\n"
+        f"  partially_recoverable_hours={report.partially_recoverable_hours}\n"
+        f"  genuine_no_data_exchange_outage_hours={report.genuine_no_data_hours}\n"
+        f"  unresolved_hours={report.unresolved_hours}"
+    )
+    for gap_result in report.gap_results:
+        gap = gap_result.gap
+        click.echo(
+            f"\n--- confirmed gap: expected_open_time_ms={gap.expected_open_time_ms} "
+            f"previous_open_time_ms={gap.previous_open_time_ms} next_open_time_ms={gap.next_open_time_ms} "
+            f"missing_intervals={gap.missing_intervals} ---"
+        )
+        for hour in gap_result.missing_hours:
+            click.echo(
+                f"  hour open_time_ms={hour.open_time_ms}: {hour.outcome.value} "
+                f"(found_1m_candles={hour.found_1m_candle_count}) - {hour.detail}"
+            )
+            if hour.provenance is not None:
+                p = hour.provenance
+                click.echo(
+                    f"    provenance: source={p.source} retrieved_at_ms={p.retrieved_at_ms} "
+                    f"component_count={p.component_count} "
+                    f"first_component_open_time_ms={p.first_component_open_time_ms} "
+                    f"last_component_open_time_ms={p.last_component_open_time_ms} "
+                    f"validation_result={p.validation_result} content_hash={p.content_hash}"
+                )
+
+    click.echo("\n--- resulting gap-free segments if every FULLY_RECOVERABLE hour above were stored ---")
+    for seg in report.resulting_segments_after_recovery:
+        click.echo(
+            f"  segment {seg.segment_index}: start_time_ms={seg.start_time_ms} end_time_ms={seg.end_time_ms} "
+            f"candle_count={seg.candle_count}"
+        )
+    click.echo(
+        f"\nRound-3 (multitimeframe_breakout_E1_round3) complete "
+        f"{report.round3_block_duration_days}-day fixed-duration block count after recovery: "
+        f"{report.round3_complete_blocks_after_recovery} "
+        f"(anchor_warm_up_candles_required={report.round3_min_required_candles}; a pure candle-counting "
+        "estimate only - no candidate evaluation was run to produce this number)"
+    )
+
+
+@cli.command("research-gap-audit")
+@click.option("--max-retries", default=DEFAULT_MAX_RETRIES, show_default=True, help="Max retries per 1-minute-kline / native-1h-cross-check request before giving up on one hour.")
+@click.pass_context
+def research_gap_audit_cmd(ctx: click.Context, max_retries: int) -> None:
+    """READ-ONLY forensic report over every confirmed BTCUSDT 1h gap
+    already recorded in the local candle database (see `data/
+    gap_recovery.py`).
+
+    For every missing hour, queries Binance's official 1-minute historical
+    klines for exactly that hour and classifies it: FULLY_RECOVERABLE (all
+    60 1-minute candles present, continuous, and validated - would be
+    reconstructed by `research-gap-recover --confirm`), PARTIALLY_RECOVERABLE
+    (some but not all 60 exist - never reconstructed), GENUINE_NO_DATA (the
+    exchange has nothing at all for that hour - a real, permanent outage),
+    or UNRESOLVED (a validation failure, or a candle at or after the
+    immutable research cutoff, which is never even fetched).
+
+    This command NEVER writes to any database, NEVER runs a candidate
+    evaluation of any kind, NEVER connects to Testnet, and NEVER places an
+    order - it only ever makes read-only requests to the public,
+    unauthenticated Binance market-data host. Reconstruction, when
+    something is fully recoverable, always aggregates real 1-minute data
+    exactly as Binance's own 1h candles are built (open=first open,
+    high=max high, low=min low, close=last close, volume=sum volume) -
+    never interpolated, never fabricated.
+    """
+    config: AppConfig = ctx.obj["config"]
+    if config.mode != Mode.BACKTEST:
+        click.echo("The research-gap-audit command requires --mode backtest.", err=True)
+        sys.exit(1)
+    if config.market.interval != "1h":
+        click.echo(
+            f"The research-gap-audit command requires market.interval='1h' (got {config.market.interval!r}) - "
+            "gap forensics/recovery is only meaningful for hourly gaps.",
+            err=True,
+        )
+        sys.exit(1)
+
+    with CandleStore(config.paths.db_path) as store:
+        candles = store.get_candles(config.market.symbol, "1h")
+        gaps = store.get_gaps(config.market.symbol, "1h")
+
+    if not gaps:
+        click.echo(f"No confirmed 1h gaps recorded for {config.market.symbol} - nothing to audit.")
+        return
+
+    client = BinancePublicMarketDataClient(PRODUCTION_MARKET_DATA_HOST)
+    report = run_gap_forensics(client, config.market.symbol, "1h", candles, gaps, max_retries=max_retries)
+    _print_gap_forensic_report(report)
+    click.echo(
+        "\nThis was a READ-ONLY audit - nothing was stored. Run `research-gap-recover --confirm` to store "
+        "any FULLY_RECOVERABLE candle reported above."
+    )
+
+
+@cli.command("research-gap-recover")
+@click.option("--confirm", is_flag=True, default=False, help="Explicitly approve storing every FULLY_RECOVERABLE reconstructed candle. Without this flag, nothing is written.")
+@click.option("--max-retries", default=DEFAULT_MAX_RETRIES, show_default=True, help="Max retries per 1-minute-kline / native-1h-cross-check request before giving up on one hour.")
+@click.pass_context
+def research_gap_recover_cmd(ctx: click.Context, confirm: bool, max_retries: int) -> None:
+    """Runs the EXACT SAME read-only forensic analysis as `research-gap-audit`,
+    then - ONLY if `--confirm` is passed - stores every FULLY_RECOVERABLE
+    reconstructed candle (see `data/gap_recovery.py`) atomically alongside
+    a freshly recomputed gap manifest (a gap that is now fully resolved is
+    removed; a gap only partially resolved is replaced by a narrower one
+    covering exactly what remains missing).
+
+    Storage is atomic (one transaction - either every recovered candle and
+    the updated gap manifest are committed together, or nothing is) and
+    idempotent (re-running this command against an already-recovered
+    database re-derives and re-asserts the identical result). Never
+    fabricates, interpolates, changes any strategy/candidate/parameter/
+    scorecard/risk/fee/slippage/sizing/execution logic, runs a candidate
+    evaluation, or connects to Testnet.
+
+    Without `--confirm`, this command performs the exact same analysis and
+    prints the exact same report as `research-gap-audit` but stores
+    nothing at all - `--confirm` is the ONLY thing that makes this command
+    write to the database.
+    """
+    config: AppConfig = ctx.obj["config"]
+    if config.mode != Mode.BACKTEST:
+        click.echo("The research-gap-recover command requires --mode backtest.", err=True)
+        sys.exit(1)
+    if config.market.interval != "1h":
+        click.echo(
+            f"The research-gap-recover command requires market.interval='1h' (got {config.market.interval!r}) - "
+            "gap forensics/recovery is only meaningful for hourly gaps.",
+            err=True,
+        )
+        sys.exit(1)
+
+    with CandleStore(config.paths.db_path) as store:
+        candles = store.get_candles(config.market.symbol, "1h")
+        gaps = store.get_gaps(config.market.symbol, "1h")
+
+        if not gaps:
+            click.echo(f"No confirmed 1h gaps recorded for {config.market.symbol} - nothing to recover.")
+            return
+
+        client = BinancePublicMarketDataClient(PRODUCTION_MARKET_DATA_HOST)
+        report = run_gap_forensics(client, config.market.symbol, "1h", candles, gaps, max_retries=max_retries)
+        _print_gap_forensic_report(report)
+
+        if not confirm:
+            click.echo(
+                "\nNo --confirm flag given - NOTHING was stored (identical read-only analysis to "
+                "`research-gap-audit`). Re-run with --confirm to store the FULLY_RECOVERABLE candle(s) above."
+            )
+            return
+
+        recoverable_count = sum(
+            1
+            for gap_result in report.gap_results
+            for hour in gap_result.missing_hours
+            if hour.outcome == RecoveryOutcome.FULLY_RECOVERABLE
+        )
+        if recoverable_count == 0:
+            click.echo("\n--confirm given, but there is nothing FULLY_RECOVERABLE to store.")
+            return
+
+        result = apply_gap_recovery(store, config.market.symbol, "1h", report)
+
+    click.echo(
+        f"\nSTORED {result.stored_candle_count} recovered candle(s), atomically, alongside a freshly "
+        f"recomputed gap manifest. {len(result.remaining_confirmed_gaps)} confirmed 1h gap(s) remain."
+    )
+    for gap in result.remaining_confirmed_gaps:
+        click.echo(
+            f"  remaining confirmed gap: expected_open_time_ms={gap.expected_open_time_ms} "
             f"previous_open_time_ms={gap.previous_open_time_ms} next_open_time_ms={gap.next_open_time_ms} "
             f"missing_intervals={gap.missing_intervals}"
         )
