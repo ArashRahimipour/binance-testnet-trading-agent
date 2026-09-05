@@ -282,9 +282,11 @@ class _OpenTrade:
     #: The REALIZED risk/reward plan (`backtest/risk_reward.py::
     #: build_realized_plan`) - None unless this position was opened under
     #: `use_fixed_risk_reward_policy=True`. `target_price` is checked
-    #: alongside `_LoopState.stop_price` on every subsequent candle;
-    #: `planned_risk_quote` is compared against a stop exit's actual
-    #: realized loss to detect a gap exceeding the planned risk budget.
+    #: alongside `_LoopState.stop_price` starting on the SAME candle the
+    #: entry filled on (its high/low reflect price action after the open -
+    #: see `run_segment`) and on every candle after it; `planned_risk_quote`
+    #: is compared against a stop exit's actual realized loss to detect a
+    #: gap exceeding the planned risk budget.
     realized_plan: RiskRewardPlan | None = None
 
 
@@ -313,11 +315,6 @@ class _LoopState:
     #: otherwise. Checked alongside `stop_price`; STOP takes precedence
     #: when both would trigger on the same candle (see `run_segment`).
     target_price: Decimal | None = None
-    #: `open_time_ms` of the candle whose fill just opened the current
-    #: position - the stop/target check is skipped for exactly this one
-    #: candle so an entry can never also exit within the same candle (no
-    #: same-candle entry/exit lookahead). None when flat.
-    entry_candle_open_time_ms: int | None = None
 
 
 @dataclass
@@ -754,7 +751,17 @@ def run_segment(
     sized and gated by the fixed 1:2 planned reward/risk policy
     (`backtest/risk_reward.py`) instead of the plain fixed-percentage
     stop-only sizing, and each open position also carries a take-profit
-    target checked alongside its stop on every subsequent candle. Set to
+    target checked alongside its stop. Protection begins IMMEDIATELY,
+    starting with the SAME candle the entry fills on: a pending signal
+    decided from the previous candle's close fills at this candle's open,
+    and this candle's own high/low reflect price movement that occurs
+    AFTER that open, so a stop or target genuinely can be (and is)
+    evaluated against it - never delayed to the following candle. This is
+    not same-close execution: the entry decision still came from the
+    prior completed candle, the fill still happens no earlier than this
+    candle's open, and the strategy's own signal generation still only
+    ever sees completed candles - only the engine's post-fill protective
+    exit check reads this candle's OHLC, and only after the fill. Set to
     True ONLY by `research/blocked_chronological_evaluation.py` (every
     research candidate) - `run_backtest`/`run_independent_holdout_evaluation`
     (the frozen v0.1 baseline) never pass it, so that baseline continues to
@@ -802,18 +809,20 @@ def run_segment(
             )
             pending_signal = None
 
-        # No same-candle entry/exit lookahead under the fixed risk/reward
-        # policy: the stop/target check is skipped for exactly the candle
-        # whose fill just opened this position - checks begin only on the
-        # NEXT candle. The legacy stop-only path (policy disabled) is
-        # unaffected - it never sets `entry_candle_open_time_ms`.
-        just_entered_this_candle = (
-            use_fixed_risk_reward_policy and state.entry_candle_open_time_ms == candle.open_time_ms
-        )
+        # Protection begins IMMEDIATELY after a fill, on the SAME candle
+        # that fill happened on - a pending signal decided from the
+        # PREVIOUS candle's close fills at THIS candle's open, and this
+        # candle's own high/low represent price movement that occurs
+        # AFTER that open, so a stop or target genuinely can (and must be
+        # allowed to) be hit within it. This is not same-close execution:
+        # the entry decision still came from the prior completed candle,
+        # the fill still happens no earlier than this candle's open, and
+        # the strategy's own signal generation below still only ever sees
+        # completed, already-elapsed candles - only the ENGINE's post-fill
+        # protective-exit check is evaluated against this candle's OHLC.
         if (
             state.portfolio.position_side == PositionSide.LONG
             and state.stop_price is not None
-            and not just_entered_this_candle
         ):
             if candle.low <= state.stop_price:
                 # Conservative same-candle ambiguity rule: if both the stop
@@ -1071,7 +1080,6 @@ def _resolve_pending_signal(
         if use_fixed_risk_reward_policy and realized_plan is not None:
             state.stop_price = realized_plan.stop_price
             state.target_price = realized_plan.target_price
-            state.entry_candle_open_time_ms = candle.open_time_ms
             state.open_trade = _OpenTrade(
                 candle.open_time_ms, fill.fill_price, quantity, fill.fee_quote, reference_price,
                 realized_plan=realized_plan,
@@ -1215,7 +1223,6 @@ def _apply_exit_fill(
     state.trades_today += 1
     state.stop_price = None
     state.target_price = None
-    state.entry_candle_open_time_ms = None
     state.open_trade = None
     return state
 

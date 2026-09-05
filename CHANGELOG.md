@@ -2,6 +2,52 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.4] - Fix an execution-bias defect: protection now begins on the entry candle
+
+0.2.3 introduced an incorrect "no same-candle entry/exit lookahead" rule
+that SKIPPED the stop/take-profit check on the exact candle a BUY filled
+on, deferring protection to the following candle. This was optimistic and
+wrong: once a market entry fills at a candle's open, that same candle's
+high/low describe price movement occurring AFTER the open - a protective
+stop can genuinely be hit within the very candle a position was opened
+in, and skipping it silently let a position ride out an adverse move for
+up to one full interval before the stop was ever checked. Corrected here,
+again BEFORE the first real candidate evaluation - **no real candidate
+result was inspected before or during this release.** Adds 5 tests (461
+-> 466 total). No PR was opened, no Testnet connection was made, and no
+order was placed as part of this work.
+
+### Fixed
+
+- **Protection begins immediately on the entry candle**
+  (`backtest/engine.py::run_segment`): the stop/take-profit check under
+  the fixed risk/reward policy now runs on every candle unconditionally,
+  including the one whose fill just opened the position - removing the
+  `_LoopState.entry_candle_open_time_ms` field and the skip logic that
+  used it. This is NOT same-close execution: the entry decision still
+  comes from the PREVIOUS candle's close, the fill still happens no
+  earlier than the entry candle's own open, and the strategy's signal
+  generation still only ever sees completed candles - only the engine's
+  own post-fill protective-exit check now reads the entry candle's own
+  high/low, and only after the fill has already been applied. The
+  existing conservative rules are unchanged and now apply from the first
+  candle: if both the stop and target are touched within the entry
+  candle, STOP is assumed to occur first; a gap through the stop still
+  fills at the worse available price; a gap beyond the target is still
+  never credited as a favourable improvement.
+- Replaced the two tests that asserted a position survives its own entry
+  candle touching both protective levels (`test_no_same_candle_entry_exit_lookahead_and_take_profit_execution`,
+  `test_position_survives_the_entry_candles_own_low_and_high`) with tests
+  proving the corrected behavior, and added new tests: a stop hit later
+  in the entry candle; a target hit later in the entry candle; both
+  touched on the entry candle still resolves to stop; neither touched
+  leaves the position open; the SIGNAL candle's own high/low (before any
+  position or stop/target exists) cannot trigger protection; the
+  stop/target check never uses a future candle; an ordinary non-gap stop
+  loss stays within the planned 1% risk; an ordinary take-profit's net
+  PnL is at least 2x the planned risk (subject only to tick-rounding,
+  which can only ever increase it).
+
 ## [0.2.3] - Correction to the fixed 1:2 risk/reward policy's target design
 
 The 0.2.2 fixed 1:2 risk/reward policy correctly disclosed that fixing the

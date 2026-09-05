@@ -336,8 +336,16 @@ reach or influence any of that.
   assumed to occur first; a gap through the stop fills at the worse
   available price; a gap beyond the take-profit target is never credited
   as a favourable improvement; a position's own stop/target checks begin
-  only on the candle after its entry filled (no same-candle entry/exit
-  lookahead). Candidates' declared signal parameters are unchanged.
+  IMMEDIATELY, on the SAME candle its entry filled on - a pending signal
+  decided from the previous candle's close fills at this candle's open,
+  and this candle's own high/low reflect price action AFTER that open, so
+  a stop or target genuinely can (and does) fire within it. This is not
+  same-close execution: the entry decision still came from the prior
+  completed candle, the fill still happens no earlier than this candle's
+  open, and the strategy itself is never consulted about this candle's
+  close before the entry - only the engine's own post-fill check reads
+  this candle's OHLC, and only after the fill. Candidates' declared
+  signal parameters are unchanged.
 
 ## Crash recovery, the pending-order state machine, and the atomic transaction boundary
 

@@ -1,10 +1,23 @@
 """Proofs for backtest/engine.py::run_segment's fixed 1:2 risk/reward
 policy integration (`use_fixed_risk_reward_policy=True`): stop/target
 resolution, the conservative same-candle stop-first tie-break, gap-through-
-stop loss tracking, take-profit execution, and no same-candle entry/exit
-lookahead. The policy itself (sizing, gating math) is proven directly in
-test_backtest_risk_reward.py; this file proves the ENGINE wires it in
-correctly.
+stop loss tracking, take-profit execution, and - the corrected behavior -
+protection beginning IMMEDIATELY on the SAME candle an entry fills on
+(never delayed to the next candle). The policy itself (sizing, gating
+math) is proven directly in test_backtest_risk_reward.py; this file
+proves the ENGINE wires it in correctly.
+
+Why same-candle protection is correct, not "same-close execution": a
+pending BUY signal is decided from the PREVIOUS candle's CLOSE and fills
+at THIS candle's OPEN (the project's existing next-open-fill rule,
+unchanged). This candle's own high/low describe price action that occurs
+AFTER that open - a real market can genuinely hit a protective stop (or a
+take-profit) within the very candle a position was just opened in, so the
+engine evaluates that candle's OHLC against the freshly-established
+stop/target immediately after the fill. The strategy itself is never
+consulted about this candle's close before the entry - only the engine's
+own post-fill protective-exit check reads this candle's high/low, and
+only after `apply_buy` has already happened.
 """
 
 from decimal import Decimal
@@ -95,66 +108,96 @@ def test_normal_trade_with_realistic_costs_is_approved_and_executes():
     assert result.risk_reward.net_reward_to_risk_values[0] >= 2.0 - 1e-6
 
 
-# --- Take-profit execution + no same-candle entry/exit lookahead. ---
+# --- Protection begins IMMEDIATELY on the entry candle itself. ---
 
 
-def test_no_same_candle_entry_exit_lookahead_and_take_profit_execution():
-    # Entry signal at index 0 -> fills at candle 1's open (100). Stop=95,
-    # target=110 (5% stop, 2x gross target). Candle 1 (the FILL candle
-    # itself) is deliberately given a low/high that WOULD trigger both the
-    # stop and the target if checked - it must be ignored entirely (no
-    # same-candle entry/exit lookahead). Candle 2 then genuinely touches
-    # the target (high=112) without touching the stop (low=99), and must
-    # produce a TAKE_PROFIT exit at exactly the target price.
+def test_stop_is_hit_later_in_the_same_candle_the_entry_filled_on():
+    # Entry signal decided at candle 0's close -> fills at candle 1's open
+    # (100). Stop=95, target=110. Candle 1's low (90) touches the stop
+    # AFTER its own open - this is the SAME candle the position was
+    # opened in, and the stop must still fire within it.
     candles = [
         _candle(0, open_=100, high=100, low=100, close=100),
-        _candle(1, open_=100, high=120, low=90, close=100),  # entry candle - must be skipped for exits
-        _candle(2, open_=100, high=112, low=99, close=105),
+        _candle(1, open_=100, high=101, low=90, close=98),
     ]
     result = _run(candles, buy_at_index=0)
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.exit_reason == EXIT_REASON_STOP_LOSS
+    assert trade.exit_price == Decimal(95)  # no gap (open 100 > stop 95): fills exactly at the stop
+    # Entry and exit both happened within candle 1 - not delayed to a later candle.
+    assert trade.entry_time_ms == candles[1].open_time_ms
+    assert trade.exit_time_ms == candles[1].open_time_ms
 
+
+def test_target_is_hit_later_in_the_same_candle_the_entry_filled_on():
+    candles = [
+        _candle(0, open_=100, high=100, low=100, close=100),
+        _candle(1, open_=100, high=112, low=99, close=105),
+    ]
+    result = _run(candles, buy_at_index=0)
     assert len(result.trades) == 1
     trade = result.trades[0]
     assert trade.exit_reason == EXIT_REASON_TAKE_PROFIT
     assert trade.exit_price == Decimal(110)  # zero fees/slippage: fill == target exactly
-    assert trade.entry_price == Decimal(100)
-    assert result.risk_reward is not None
-    assert result.risk_reward.entries_approved == 1
-    assert result.risk_reward.take_profit_exits == 1
-    assert result.risk_reward.stop_loss_exits == 0
+    assert trade.entry_time_ms == candles[1].open_time_ms
+    assert trade.exit_time_ms == candles[1].open_time_ms
 
 
-def test_position_survives_the_entry_candles_own_low_and_high():
-    # Same fixture as above, isolated: confirm the position is STILL OPEN
-    # after processing candle 1 (the entry candle) alone, proving the
-    # stop/target check truly skipped it rather than coincidentally not
-    # triggering.
+def test_both_touched_on_the_entry_candle_itself_resolves_to_stop():
     candles = [
         _candle(0, open_=100, high=100, low=100, close=100),
-        _candle(1, open_=100, high=120, low=90, close=100),
+        _candle(1, open_=100, high=115, low=90, close=100),  # both stop(95) and target(110) touched
+    ]
+    result = _run(candles, buy_at_index=0)
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.exit_reason == EXIT_REASON_STOP_LOSS
+    assert trade.exit_price == Decimal(95)
+    assert result.risk_reward is not None
+    assert result.risk_reward.stop_loss_exits == 1
+    assert result.risk_reward.take_profit_exits == 0
+
+
+def test_neither_touched_on_the_entry_candle_position_remains_open():
+    candles = [
+        _candle(0, open_=100, high=100, low=100, close=100),
+        _candle(1, open_=100, high=105, low=97, close=102),  # stays strictly between stop(95) and target(110)
     ]
     result = _run(candles, buy_at_index=0)
     assert result.ends_with_open_position is True
     assert len(result.trades) == 0
 
 
-# --- Stop-first same-candle ambiguity. ---
-
-
-def test_stop_occurs_first_when_both_stop_and_target_are_touched_in_one_candle():
+def test_signal_candles_high_low_cannot_trigger_protection_before_the_next_open_entry():
+    # candle 0 is where the BUY signal is DECIDED (from its close) - no
+    # position and no stop/target exist yet at that point, so its own
+    # wildly extreme high/low must have zero effect, however they compare
+    # to what the stop/target will later become.
     candles = [
-        _candle(0, open_=100, high=100, low=100, close=100),
-        _candle(1, open_=100, high=100, low=100, close=100),  # entry candle - inert
-        _candle(2, open_=105, high=115, low=90, close=100),  # both stop(95) and target(110) touched
+        _candle(0, open_=100, high=100_000, low=1, close=100),
+        _candle(1, open_=100, high=105, low=97, close=102),  # normal fill, no touch
     ]
     result = _run(candles, buy_at_index=0)
-    assert len(result.trades) == 1
-    trade = result.trades[0]
-    assert trade.exit_reason == EXIT_REASON_STOP_LOSS
-    assert trade.exit_price == Decimal(95)  # no gap (open 105 > stop 95): fills exactly at the stop
-    assert result.risk_reward is not None
-    assert result.risk_reward.stop_loss_exits == 1
-    assert result.risk_reward.take_profit_exits == 0
+    assert len(result.trades) == 0
+    assert result.ends_with_open_position is True
+
+
+def test_stop_and_target_evaluation_never_uses_a_future_candle():
+    # A take-profit fires within the entry candle (candle 1); a wildly
+    # different FUTURE candle 2 must never be able to change that already-
+    # resolved outcome. Compare the full run against a run truncated right
+    # after the exit - the resolved trade must be identical in both.
+    candles = [
+        _candle(0, open_=100, high=100, low=100, close=100),
+        _candle(1, open_=100, high=112, low=99, close=105),  # take-profit fires here
+        _candle(2, open_=1, high=1_000_000, low=0.01, close=500),  # wild future candle
+    ]
+    full_result = _run(candles, buy_at_index=0)
+    truncated_result = _run(candles[:2], buy_at_index=0)
+    assert len(full_result.trades) == 1
+    assert len(truncated_result.trades) == 1
+    assert full_result.trades[0] == truncated_result.trades[0]
 
 
 # --- Gap through stop exceeding the planned risk budget. ---
@@ -176,3 +219,38 @@ def test_gap_through_stop_can_exceed_the_planned_risk_budget():
     # The realized loss is indeed larger than what was planned.
     planned_risk = result.risk_reward.planned_risk_quote_total
     assert -trade.pnl_quote > planned_risk
+
+
+# --- Realized economics stay within/meet the planned figures. ---
+
+
+def test_ordinary_non_gap_stop_loss_stays_within_the_planned_risk():
+    config = _config(fees={"taker_fee_pct": 0.001, "slippage_pct": 0.0005})
+    candles = [
+        _candle(0, open_=100, high=100, low=100, close=100),
+        _candle(1, open_=100, high=101, low=90, close=98),  # non-gap stop touch (open 100 > stop 95)
+    ]
+    result = _run(candles, buy_at_index=0, config=config)
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.exit_reason == EXIT_REASON_STOP_LOSS
+    assert result.risk_reward is not None
+    planned_risk = result.risk_reward.planned_risk_quote_total
+    assert -trade.pnl_quote <= planned_risk
+
+
+def test_take_profit_net_pnl_is_at_least_twice_the_planned_risk():
+    config = _config(fees={"taker_fee_pct": 0.001, "slippage_pct": 0.0005})
+    candles = [
+        _candle(0, open_=100, high=100, low=100, close=100),
+        _candle(1, open_=100, high=112, low=99, close=105),  # non-gap take-profit touch
+    ]
+    result = _run(candles, buy_at_index=0, config=config)
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.exit_reason == EXIT_REASON_TAKE_PROFIT
+    assert result.risk_reward is not None
+    planned_risk = result.risk_reward.planned_risk_quote_total
+    # Tick rounding only ever rounds the target UP (more reward), so the
+    # realized net gain can exceed, but never fall short of, 2x the risk.
+    assert trade.pnl_quote >= 2 * planned_risk
