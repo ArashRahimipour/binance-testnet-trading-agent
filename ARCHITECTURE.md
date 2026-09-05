@@ -285,6 +285,29 @@ reach or influence any of that.
   position can never by itself make a block - or a candidate - pass;
   marked-to-market return and its excess over buy-and-hold are still
   reported per block for visibility only.
+- `research/post_mortem.py` - a READ-ONLY, deterministic post-mortem report
+  over an already-completed blocked chronological evaluation result (the
+  `research-postmortem` CLI command). Runs no new simulation and touches
+  no database; it is pure aggregation math over `Trade`/`RiskRewardDiagnostics`
+  data a run already produced. Per candidate: trade counts/win rate, PnL
+  statistics (including expected value in quote/%/R-multiples and profit
+  factor), an exit-reason breakdown (adding a gap-through-stop subset of
+  stop-loss), the realized R-multiple distribution, planned-vs-realized
+  R/R, fee/slippage totals, best-trade/best-3/best-5% exclusion analysis
+  (reported specifically for breakout-family candidates), PnL
+  concentration, chronological stability (per-block, per-year, streaks,
+  underwater period, half-split), and the risk/reward policy's own
+  rejection/1%-compliance rollup. Per-trade R-multiples require each
+  closed trade's own planned quote risk, recovered by correlating
+  `BlockResult.trades` with `RiskRewardDiagnostics`'s per-approved-entry
+  value tuples (both chronological, at most one open trailing entry per
+  block - see the module docstring for why this correlation is exact).
+  Every aggregate PnL figure carries `EQUITY_ACCOUNTING_NOTE` - a SUM of
+  independently-restarted $50 blocks, never a continuous equity curve.
+  NEVER ranks or selects a candidate; each ends with exactly one
+  evidence-only diagnosis (`broad positive expectancy` /
+  `concentrated/fragile positive expectancy` / `negative expectancy` /
+  `insufficient evidence`) from one declared, fixed rule.
 - `research/fingerprint.py` - deterministic SHA-256 fingerprints for
   reproducible candidate freezing: a strategy-implementation fingerprint
   (the candidate's own source module plus the shared causal

@@ -2,6 +2,61 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.0] - Read-only candidate post-mortem report
+
+The first REAL pre-cutoff research evaluation (`research-backtest`) has now
+run and reported REJECTED/INSUFFICIENT_EVIDENCE for all nine declared
+candidates. This release adds a read-only, deterministic POST-MORTEM
+report over that already-completed, already-authorized pre-cutoff
+evaluation data - it changes NOTHING about any strategy, parameter,
+threshold, risk/reward rule, fee, slippage, sizing, or execution behavior,
+performs NO new candidate search, and never touches the consumed
+(post-cutoff) period. It never ranks candidates and never selects one.
+Adds 24 tests (466 -> 490 total). No PR was opened, no Testnet connection
+was made, and no order was placed as part of this work.
+
+### Added
+
+- **`research/post_mortem.py`**: per-candidate report covering trade
+  counts/win rate, PnL statistics (average/median/payoff ratio/expected
+  value in quote, % of starting equity, and R-multiples/profit factor),
+  an exit-reason breakdown (take-profit/stop-loss/strategy-exit, plus a
+  gap-through-stop subset of stop-loss), the realized R-multiple
+  distribution (min/median/mean/max, % >= +2R, % losing more than -1R),
+  planned-vs-realized R/R, total fees and modeled slippage, exclusion
+  analysis (results with the best trade / best 3 trades / best 5% of
+  trades removed - reported specifically for breakout-family candidates
+  as required), PnL concentration (top 1/3/5 trade share of gross winning
+  PnL; trade count needed to reach 50%/100% of net profit), chronological
+  stability (per-block, per-calendar-year, longest losing streak, longest
+  underwater period on a clearly-labeled cumulative-PnL curve, first-half
+  vs second-half), and the fixed risk/reward policy's own rejection/1%-
+  compliance diagnostics. Every aggregate PnL figure is accompanied by
+  `EQUITY_ACCOUNTING_NOTE`, making explicit that it is the SUM of
+  independently-restarted $50 blocks, never a continuous compounding
+  equity curve. Each candidate ends with exactly one evidence-only
+  diagnosis (`broad positive expectancy` / `concentrated/fragile positive
+  expectancy` / `negative expectancy` / `insufficient evidence`), assigned
+  by one declared, fixed rule applied identically to every candidate -
+  never a subjective read of the numbers, and never "profitable",
+  "approved", or "rejected" (that vocabulary stays with `scorecard.py`'s
+  own, separate pass/fail test).
+- **`cli/main.py::research-postmortem`**: new command that re-runs the
+  same deterministic blocked chronological evaluation `research-backtest`
+  already performs (same fixed candidates, same pre-cutoff-only data - no
+  candle at or after the immutable research cutoff is ever used) and
+  prints the post-mortem report for every candidate.
+- Read-only reporting instrumentation, purely additive and behavior-
+  preserving (no decision, gate, or computed value changes - only
+  already-computed values are now also retained for reporting):
+  `RiskRewardDiagnostics.planned_risk_quote_values` /
+  `planned_reward_quote_values` (exact per-approved-entry Decimal figures,
+  `backtest/risk_reward.py` + `backtest/engine.py`), and
+  `BlockResult.trades` (`research/blocked_chronological_evaluation.py`) -
+  the block's own closed-trade list, the exact same list `performance`/
+  `extended` were already computed from, now also retained instead of
+  discarded.
+
 ## [0.2.4] - Fix an execution-bias defect: protection now begins on the entry candle
 
 0.2.3 introduced an incorrect "no same-candle entry/exit lookahead" rule

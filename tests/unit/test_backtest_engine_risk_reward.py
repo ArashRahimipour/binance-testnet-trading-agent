@@ -22,6 +22,8 @@ only after `apply_buy` has already happened.
 
 from decimal import Decimal
 
+import pytest
+
 from tests.fixtures.exchange_info import make_exchange_info
 from trading_agent.backtest.engine import run_segment
 from trading_agent.config.models import AppConfig
@@ -237,6 +239,30 @@ def test_ordinary_non_gap_stop_loss_stays_within_the_planned_risk():
     assert result.risk_reward is not None
     planned_risk = result.risk_reward.planned_risk_quote_total
     assert -trade.pnl_quote <= planned_risk
+
+
+def test_planned_risk_and_reward_quote_values_are_recorded_per_approved_entry():
+    # Read-only instrumentation added for research/post_mortem.py: the same
+    # per-entry values already reflected in planned_risk_pct_values/
+    # planned_reward_pct_values must also be available in QUOTE currency
+    # (exact Decimal), one value per approved entry, same order.
+    config = _config(fees={"taker_fee_pct": 0.001, "slippage_pct": 0.0005})
+    candles = [
+        _candle(0, open_=100, high=100, low=100, close=100),
+        _candle(1, open_=100, high=100, low=100, close=100),  # entry candle - inert
+        _candle(2, open_=100, high=200, low=99, close=105),  # clears the target
+    ]
+    result = _run(candles, buy_at_index=0, config=config)
+    assert result.risk_reward is not None
+    rr = result.risk_reward
+    assert len(rr.planned_risk_quote_values) == 1
+    assert len(rr.planned_reward_quote_values) == 1
+    assert rr.planned_risk_quote_values[0] == rr.planned_risk_quote_total
+    assert rr.planned_reward_quote_values[0] == rr.planned_reward_quote_total
+    # Consistent with the pct figures already reported for the same entry.
+    starting_equity = STARTING_EQUITY
+    assert float(rr.planned_risk_quote_values[0] / starting_equity) == pytest.approx(rr.planned_risk_pct_values[0])
+    assert float(rr.planned_reward_quote_values[0] / starting_equity) == pytest.approx(rr.planned_reward_pct_values[0])
 
 
 def test_take_profit_net_pnl_is_at_least_twice_the_planned_risk():

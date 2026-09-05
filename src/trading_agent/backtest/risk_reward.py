@@ -429,3 +429,12 @@ class RiskRewardDiagnostics:
     planned_reward_pct_values: tuple[float, ...] = ()
     gross_reward_to_risk_values: tuple[float, ...] = ()
     net_reward_to_risk_values: tuple[float, ...] = ()
+    #: Per-approved-entry PLANNED risk/reward in QUOTE currency (exact
+    #: Decimal, one value per approved entry, same chronological order as
+    #: `planned_risk_pct_values`/the entry-approval sequence itself) - pure
+    #: read-only instrumentation added for post-mortem reporting (`research/
+    #: post_mortem.py`'s per-trade R-multiples). Records values `build_
+    #: realized_plan` already computes; adds no new computation, decision,
+    #: or gate of any kind.
+    planned_risk_quote_values: tuple[Decimal, ...] = ()
+    planned_reward_quote_values: tuple[Decimal, ...] = ()

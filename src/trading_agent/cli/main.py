@@ -47,6 +47,7 @@ from trading_agent.research.candidate_registry import CANDIDATE_REGISTRY, TOTAL_
 from trading_agent.research.cutoff import RESEARCH_CUTOFF_ISO, split_at_cutoff
 from trading_agent.research.freeze import freeze_candidate, save_frozen_candidate
 from trading_agent.research.frozen_baseline import reproduce_frozen_baseline_report
+from trading_agent.research.post_mortem import CandidatePostMortem, build_post_mortem_report
 from trading_agent.research.scorecard import ScorecardStatus, build_scorecard
 from trading_agent.risk.kill_switch import KillSwitch
 from trading_agent.sizing.exchange_filters import SymbolFilters
@@ -601,6 +602,170 @@ def _print_block_result(block_result: BlockResult) -> None:
                 f"gross_reward_to_risk_per_entry={list(rr.gross_reward_to_risk_values)} "
                 f"net_reward_to_risk_per_entry={list(rr.net_reward_to_risk_values)}"
             )
+
+
+@cli.command("research-postmortem")
+@click.pass_context
+def research_postmortem_cmd(ctx: click.Context) -> None:
+    """Read-only candidate POST-MORTEM report over an already-completed
+    pre-cutoff blocked chronological evaluation (see `research/post_mortem.py`).
+
+    Re-runs `run_candidate_blocked_chronological_evaluation` for every
+    declared candidate (the SAME deterministic computation `research-backtest`
+    already performs, on the SAME pre-cutoff-only data - no candle at or
+    after the immutable research cutoff is ever used, see
+    `research/cutoff.py`) and reports detailed per-trade statistics: win
+    rate, PnL distribution, exit-reason breakdown, realized R-multiples,
+    planned-vs-realized R/R, fee/slippage totals, exclusion-of-best-trades
+    analysis, PnL concentration, chronological stability, and the fixed
+    risk/reward policy's own rejection/compliance diagnostics.
+
+    This command changes NOTHING about any strategy, parameter, threshold,
+    risk/reward rule, fee, slippage, sizing, or execution behavior - it is
+    pure, deterministic, read-only aggregation over results that already
+    exist. It NEVER ranks candidates and NEVER selects one - see
+    `research/post_mortem.py::MULTIPLE_TESTING_NOTE`. Every candidate ends
+    with exactly one evidence-only diagnosis label (never "profitable",
+    "approved", or "rejected" - those remain `research-backtest`'s own,
+    separate scorecard vocabulary).
+    """
+    config: AppConfig = ctx.obj["config"]
+    if config.mode != Mode.BACKTEST:
+        click.echo("The research-postmortem command requires --mode backtest.", err=True)
+        sys.exit(1)
+
+    with CandleStore(config.paths.db_path) as store:
+        candles = store.get_candles(config.market.symbol, config.market.interval)
+    if not candles:
+        click.echo("No candles found. Run `fetch-data` first.", err=True)
+        sys.exit(1)
+
+    client = BinancePublicMarketDataClient(PRODUCTION_MARKET_DATA_HOST)
+    try:
+        filters = SymbolFilters.from_exchange_info(client.get_exchange_info(config.market.symbol))
+    except Exception as exc:  # noqa: BLE001 - surfaced to the user, then exit
+        click.echo(f"Failed to fetch exchange filters: {exc}", err=True)
+        sys.exit(1)
+
+    pre_cutoff, consumed = split_at_cutoff(candles)
+    click.echo(
+        f"research cutoff: {RESEARCH_CUTOFF_ISO}  pre_cutoff_candles={len(pre_cutoff)}  "
+        f"consumed_candles={len(consumed)} (NEVER used below - post-mortem is pre-cutoff development "
+        "data only)"
+    )
+    if not pre_cutoff:
+        click.echo("No pre-cutoff candles available - cannot build a post-mortem for any candidate.", err=True)
+        sys.exit(1)
+
+    results = [
+        run_candidate_blocked_chronological_evaluation(spec, pre_cutoff, config, filters)
+        for spec in CANDIDATE_REGISTRY
+    ]
+    report = build_post_mortem_report(results)
+
+    click.echo(f"\n{report.multiple_testing_note}\n")
+    click.echo(f"{report.equity_accounting_note}\n")
+    for candidate in report.candidates:
+        _print_candidate_post_mortem(candidate)
+
+    click.echo(
+        "\nNote: this is a read-only diagnostic report on already-computed, already-authorized "
+        "pre-cutoff research results - not a claim of profitability and not approval for live or "
+        "Testnet trading. It selects nothing; the accompanying `research-backtest` scorecard remains "
+        "the only pass/fail assessment this project makes."
+    )
+
+
+def _print_candidate_post_mortem(c: CandidatePostMortem) -> None:
+    click.echo(f"\n--- {c.candidate_id} ({c.family}) params={c.params} ---")
+    tc = c.trade_counts
+    click.echo(
+        f"  entries_approved={tc.total_entries_approved} closed_trades={tc.closed_trades} "
+        f"wins={tc.wins} losses={tc.losses} breakeven={tc.breakeven} win_rate_pct={tc.win_rate_pct}"
+    )
+    p = c.pnl_stats
+    click.echo(
+        f"  avg_net_pnl_quote={p.average_net_pnl_quote} median_net_pnl_quote={p.median_net_pnl_quote} "
+        f"avg_winner_quote={p.average_winner_quote} avg_loser_quote={p.average_loser_quote} "
+        f"realized_payoff_ratio={p.realized_payoff_ratio} profit_factor={p.profit_factor}"
+    )
+    click.echo(
+        f"  expected_value: quote={p.expected_value_quote} "
+        f"pct_of_starting_equity={p.expected_value_pct_of_starting_equity} "
+        f"r_multiple={p.expected_value_r_multiple}"
+    )
+    for e in c.exit_reason_breakdown:
+        click.echo(
+            f"  exit_reason={e.exit_reason}: trade_count={e.trade_count} win_rate_pct={e.win_rate_pct} "
+            f"expectancy_quote={e.expectancy_quote}"
+        )
+    r = c.realized_r_distribution
+    click.echo(
+        f"  realized_R: n={r.trades_with_known_r} excluded_unknown={r.trades_excluded_unknown_r} "
+        f"min={r.min_r} median={r.median_r} mean={r.mean_r} max={r.max_r} "
+        f"pct_>=+2R={r.pct_at_least_plus_2r} pct_<-1R={r.pct_losing_more_than_minus_1r}"
+    )
+    pr = c.planned_vs_realized
+    click.echo(
+        f"  planned_vs_realized: avg_planned_net_rr={pr.average_planned_net_reward_to_risk} "
+        f"avg_realized_r_on_winners={pr.average_realized_r_multiple_on_winners} "
+        f"total_planned_risk_quote={pr.total_planned_risk_quote} "
+        f"total_planned_reward_quote={pr.total_planned_reward_quote} "
+        f"total_realized_pnl_quote={pr.total_realized_pnl_quote}"
+    )
+    click.echo(f"  costs: total_fees_quote={c.costs.total_fees_quote} total_slippage_quote={c.costs.total_slippage_quote}")
+    for ex in c.exclusions:
+        click.echo(
+            f"  {ex.label}: trades_excluded={ex.trades_excluded} net_pnl_quote={ex.net_pnl_quote} "
+            f"remains_positive={ex.remains_positive}"
+        )
+    conc = c.concentration
+    click.echo(
+        f"  concentration: top1_pct={conc.top1_pct_of_positive_pnl} top3_pct={conc.top3_pct_of_positive_pnl} "
+        f"top5_pct={conc.top5_pct_of_positive_pnl} "
+        f"trades_to_50pct_net_profit={conc.trades_to_reach_50_pct_of_net_profit} "
+        f"trades_to_100pct_net_profit={conc.trades_to_reach_100_pct_of_net_profit}"
+    )
+    cs = c.chronological_stability
+    click.echo(
+        f"  chronological_stability: longest_losing_streak_trades={cs.longest_losing_streak_trades} "
+        f"longest_underwater_period_days={cs.longest_underwater_period_days}"
+    )
+    click.echo(
+        f"    first_half: trades={cs.first_half.trade_count} net_pnl_quote={cs.first_half.net_pnl_quote} "
+        f"win_rate_pct={cs.first_half.win_rate_pct}"
+    )
+    click.echo(
+        f"    second_half: trades={cs.second_half.trade_count} net_pnl_quote={cs.second_half.net_pnl_quote} "
+        f"win_rate_pct={cs.second_half.win_rate_pct}"
+    )
+    for y in cs.per_calendar_year:
+        click.echo(f"    year={y.year}: trades={y.trade_count} net_pnl_quote={y.net_pnl_quote} win_rate_pct={y.win_rate_pct}")
+    for b in cs.per_block:
+        click.echo(
+            f"    segment={b.segment_index} block={b.block_index}: trades={b.trade_count} "
+            f"net_pnl_quote={b.net_pnl_quote} positive={b.positive}"
+        )
+    rr = c.risk_reward_diagnostics
+    click.echo(
+        f"  risk_reward_policy: rejected_net_rr_below_2={rr.entries_rejected_net_rr_below_minimum} "
+        f"rejected_exchange_filter={rr.entries_rejected_exchange_filter} "
+        f"rejected_post_fill_revalidation={rr.entries_rejected_post_fill_revalidation} "
+        f"stop_loss_trades_total={rr.stop_loss_trades_total} "
+        f"within_planned_risk={rr.stop_loss_trades_within_planned_risk} "
+        f"gap_exceeding_planned_risk={rr.stop_loss_trades_gap_exceeding_planned_risk} "
+        f"planned_1pct_risk_compliance_pct={rr.planned_1pct_risk_compliance_pct}"
+    )
+    if c.breakout_exclusion_check.applicable:
+        bc = c.breakout_exclusion_check
+        click.echo(
+            f"  breakout_exclusion_check: remains_positive_excl_best_trade={bc.remains_positive_excluding_best_trade} "
+            f"remains_positive_excl_best_3={bc.remains_positive_excluding_best_3_trades} "
+            f"remains_positive_excl_best_5pct={bc.remains_positive_excluding_best_5_pct}"
+        )
+    for warning in c.warnings:
+        click.echo(f"  WARNING: {warning}", err=True)
+    click.echo(f"  DIAGNOSIS: {c.diagnosis.value} - {c.diagnosis_reason}")
 
 
 @cli.command("run")

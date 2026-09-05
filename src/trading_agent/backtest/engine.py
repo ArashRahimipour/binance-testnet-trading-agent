@@ -343,6 +343,11 @@ class _DiagBuilder:
     rr_planned_reward_pct_values: list[float] = field(default_factory=list)
     rr_gross_reward_to_risk_values: list[float] = field(default_factory=list)
     rr_net_reward_to_risk_values: list[float] = field(default_factory=list)
+    #: Same per-entry values as `rr_planned_risk_pct_values`/`rr_planned_
+    #: reward_pct_values`, but in QUOTE currency (exact Decimal) - see
+    #: `RiskRewardDiagnostics.planned_risk_quote_values` for why this exists.
+    rr_planned_risk_quote_values: list[Decimal] = field(default_factory=list)
+    rr_planned_reward_quote_values: list[Decimal] = field(default_factory=list)
 
     def record_rejected_entry(self, reason_code: str) -> None:
         self.rejected_entries_by_reason[reason_code] = self.rejected_entries_by_reason.get(reason_code, 0) + 1
@@ -933,6 +938,8 @@ def run_segment(
             planned_reward_pct_values=tuple(diag.rr_planned_reward_pct_values),
             gross_reward_to_risk_values=tuple(diag.rr_gross_reward_to_risk_values),
             net_reward_to_risk_values=tuple(diag.rr_net_reward_to_risk_values),
+            planned_risk_quote_values=tuple(diag.rr_planned_risk_quote_values),
+            planned_reward_quote_values=tuple(diag.rr_planned_reward_quote_values),
         )
 
     return SegmentRunResult(
@@ -1093,6 +1100,10 @@ def _resolve_pending_signal(
                 diag.rr_planned_risk_pct_values.append(realized_plan.planned_risk_pct)
             if realized_plan.planned_reward_pct is not None:
                 diag.rr_planned_reward_pct_values.append(realized_plan.planned_reward_pct)
+            if realized_plan.planned_risk_quote is not None:
+                diag.rr_planned_risk_quote_values.append(realized_plan.planned_risk_quote)
+            if realized_plan.planned_reward_quote is not None:
+                diag.rr_planned_reward_quote_values.append(realized_plan.planned_reward_quote)
             if realized_plan.gross_reward_to_risk is not None:
                 diag.rr_gross_reward_to_risk_values.append(realized_plan.gross_reward_to_risk)
             if realized_plan.net_reward_to_risk is not None:

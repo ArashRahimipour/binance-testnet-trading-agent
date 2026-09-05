@@ -78,6 +78,7 @@ from trading_agent.metrics.extended_report import (
 )
 from trading_agent.metrics.performance import (
     PerformanceReport,
+    Trade,
     compute_buy_and_hold_report,
     compute_performance_report,
 )
@@ -121,6 +122,13 @@ class BlockResult:
     #: populated for every non-skipped block. None only when `block.
     #: skipped_reason` is set (nothing ran at all).
     risk_reward: RiskRewardDiagnostics | None = None
+    #: This block's own CLOSED trades, in chronological order - the exact
+    #: list `backtest/engine.py::run_segment` already produced and
+    #: `performance`/`extended` above were already computed from. Read-only
+    #: instrumentation retained purely so a per-trade report (`research/
+    #: post_mortem.py`) can be built without re-running anything; adds no
+    #: new simulation, decision, or number that did not already exist.
+    trades: tuple[Trade, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,6 +297,7 @@ def run_candidate_blocked_chronological_evaluation(
                     ends_with_open_position=result.ends_with_open_position,
                     unresolved_pending_signal=result.pending_signal_note,
                     risk_reward=result.risk_reward,
+                    trades=tuple(result.trades),
                 )
             )
 

@@ -112,6 +112,20 @@ def test_blocked_chronological_evaluation_reports_a_skipped_block_when_segment_t
     assert any("skipped" in w for w in result.warnings)
 
 
+def test_blocked_chronological_evaluation_reports_each_blocks_own_closed_trades():
+    # Read-only instrumentation added for research/post_mortem.py:
+    # BlockResult.trades must carry the SAME closed-trade list
+    # `performance`/`extended` were already computed from - not a
+    # recomputation, just retaining what run_segment already produced.
+    candles = _zigzag_candles()
+    result = run_candidate_blocked_chronological_evaluation(_BREAKOUT_B1, candles, _config(), _filters(), block_count=5)
+    evaluated = [b for b in result.blocks if b.block.skipped_reason is None]
+    assert any(len(b.trades) > 0 for b in evaluated)
+    for block in evaluated:
+        assert block.performance is not None
+        assert len(block.trades) == block.performance.trade_count
+
+
 def test_blocked_chronological_evaluation_never_reports_only_the_best_block():
     # With a strict per-block drawdown shutdown, at least one block trades
     # and at least one is starved by the latch - BOTH must appear, not

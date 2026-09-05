@@ -377,6 +377,48 @@ This phase does not implement Testnet BUY, production execution,
 scheduling, leverage, futures, short selling, forex, machine learning,
 news trading, or copy trading - it is a backtest-only research tool.
 
+### Candidate post-mortem report (read-only)
+
+```bash
+trading-agent research-postmortem
+```
+
+After `research-backtest` has run and reported REJECTED/INSUFFICIENT_EVIDENCE
+(or RESEARCH_SURVIVOR) for the declared candidates, this command builds a
+detailed, READ-ONLY post-mortem for every one of them (`research/
+post_mortem.py`) - pure aggregation math over the SAME deterministic
+pre-cutoff evaluation, with no new simulation, no database write, and no
+candidate search. It changes nothing about any strategy, parameter,
+threshold, risk/reward rule, fee, slippage, sizing, or execution behavior.
+
+For each candidate it reports: trade counts and win rate; average/median
+net PnL, average winner/loser, realized payoff ratio; expected value per
+trade (in quote currency, as a % of starting equity, and in R-multiples);
+profit factor; an exit-reason breakdown (take-profit, stop-loss, strategy
+exit, and a gap-through-stop subset of stop-loss) with win rate/expectancy
+per reason; the realized R-multiple distribution (min/median/mean/max, %
+achieving at least +2R, % losing more than -1R due to gaps/costs); planned
+vs. realized R/R; total fees and total modeled slippage; results excluding
+the best trade / best 3 trades / best 5% of trades (reported specifically
+for breakout-family candidates, as required); PnL concentration (top 1/3/5
+trade share of gross winning PnL, and how many trades are needed to reach
+50%/100% of net profit); chronological stability (per-block, per-calendar-
+year, longest losing streak, longest underwater period on a clearly-
+labeled cumulative-PnL curve - never an equity curve, first-half vs.
+second-half); and the fixed risk/reward policy's own rejection and 1%-risk-
+compliance diagnostics.
+
+Every aggregate PnL figure is explicitly labeled as the **sum of PnL across
+independently restarted $50 blocks** - never presented as, or confused
+with, a continuous compounding equity curve (no such continuous account
+ever existed in this evaluation). This report generates **no rankings and
+selects no candidate** - each candidate ends with exactly one evidence-only
+diagnosis, from a fixed, disclosed rule applied identically to all of them:
+`broad positive expectancy`, `concentrated/fragile positive expectancy`,
+`negative expectancy`, or `insufficient evidence`. These are never
+"profitable", "approved", or "rejected" - that vocabulary remains
+`research-backtest`'s own, separate scorecard.
+
 ## Running on the Spot Testnet
 
 ```bash
