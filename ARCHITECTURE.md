@@ -308,6 +308,45 @@ reach or influence any of that.
   evidence-only diagnosis (`broad positive expectancy` /
   `concentrated/fragile positive expectancy` / `negative expectancy` /
   `insufficient evidence`) from one declared, fixed rule.
+- `research/fixed_duration_evaluation.py` - a SIBLING block-construction
+  method to `blocked_chronological_evaluation.py` (never modified, never
+  monkey-patched), added after a post-round-1 finding: the original
+  method's `block_count=5` splits every gap-free segment by CANDLE COUNT,
+  so a tiny fragment segment gets the same five voting blocks as a
+  multi-year dominant one. This module instead gives each segment as many
+  COMPLETE, non-overlapping 365-day blocks as its own post-warm-up
+  duration allows - zero for a segment too short (`InsufficientDurationFragment`,
+  never five negative zero-trade votes), with any sub-365-day tail
+  reported separately (`LeftoverPartialWindow`) and excluded from every
+  pass/fail calculation. Reuses the SAME `run_segment` primitive, fixed
+  1:2 risk/reward policy, and warm-up-never-trades mechanism; `CandidateFixedDurationResult.
+  as_blocked_chronological_result()` lets the UNMODIFIED `scorecard.score_candidate`
+  be reused verbatim.
+- `research/sensitivity_comparison.py` - for a candidate, reproduces
+  `round_1_original_evaluation` (calling the original, unmodified
+  evaluation + scorecard functions directly - a label, never a
+  recomputation that could differ) alongside a `duration_normalized_sensitivity`
+  scorecard from the new fixed-duration blocks. The sensitivity side is
+  explicitly non-binding: it never changes an original verdict and never
+  retroactively creates a survivor.
+- `research/candidates/breakout_regime_gate.py` (`BreakoutWithBullishRegimeGateStrategy`,
+  round-2 candidate family D) - an explicitly RESULT-INFORMED hypothesis:
+  round 1 showed `breakout_B1` sustained losses in the 2021-2022 regime.
+  Delegates B1's own breakout/channel-breakdown signal verbatim (identical
+  parameters) and adds exactly one causal gate in front of a would-be BUY:
+  close above a 200-period EMA AND that EMA above its own value 20
+  completed candles earlier. Read-only instance counters
+  (`breakout_signals_evaluated`/`breakout_signals_blocked_by_regime_gate`)
+  record gate activity for reporting only, never consulted by the signal
+  decision. `research/candidate_registry_round2.py` declares exactly this
+  one candidate, `ROUND_NUMBER=2`, `CUMULATIVE_CANDIDATE_CONFIGURATIONS_EXAMINED=10`,
+  and a permanent multiple-testing warning disclosing this is not an
+  untouched, pre-registered test. `research/round2_report.py` evaluates it
+  ONLY on pre-cutoff data via the fixed-duration blocks, scored against
+  the SAME unmodified scorecard thresholds, reused with `research/post_mortem.py`
+  for its detailed report, and separately re-runs the original
+  `breakout_B1` through the SAME fixed-duration blocks (identical block
+  dates) for a fair comparison that never alters B1's own round-1 status.
 - `research/fingerprint.py` - deterministic SHA-256 fingerprints for
   reproducible candidate freezing: a strategy-implementation fingerprint
   (the candidate's own source module plus the shared causal

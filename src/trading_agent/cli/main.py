@@ -45,10 +45,16 @@ from trading_agent.research.blocked_chronological_evaluation import (
 )
 from trading_agent.research.candidate_registry import CANDIDATE_REGISTRY, TOTAL_CANDIDATE_COUNT
 from trading_agent.research.cutoff import RESEARCH_CUTOFF_ISO, split_at_cutoff
+from trading_agent.research.fixed_duration_evaluation import DEFAULT_BLOCK_DURATION_DAYS
 from trading_agent.research.freeze import freeze_candidate, save_frozen_candidate
 from trading_agent.research.frozen_baseline import reproduce_frozen_baseline_report
 from trading_agent.research.post_mortem import CandidatePostMortem, build_post_mortem_report
-from trading_agent.research.scorecard import ScorecardStatus, build_scorecard
+from trading_agent.research.round2_report import Round2Comparison, build_round2_report
+from trading_agent.research.scorecard import ScorecardEntry, ScorecardStatus, build_scorecard
+from trading_agent.research.sensitivity_comparison import (
+    CandidateSensitivityComparison,
+    build_candidate_sensitivity_comparison,
+)
 from trading_agent.risk.kill_switch import KillSwitch
 from trading_agent.sizing.exchange_filters import SymbolFilters
 
@@ -766,6 +772,189 @@ def _print_candidate_post_mortem(c: CandidatePostMortem) -> None:
     for warning in c.warnings:
         click.echo(f"  WARNING: {warning}", err=True)
     click.echo(f"  DIAGNOSIS: {c.diagnosis.value} - {c.diagnosis_reason}")
+
+
+def _print_scorecard_entry_summary(entry: ScorecardEntry, indent: str = "") -> None:
+    click.echo(f"{indent}status={entry.status.value}")
+    click.echo(
+        f"{indent}total_trades={entry.total_trade_count} blocks_with_a_trade={entry.blocks_with_a_trade}/"
+        f"{entry.block_count} median_block_realized_return_pct={entry.median_block_realized_return_pct} "
+        f"aggregate_realized_pnl_quote={entry.aggregate_realized_pnl_quote} "
+        f"worst_block_realized_return_pct={entry.worst_block_realized_return_pct} "
+        f"worst_block_max_drawdown_pct={entry.worst_block_max_drawdown_pct} "
+        f"positive_realized_pnl_block_fraction={entry.positive_realized_pnl_block_fraction} "
+        f"max_best_trade_contribution_pct={entry.max_best_trade_contribution_pct}"
+    )
+    for criterion in entry.criteria:
+        click.echo(f"{indent}  [{'PASS' if criterion.passed else 'FAIL'}] {criterion.name}: {criterion.detail}")
+    click.echo(f"{indent}{entry.caveat}")
+
+
+@cli.command("research-sensitivity")
+@click.pass_context
+def research_sensitivity_cmd(ctx: click.Context) -> None:
+    """DURATION-NORMALIZED sensitivity report over the same pre-cutoff data
+    (see `research/fixed_duration_evaluation.py` and `research/
+    sensitivity_comparison.py`).
+
+    The original `research-backtest` method splits every gap-free segment
+    into a FIXED NUMBER of blocks by candle count - a tiny fragment segment
+    therefore gets the same voting weight as a multi-year dominant segment.
+    This command re-scores all nine ORIGINAL, UNMODIFIED round-1 candidates
+    using fixed 365-day-duration blocks instead, and prints the original
+    and duration-normalized scorecards SIDE BY SIDE for comparison. It
+    NEVER changes any original result, scorecard, diagnosis, or frozen
+    artifact (`research/blocked_chronological_evaluation.py` and
+    `research/scorecard.py` are called completely unmodified), and it
+    NEVER retroactively creates a RESEARCH_SURVIVOR from the sensitivity
+    side of the comparison.
+    """
+    config: AppConfig = ctx.obj["config"]
+    if config.mode != Mode.BACKTEST:
+        click.echo("The research-sensitivity command requires --mode backtest.", err=True)
+        sys.exit(1)
+
+    with CandleStore(config.paths.db_path) as store:
+        candles = store.get_candles(config.market.symbol, config.market.interval)
+    if not candles:
+        click.echo("No candles found. Run `fetch-data` first.", err=True)
+        sys.exit(1)
+
+    client = BinancePublicMarketDataClient(PRODUCTION_MARKET_DATA_HOST)
+    try:
+        filters = SymbolFilters.from_exchange_info(client.get_exchange_info(config.market.symbol))
+    except Exception as exc:  # noqa: BLE001 - surfaced to the user, then exit
+        click.echo(f"Failed to fetch exchange filters: {exc}", err=True)
+        sys.exit(1)
+
+    pre_cutoff, consumed = split_at_cutoff(candles)
+    click.echo(
+        f"research cutoff: {RESEARCH_CUTOFF_ISO}  pre_cutoff_candles={len(pre_cutoff)}  "
+        f"consumed_candles={len(consumed)} (NEVER used below)"
+    )
+    if not pre_cutoff:
+        click.echo("No pre-cutoff candles available.", err=True)
+        sys.exit(1)
+
+    for spec in CANDIDATE_REGISTRY:
+        comparison: CandidateSensitivityComparison = build_candidate_sensitivity_comparison(
+            spec, pre_cutoff, config, filters
+        )
+        click.echo(f"\n--- {comparison.candidate_id} ({comparison.family}) params={comparison.params} ---")
+        click.echo(f"  {comparison.methodology_note}")
+        click.echo(f"  [{comparison.round_1_label}] (UNCHANGED, reproduced exactly - never altered)")
+        _print_scorecard_entry_summary(comparison.round_1_original_evaluation, indent="    ")
+        click.echo(
+            f"  [duration_normalized_sensitivity] (fixed {DEFAULT_BLOCK_DURATION_DAYS}-day blocks - "
+            "NON-BINDING, see note below)"
+        )
+        _print_scorecard_entry_summary(comparison.duration_normalized_sensitivity, indent="    ")
+        click.echo(f"  {comparison.non_binding_note}")
+        for fragment in comparison.fragments:
+            click.echo(
+                f"  INSUFFICIENT-DURATION FRAGMENT: segment={fragment.segment_index} "
+                f"candles={fragment.candle_count} available_tradable_duration_days="
+                f"{fragment.available_tradable_duration_days:.1f} - {fragment.reason}"
+            )
+        for leftover in comparison.leftovers:
+            click.echo(
+                f"  LEFTOVER PARTIAL WINDOW: segment={leftover.segment_index} candles={leftover.candle_count} "
+                f"duration_days={leftover.duration_days:.1f} (excluded from all pass/fail calculations)"
+            )
+
+    click.echo(
+        "\nNote: round_1_original_evaluation above is never changed by this command - it remains the "
+        "sole official status for every round-1 candidate. duration_normalized_sensitivity is a "
+        "diagnostic lens only."
+    )
+
+
+@cli.command("research-round2")
+@click.pass_context
+def research_round2_cmd(ctx: click.Context) -> None:
+    """ROUND-2 report: `breakout_regime_D1_round2`'s complete pre-cutoff
+    result (see `research/round2_report.py`, `research/candidate_registry_round2.py`,
+    and `research/candidates/breakout_regime_gate.py`).
+
+    D1 is an explicitly RESULT-INFORMED round-2 hypothesis (round 1 showed
+    breakout_B1 had broad trade-level profitability but sustained losses
+    in 2021-2022) - NEVER presented as an untouched, pre-registered test.
+    Evaluated ONLY on pre-cutoff data using the duration-normalized
+    sensitivity blocks; the consumed post-cutoff period is never touched.
+    Scored against the SAME conservative, pre-declared scorecard
+    thresholds as round 1 - nothing loosened or tightened. Reports every
+    full-duration block (including any that failed), never only the best.
+    Even a RESEARCH_SURVIVOR verdict here is NOT a claim of profitability
+    and NOT approval for live or Testnet trading.
+    """
+    config: AppConfig = ctx.obj["config"]
+    if config.mode != Mode.BACKTEST:
+        click.echo("The research-round2 command requires --mode backtest.", err=True)
+        sys.exit(1)
+
+    with CandleStore(config.paths.db_path) as store:
+        candles = store.get_candles(config.market.symbol, config.market.interval)
+    if not candles:
+        click.echo("No candles found. Run `fetch-data` first.", err=True)
+        sys.exit(1)
+
+    client = BinancePublicMarketDataClient(PRODUCTION_MARKET_DATA_HOST)
+    try:
+        filters = SymbolFilters.from_exchange_info(client.get_exchange_info(config.market.symbol))
+    except Exception as exc:  # noqa: BLE001 - surfaced to the user, then exit
+        click.echo(f"Failed to fetch exchange filters: {exc}", err=True)
+        sys.exit(1)
+
+    pre_cutoff, consumed = split_at_cutoff(candles)
+    click.echo(
+        f"research cutoff: {RESEARCH_CUTOFF_ISO}  pre_cutoff_candles={len(pre_cutoff)}  "
+        f"consumed_candles={len(consumed)} (NEVER used below - D1 is pre-cutoff development data only)"
+    )
+    if not pre_cutoff:
+        click.echo("No pre-cutoff candles available - cannot evaluate D1.", err=True)
+        sys.exit(1)
+
+    comparison: Round2Comparison = build_round2_report(pre_cutoff, config, filters)
+    d1 = comparison.d1
+    click.echo(f"\n=== ROUND {d1.round_number} HYPOTHESIS: {d1.candidate_id} ({d1.family}) params={d1.params} ===")
+    click.echo(f"cumulative_candidate_configurations_examined={d1.cumulative_candidate_configurations_examined}")
+    click.echo(d1.multiple_testing_warning)
+
+    click.echo("\n--- D1 scorecard (same conservative thresholds as round 1) ---")
+    _print_scorecard_entry_summary(d1.scorecard)
+
+    click.echo(
+        f"\n--- D1 EMA200 regime gate ---\nbreakout_signals_evaluated={d1.regime_gate_signals_evaluated} "
+        f"blocked_by_regime_gate={d1.regime_gate_signals_blocked} "
+        f"blocked_pct={d1.regime_gate_blocked_pct}"
+    )
+    click.echo(f"D1 max_drawdown_pct (worst full-duration block)={d1.max_drawdown_pct}")
+
+    for fragment in d1.fragments:
+        click.echo(
+            f"INSUFFICIENT-DURATION FRAGMENT: segment={fragment.segment_index} candles={fragment.candle_count} "
+            f"available_tradable_duration_days={fragment.available_tradable_duration_days:.1f} - {fragment.reason}"
+        )
+    for leftover in d1.leftovers:
+        click.echo(
+            f"LEFTOVER PARTIAL WINDOW: segment={leftover.segment_index} candles={leftover.candle_count} "
+            f"duration_days={leftover.duration_days:.1f} (excluded from all pass/fail calculations)"
+        )
+
+    click.echo("\n--- D1 detailed post-mortem (every full-duration block, no hidden failures) ---")
+    _print_candidate_post_mortem(d1.post_mortem)
+
+    click.echo(f"\n{d1.not_approved_note}")
+
+    click.echo(f"\n{comparison.comparison_note}")
+    click.echo("\n--- breakout_B1 on IDENTICAL dates (same duration-normalized blocks) ---")
+    _print_scorecard_entry_summary(comparison.b1_scorecard_on_identical_dates)
+    _print_candidate_post_mortem(comparison.b1_post_mortem_on_identical_dates)
+
+    click.echo(
+        "\nNote: this is exploratory research on simulated fills over historical data, not a claim of "
+        "profitability and not approval for live or Testnet trading."
+    )
 
 
 @cli.command("run")

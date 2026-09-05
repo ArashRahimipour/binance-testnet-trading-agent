@@ -2,6 +2,85 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.0] - Duration-normalized sensitivity report and round-2 hypothesis (breakout_regime_D1_round2)
+
+Round 1's real pre-cutoff evaluation and post-mortem completed with a
+methodology finding: the original blocked chronological evaluation splits
+every gap-free segment into a FIXED NUMBER of blocks (`block_count=5`) by
+candle count, so a tiny 297-candle pre-gap fragment received the same five
+voting blocks as the 14,000-candle dominant segment - zero-trade
+micro-blocks from the fragment could distort `positive_realized_pnl_block_fraction`
+and other per-block aggregates on equal footing with years of real
+history. This release adds a duration-normalized sensitivity analysis to
+test for that defect, WITHOUT altering any original result, scorecard,
+diagnosis, or frozen artifact (all permanently labeled
+`round_1_original_evaluation` and reproduced byte-for-byte, never
+recomputed differently), plus exactly one new, explicitly result-informed
+round-2 hypothesis. Adds 35 tests (492 -> 527 total). No PR was opened, no
+Testnet connection was made, and no order was placed as part of this work.
+
+### Added
+
+- **`research/fixed_duration_evaluation.py`**: a sibling block-construction
+  method to `research/blocked_chronological_evaluation.py` (never
+  modified) that gives every gap-free segment as many COMPLETE,
+  non-overlapping 365-day blocks as its own post-warm-up duration allows,
+  instead of a fixed count. A segment too short for even one complete
+  block gets ZERO voting blocks (`InsufficientDurationFragment`), never
+  five negative zero-trade votes; any leftover sub-365-day tail is
+  reported separately (`LeftoverPartialWindow`) and excluded from every
+  pass/fail calculation. Reuses the exact same `run_segment` primitive,
+  fixed 1:2 risk/reward policy, and warm-up-never-trades mechanism as the
+  original module - a different block-construction methodology only,
+  nothing about strategy, parameter, threshold, fee, slippage, sizing, or
+  execution changes.
+- **`research/sensitivity_comparison.py`**: for each of the nine original
+  candidates, reproduces `round_1_original_evaluation` (calling the
+  original, unmodified evaluation + scorecard functions directly) side by
+  side with a `duration_normalized_sensitivity` scorecard computed the
+  same, unmodified way over the new fixed-duration blocks. The
+  sensitivity side is explicitly NON-BINDING: it never changes a
+  candidate's original verdict and never retroactively creates a
+  RESEARCH_SURVIVOR.
+- **`cli/main.py::research-sensitivity`**: prints both scorecards side by
+  side for all nine candidates, plus every insufficient-duration fragment
+  and leftover window.
+- **`research/candidates/breakout_regime_gate.py`** (`BreakoutWithBullishRegimeGateStrategy`,
+  candidate family D): an explicitly RESULT-INFORMED round-2 hypothesis -
+  round 1 showed `breakout_B1` had broad trade-level profitability but
+  sustained losses in an unfavorable 2021-2022 regime. Delegates B1's own
+  breakout/channel-breakdown signal verbatim (identical channel_period=20,
+  atr_period=14, breakout_atr_multiple=0.25) and adds exactly one causal
+  gate in front of a would-be BUY: the signal candle's close must be above
+  a 200-period EMA, and that EMA must be strictly above its own value 20
+  completed candles earlier (a rising long-term average). Read-only
+  instance counters record how often the gate blocked an otherwise-valid
+  breakout, for reporting only - never consulted by the signal decision
+  itself. No shorts, no leverage, no additional indicators, and B1's own
+  channel-breakdown exit is never gated.
+- **`research/candidate_registry_round2.py`**: exactly one round-2
+  candidate (`breakout_regime_D1_round2`), `ROUND_NUMBER=2`,
+  `CUMULATIVE_CANDIDATE_CONFIGURATIONS_EXAMINED=10` (9 round-1 + 1
+  round-2), and `ROUND2_MULTIPLE_TESTING_WARNING` disclosing that D1 is
+  NOT an untouched, pre-registered test.
+- **`research/round2_report.py`** + **`cli/main.py::research-round2`**:
+  evaluates D1 ONLY on pre-cutoff data using the new fixed-duration
+  blocks (never the consumed post-cutoff period), scored against the SAME
+  conservative scorecard thresholds as round 1 (unchanged), with a full
+  `research/post_mortem.py`-based report (trade counts/win rate,
+  expectancy in quote/%/R, payoff ratio, profit factor, exit-reason
+  breakdown, per-calendar-year results, longest underwater period, cost
+  totals, best-trade/best-3/best-5% exclusion analysis), plus the worst
+  per-block max drawdown and the percentage of breakout signals the
+  EMA200 regime gate blocked. Also re-runs the original, unmodified
+  `breakout_B1` through the SAME fixed-duration blocks so both candidates
+  share IDENTICAL block date ranges for a fair comparison - this does not
+  alter or supersede `breakout_B1`'s own `round_1_original_evaluation`.
+  Every report carries a permanent notice that even a RESEARCH_SURVIVOR
+  verdict is not a claim of profitability or approval for live/Testnet
+  trading, and every full-duration block (including any that failed) is
+  reported - never only the best.
+
 ## [0.3.0] - Read-only candidate post-mortem report
 
 The first REAL pre-cutoff research evaluation (`research-backtest`) has now

@@ -419,6 +419,63 @@ diagnosis, from a fixed, disclosed rule applied identically to all of them:
 "profitable", "approved", or "rejected" - that vocabulary remains
 `research-backtest`'s own, separate scorecard.
 
+### Duration-normalized sensitivity report (read-only)
+
+```bash
+trading-agent research-sensitivity
+```
+
+Round 1's real evaluation surfaced a methodology finding: the original
+blocked chronological evaluation splits every gap-free segment into a
+FIXED NUMBER of blocks (`block_count=5`) by candle count, so a tiny
+fragment segment gets the same five voting blocks as a multi-year dominant
+segment. This command re-scores all nine ORIGINAL, UNMODIFIED candidates
+using fixed **365-day-duration** blocks instead (`research/
+fixed_duration_evaluation.py`) - a segment too short for even one complete
+year gets **zero** voting blocks (reported as an insufficient-duration
+fragment), never five negative zero-trade votes; any leftover sub-year
+tail is reported separately and excluded from every pass/fail calculation.
+Both the original and duration-normalized scorecards are printed side by
+side, using the exact same, unmodified `research/scorecard.py` thresholds
+for both. **This never changes any original result, scorecard, diagnosis,
+or frozen artifact** - `round_1_original_evaluation` is a byte-for-byte
+reproduction, and `duration_normalized_sensitivity` is explicitly
+non-binding: it never overrides an original verdict and never
+retroactively creates a `RESEARCH_SURVIVOR`.
+
+### Round 2: one result-informed hypothesis (read-only, pre-cutoff only)
+
+```bash
+trading-agent research-round2
+```
+
+Round 1 showed `breakout_B1` had broad trade-level profitability but
+sustained losses during an unfavorable 2021-2022 regime. This command
+evaluates exactly **one** new, explicitly RESULT-INFORMED candidate -
+`breakout_regime_D1_round2` (`research/candidates/breakout_regime_gate.py`)
+- never presented as an untouched, pre-registered test. D1 preserves
+`breakout_B1`'s own breakout/channel-breakdown signal and parameters
+exactly (channel_period=20, atr_period=14, breakout_atr_multiple=0.25) and
+adds exactly one causal gate in front of a would-be BUY: the signal
+candle's close must be above a 200-period EMA, and that EMA must be
+strictly above its own value 20 completed candles earlier (a rising
+long-term average) - both conditions on the same completed candle, no
+look-ahead. Nothing about B1's exit, stop-loss, take-profit, sizing, fees,
+or slippage changes.
+
+D1 is evaluated **only** on pre-cutoff data using the same
+duration-normalized blocks above - never the consumed post-cutoff period -
+and scored against the exact same conservative scorecard thresholds as
+round 1 (nothing loosened or tightened). The report discloses the round
+number, the cumulative candidate configurations examined across both
+rounds (**10**), and a permanent multiple-testing warning. It reports
+every full-duration block (including any that failed), the percentage of
+breakout signals the EMA200 gate blocked, and a side-by-side comparison
+against the original `breakout_B1` re-run on **identical** block dates for
+a fair comparison - without altering B1's own round-1 status. **Even a
+`RESEARCH_SURVIVOR` verdict for D1 is not a claim of profitability and not
+approval for live or Testnet trading.**
+
 ## Running on the Spot Testnet
 
 ```bash

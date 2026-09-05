@@ -154,6 +154,70 @@ def test_research_postmortem_command_requires_backtest_mode(tmp_path):
     assert "requires --mode backtest" in result.output
 
 
+@responses.activate
+def test_research_sensitivity_command_end_to_end(tmp_path):
+    config_path = _write_config(tmp_path)
+    rows = make_kline_series(START, INTERVAL, 60)
+    responses.add(responses.GET, f"{PROD_HOST}/api/v3/time", json={"serverTime": rows[-1][6] + 1}, status=200)
+    responses.add(responses.GET, f"{PROD_HOST}/api/v3/klines", json=rows, status=200)
+    fetch_result = CliRunner().invoke(cli, ["--config", config_path, "fetch-data", "--limit", "60"])
+    assert fetch_result.exit_code == 0, fetch_result.output
+
+    responses.add(
+        responses.GET, f"{PROD_HOST}/api/v3/exchangeInfo", json=make_exchange_info(min_notional="1"), status=200,
+    )
+    result = CliRunner().invoke(cli, ["--config", config_path, "research-sensitivity"])
+    assert result.exit_code == 0, result.output
+    assert "research cutoff: 2025-05-16T00:00:00Z" in result.output
+    assert "round_1_original_evaluation" in result.output
+    assert "duration_normalized_sensitivity" in result.output
+    assert "NON-BINDING" in result.output
+    for spec_id in ("trend_regime_A1", "breakout_B1", "mean_reversion_C1"):
+        assert spec_id in result.output
+    assert "never changed by this command" in result.output
+
+
+def test_research_sensitivity_command_requires_backtest_mode(tmp_path):
+    config_path = _write_config(tmp_path)
+    result = CliRunner().invoke(cli, ["--config", config_path, "--mode", "testnet", "research-sensitivity"])
+    assert result.exit_code != 0
+    assert "requires --mode backtest" in result.output
+
+
+@responses.activate
+def test_research_round2_command_end_to_end(tmp_path):
+    config_path = _write_config(tmp_path)
+    # 250 candles clears D1's own EMA200+slope warm-up requirement so the
+    # command exercises real signal generation, though still short of a
+    # full 365-day duration block (reported as a fragment, not silently
+    # dropped).
+    rows = make_kline_series(START, INTERVAL, 250)
+    responses.add(responses.GET, f"{PROD_HOST}/api/v3/time", json={"serverTime": rows[-1][6] + 1}, status=200)
+    responses.add(responses.GET, f"{PROD_HOST}/api/v3/klines", json=rows, status=200)
+    fetch_result = CliRunner().invoke(cli, ["--config", config_path, "fetch-data", "--limit", "250"])
+    assert fetch_result.exit_code == 0, fetch_result.output
+
+    responses.add(
+        responses.GET, f"{PROD_HOST}/api/v3/exchangeInfo", json=make_exchange_info(min_notional="1"), status=200,
+    )
+    result = CliRunner().invoke(cli, ["--config", config_path, "research-round2"])
+    assert result.exit_code == 0, result.output
+    assert "research cutoff: 2025-05-16T00:00:00Z" in result.output
+    assert "breakout_regime_D1_round2" in result.output
+    assert "ROUND 2 HYPOTHESIS" in result.output
+    assert "cumulative_candidate_configurations_examined=10" in result.output
+    assert "NOT AN UNTOUCHED TEST" in result.output
+    assert "breakout_B1 on IDENTICAL dates" in result.output
+    assert "not a claim of profitability and not approval for live or Testnet trading" in result.output
+
+
+def test_research_round2_command_requires_backtest_mode(tmp_path):
+    config_path = _write_config(tmp_path)
+    result = CliRunner().invoke(cli, ["--config", config_path, "--mode", "testnet", "research-round2"])
+    assert result.exit_code != 0
+    assert "requires --mode backtest" in result.output
+
+
 def test_backtest_command_requires_backtest_mode(tmp_path):
     config_path = _write_config(tmp_path)
     result = CliRunner().invoke(cli, ["--config", config_path, "--mode", "testnet", "backtest"])
