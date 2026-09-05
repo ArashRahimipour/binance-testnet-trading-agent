@@ -517,6 +517,39 @@ an accepted cost of the required multi-timeframe design. **Even a
 `RESEARCH_SURVIVOR` verdict for E1 is not a claim of profitability and
 not approval for live or Testnet trading.**
 
+**Fetching the 1h data this command needs.** A dedicated pre-evaluation
+data-integrity audit (see the `[0.5.1]` entry in
+[CHANGELOG.md](CHANGELOG.md) and
+`tests/unit/test_data_integrity_round3_audit.py`) proved that
+`data/storage.py`'s candle schema is already fully interval-aware - its
+`PRIMARY KEY (symbol, interval, open_time_ms)` and every read (`get_candles`,
+`latest_close_time_ms`) filtering on `interval` explicitly means 1h and 4h
+candles for the same symbol coexist safely in **the same** database file;
+switching `market.interval` can never overwrite, mix with, or leak into
+the other interval's rows or queries. No schema migration and no separate
+database file is structurally required. Use the provided
+`config/round3_1h.yaml` (identical to `config/default.yaml` except
+`market.interval: 1h`, and deliberately pointed at the SAME `db_path`) to
+fetch exactly the pre-cutoff 1h history E1 needs:
+
+```bash
+trading-agent --config config/round3_1h.yaml fetch-data --start 2017-08-17 --end 2025-05-16
+```
+
+`--start 2017-08-17` is BTCUSDT's own Binance listing date (harmless to
+start earlier than the exchange's actual history - the fetch simply
+returns nothing before it). `--end 2025-05-16` is exact, not approximate:
+`fetch-data` fetches candles opening in `[start, end)` (a half-open
+interval - see `data/historical_fetch.py::fetch_historical_range`), so
+this end date excludes every candle opening at or after
+`2025-05-16T00:00:00Z` - precisely the immutable research cutoff
+(`research/cutoff.py::RESEARCH_CUTOFF_MS`) - without fetching a single
+candle you are not allowed to develop or score against. Then run:
+
+```bash
+trading-agent --config config/round3_1h.yaml research-round3
+```
+
 ## Running on the Spot Testnet
 
 ```bash

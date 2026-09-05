@@ -2,6 +2,60 @@
 
 All notable changes to this project are documented here.
 
+## [0.5.1] - Pre-evaluation data-integrity audit for commit 47a353a
+
+An audit, not a fix: inspected (never queried the real database, fetched
+market data, ran `research-round3` for real, connected to Testnet, or
+altered any strategy parameter) and proved all 9 requested invariants
+about commit 47a353a's candle storage, interval isolation, and Round-3
+1h/4h/weekly aggregation. **Conclusion: `data/storage.py`'s existing
+schema is already fully interval-aware** - `PRIMARY KEY (symbol, interval,
+open_time_ms)` on `candles` (and `(symbol, interval, expected_open_time_ms)`
+on `candle_gaps`), with the `ON CONFLICT(symbol, interval, open_time_ms)`
+upsert target and every read (`get_candles`, `latest_close_time_ms`)
+filtering by both `symbol` AND `interval` explicitly - so switching
+`market.interval` from "4h" to "1h" cannot overwrite, mix with, or cause a
+query to return the other interval's candles, and no schema migration or
+separate database file is structurally required. Adds 30 new regression
+tests (629 total) proving this and the remaining 8 invariants directly
+against the real source, plus one new example config file. No source
+code in `src/trading_agent/` was modified.
+
+### Added
+
+- **`tests/unit/test_data_integrity_round3_audit.py`** (30 tests): a
+  self-contained audit artifact proving, independently of any other test
+  file's coverage: (1) both tables' composite `PRIMARY KEY`s are exactly
+  `symbol, interval, (open_time_ms | expected_open_time_ms)`, including a
+  raw-SQL proof that SQLite itself (not just the upsert helper) rejects a
+  duplicate; (2) a 4h candle and a 1h candle sharing the same
+  `open_time_ms` coexist as distinct rows, re-upserting one never mutates
+  or is ever returned by a query for the other, and `latest_close_time_ms`
+  is equally interval-isolated; (3) `research-round3`'s exact read
+  (`store.get_candles(config.market.symbol, ROUND3_MARKET_INTERVAL)`)
+  returns only `BTCUSDT`+`1h` rows from a database also holding `BTCUSDT`
+  4h and `ETHUSDT` 1h candles; (4)/(5) `_weekly_bucket_start_ms` and
+  `_four_h_bucket_start_ms` match real, independently-verifiable Binance
+  UTC boundaries (Monday 00:00 UTC; 00/04/08/12/16/20 UTC) across a range
+  of known reference dates, not just internal self-consistency; (6) a
+  trailing incomplete 4h or weekly bucket is never exposed, only ever
+  exactly-complete ones are; (7) a confirmed 1h gap (via the real
+  `partition_into_segments`) produces no fabricated, blended, or
+  gap-bridging aggregate bucket - aggregating each of its segments
+  independently yields identical buckets to aggregating the original
+  gapped list directly; (8) `split_at_cutoff`/`assert_pre_cutoff` exclude
+  a 1h candle opening exactly at `2025-05-16T00:00:00Z` while including
+  the one one millisecond before it, and `research-round3`'s own source
+  is confirmed to call `split_at_cutoff` before ever building a report;
+  (9) a regression lock (schema source text + an end-to-end mixed
+  4h+1h-in-one-file round trip) on the fact that finding 1-2 depends on -
+  if the schema's interval-awareness is ever weakened, this test fails
+  and a separate 1h database becomes necessary again.
+- **`config/round3_1h.yaml`**: an example Round-3 config, identical to
+  `config/default.yaml` except `market.interval: 1h`. Deliberately reuses
+  the SAME `db_path` (`data/trading_agent.db`) as the 4h config - safe per
+  the audit above, not an oversight (see the file's own header comment).
+
 ## [0.5.0] - Round 3: multi-timeframe breakout candidate (multitimeframe_breakout_E1_round3)
 
 Round 2's `breakout_regime_D1_round2` received its OFFICIAL evaluation

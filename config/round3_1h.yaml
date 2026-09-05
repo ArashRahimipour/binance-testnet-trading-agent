@@ -1,0 +1,68 @@
+# Round-3 1h research configuration for BTCUSDT (multitimeframe_breakout_E1_round3).
+#
+# Identical to config/default.yaml in every respect except market.interval.
+# It intentionally points at the SAME db_path as config/default.yaml
+# (data/trading_agent.db) - this is safe, not an oversight: candle storage
+# is keyed by (symbol, interval, open_time_ms) (see data/storage.py's
+# PRIMARY KEY and its ON CONFLICT(symbol, interval, open_time_ms) upsert
+# target, and CandleStore.get_candles's WHERE symbol = ? AND interval = ?
+# filter), so 1h and 4h candles for the same symbol coexist in one file
+# without ever overwriting, mixing, or cross-contaminating each other's
+# queries. See tests/unit/test_data_integrity_round3_audit.py for the
+# regression proofs, and this file's own docstring reference in
+# `research-round3`'s CLI help.
+#
+# Use this file ONLY to fetch/hold 1h candles and to run `research-round3`
+# (which requires market.interval="1h" - see
+# research/candidate_registry_round3.py::REQUIRED_MARKET_INTERVAL). Every
+# other command (backtest, research-backtest, research-round2, testnet)
+# should keep using config/default.yaml (or your own 4h config) unchanged.
+
+mode: backtest
+
+market:
+  symbol: BTCUSDT
+  interval: 1h          # completed candles only - REQUIRED by research-round3
+  timezone_display: Australia/Sydney   # internal storage/logic is always UTC
+
+strategy:
+  name: ema_crossover_trend
+  ema_fast: 20
+  ema_slow: 50
+  # Unused by research-round3 (it evaluates its own fixed candidate
+  # registry), kept only so this file remains a fully valid AppConfig.
+
+sizing:
+  max_allocation_pct: 0.90
+  min_quote_buffer: 5.0
+
+fees:
+  taker_fee_pct: 0.001
+  maker_fee_pct: 0.001
+  slippage_pct: 0.0005
+
+risk:
+  max_position_pct: 0.90
+  max_risk_per_trade_pct: 0.02
+  max_daily_loss_pct: 0.05
+  max_drawdown_pct: 0.15
+  max_trades_per_day: 4
+  cooldown_bars_after_loss: 2
+  stale_data_max_age_seconds: 21600
+  min_quote_balance: 5.0
+  max_consecutive_api_errors: 3
+
+stop_loss:
+  stop_distance_pct: 0.05
+
+backtest:
+  train_fraction: 0.6
+  validation_fraction: 0.2
+  test_fraction: 0.2
+  min_trades_for_significance: 20
+  starting_equity: 50.0
+
+paths:
+  data_dir: data
+  logs_dir: logs
+  db_path: data/trading_agent.db   # SAME file as config/default.yaml - see this file's own header comment
