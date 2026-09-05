@@ -2,6 +2,66 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.1] - Fix D1-vs-B1 date misalignment in the round-2 comparison
+
+Code review found a real defect in 0.4.0 (commit 50a5a5b), caught BEFORE
+any real D1 evaluation: `run_candidate_fixed_duration_evaluation` anchors
+its first block at `min_required_candles - 1` for whichever ONE candidate
+it is given. `research/round2_report.py` called it independently for D1
+(~220 warm-up candles) and `breakout_B1` (~21) and then claimed they
+traded "IDENTICAL block date ranges" - false: each candidate's block 0
+started on a DIFFERENT calendar date, and the only test covering this
+checked for the word "identical" in a text note, not actual timestamps.
+Fixed BEFORE any real D1 evaluation - **no real D1 result was inspected
+before or during this release.** Adds 20 tests (541 total, replacing one
+weak text-only assertion with real timestamp-equality proofs). No PR was
+opened, no Testnet connection was made, and no order was placed as part
+of this work.
+
+### Fixed
+
+- **`FixedDurationBlockSchedule`** (`research/fixed_duration_evaluation.py`):
+  an immutable, candidate-agnostic schedule of block window timestamps,
+  built ONCE via `build_fixed_duration_schedule` and anchored using the
+  LARGEST warm-up requirement among every candidate it will be applied
+  to. `run_candidate_fixed_duration_evaluation` gained a `schedule=`
+  parameter - when given, every block's `(window_start_time_ms,
+  window_end_time_ms)` comes from the schedule verbatim, identical for
+  every candidate, while each candidate still gets its own warm-up length
+  preceding that window. The DEFAULT, per-candidate-anchored mode
+  (`schedule=None`) is UNCHANGED and remains correct for `research/
+  sensitivity_comparison.py`'s nine-candidate report (each candidate is
+  only ever compared against itself there) - that module now explicitly
+  discloses that its own per-candidate dates can legitimately differ
+  across candidates and must never be read as an identical-date ranking.
+- **Fail-closed schedule validation**: a window's own duration differing
+  from the schedule's declared duration, two windows overlapping, or a
+  window touching/crossing the immutable research cutoff all raise
+  immediately when a schedule is built (`ScheduleDurationMismatchError`,
+  `ScheduleOverlapError`, `ScheduleCutoffViolationError`). Applying a
+  schedule to a candidate whose own warm-up requirement exceeds what the
+  schedule was anchored for (`InsufficientWarmUpForScheduleError`), or
+  whose scheduled window can no longer resolve to a complete, non-empty,
+  single-segment candle range - e.g. a gap that now truncates a segment
+  earlier than the schedule assumed - (`ScheduleWindowOutOfRangeError`),
+  also raises rather than silently producing a misaligned or short block.
+- **`research/round2_report.py`**: now builds ONE shared schedule,
+  anchored at `max(d1_min_required, b1_min_required)`, and passes it to
+  both D1 and `breakout_B1`. A new runtime assertion
+  (`_assert_identical_trading_windows`, raising
+  `IdenticalTradingWindowAssertionError`) re-verifies, on every call, that
+  every block D1 and B1 actually traded shares the exact same
+  `(segment_index, window_start_time_ms, window_end_time_ms)` - never
+  merely trusted because both were built from the same schedule object.
+- Replaced the weak `"IDENTICAL" in comparison.comparison_note` text
+  check with tests asserting exact start/end timestamp equality between
+  two candidates with different `min_required_candles`, that their
+  warm-up lengths differ while trading dates stay identical, that both
+  receive exactly five complete 365-day blocks, that a one-candle
+  timestamp difference fails the identical-window assertion, and that
+  insufficient warm-up, gap-truncation, cutoff-touching, overlapping, and
+  wrong-duration schedules all fail closed.
+
 ## [0.4.0] - Duration-normalized sensitivity report and round-2 hypothesis (breakout_regime_D1_round2)
 
 Round 1's real pre-cutoff evaluation and post-mortem completed with a

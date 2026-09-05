@@ -190,6 +190,52 @@ def test_round2_report_includes_b1_on_identical_dates_comparison():
     assert "IDENTICAL" in comparison.comparison_note or "identical" in comparison.comparison_note
 
 
+def _long_zigzag_candles(n: int, start: int = START) -> list[Candle]:
+    closes = []
+    price = 100.0
+    direction = 1
+    for i in range(n):
+        if i % 90 == 0:
+            direction *= -1
+        price += direction * 0.5
+        closes.append(price)
+    return [_candle(i, c, start=start) for i, c in enumerate(closes)]
+
+
+def test_round2_report_d1_and_b1_trade_exactly_identical_window_timestamps():
+    # D1 requires ~220 warm-up candles, B1 only ~21 - a real regression
+    # proof (not a text check) that the shared-schedule fix in
+    # research/round2_report.py produces IDENTICAL block timestamps for
+    # both, despite their very different warm-up requirements.
+    from trading_agent.research.candidate_registry import CANDIDATE_REGISTRY
+    from trading_agent.research.candidates.breakout_regime_gate import (
+        BreakoutWithBullishRegimeGateStrategy,
+    )
+
+    d1_min_required = ROUND2_CANDIDATE_REGISTRY[0].build().min_required_candles
+    b1_min_required = next(s for s in CANDIDATE_REGISTRY if s.candidate_id == "breakout_B1").build().min_required_candles
+    assert isinstance(ROUND2_CANDIDATE_REGISTRY[0].build(), BreakoutWithBullishRegimeGateStrategy)
+    assert d1_min_required != b1_min_required  # the two really do have different warm-up requirements
+
+    n = 13140  # ~6 years of 4h candles
+    candles = _long_zigzag_candles(n, start=RESEARCH_CUTOFF_MS - (n + 10) * STEP)  # comfortably pre-cutoff
+    comparison = build_round2_report(candles, _config(), _filters())
+
+    d1_blocks = comparison.d1.post_mortem.chronological_stability.per_block
+    b1_blocks = comparison.b1_post_mortem_on_identical_dates.chronological_stability.per_block
+    assert len(d1_blocks) >= 1  # the fixture must be long enough to actually exercise this
+    assert len(d1_blocks) == len(b1_blocks) == 5  # exactly five complete 365-day blocks each
+
+    duration_ms = 365 * 24 * 60 * 60 * 1000
+    for d1_block, b1_block in zip(d1_blocks, b1_blocks, strict=True):
+        assert d1_block.segment_index == b1_block.segment_index
+        assert d1_block.window_start_time_ms == b1_block.window_start_time_ms
+        assert d1_block.window_end_time_ms == b1_block.window_end_time_ms
+        # window_end_time_ms is the last candle's own (inclusive) close_time_ms,
+        # one ms short of the schedule's exclusive upper boundary.
+        assert d1_block.window_end_time_ms - d1_block.window_start_time_ms == duration_ms - 1
+
+
 def test_round2_report_never_hides_a_failed_or_fragment_block():
     # Too short for even one full-duration block - must surface as
     # fragments, never silently omitted from the report.

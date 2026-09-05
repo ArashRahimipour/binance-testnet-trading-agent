@@ -38,6 +38,45 @@ gap):
     - `research/sensitivity_comparison.py` and any scorecard built from
     `.as_blocked_chronological_result()` therefore never scores it.
 
+SECOND FINDING - CROSS-CANDIDATE DATE MISALIGNMENT (post-commit-50a5a5b code
+review correction): calling `run_candidate_fixed_duration_evaluation`
+independently for two candidates with DIFFERENT `min_required_candles`
+(warm-up length) anchors each candidate's own block 0 at its OWN
+`first_tradable_idx = min_required - 1` - so two candidates with different
+warm-up requirements end up trading DIFFERENT calendar date ranges, even
+though both cover "5 duration-normalized blocks". This is exactly right
+when comparing a candidate against ITSELF (or against candidates you do
+NOT need identical dates for - see `research/sensitivity_comparison.py`,
+which legitimately still uses this independent, per-candidate anchoring
+for the nine-candidate report). It is WRONG when the whole point of a
+comparison is that both candidates trade the SAME dates (`research/
+round2_report.py`'s D1-vs-B1 comparison).
+
+`FixedDurationBlockSchedule` (via `build_fixed_duration_schedule`) fixes
+this: it is a schedule of window timestamps computed ONCE, ANCHORED using
+the LARGEST warm-up requirement among every candidate that will be
+evaluated against it, and independent of any one candidate's own strategy
+object. Passing that SAME schedule to `run_candidate_fixed_duration_evaluation`
+(via its `schedule=` parameter) for multiple candidates guarantees every
+one of them trades the IDENTICAL `(window_start_time_ms, window_end_time_ms)`
+per block - each candidate still gets its OWN warm-up length preceding
+that window, but the window itself never moves. Every schedule-related
+failure mode below is FAIL CLOSED (raises, never silently produces a
+misaligned or partial result):
+  - a candidate's own warm-up requirement exceeds what the schedule was
+    anchored for (`InsufficientWarmUpForScheduleError`);
+  - a scheduled window would not resolve to a valid, non-empty,
+    single-segment candle range (`ScheduleWindowOutOfRangeError` - the
+    concrete way a window "crossing a gap" would manifest, since a
+    correctly-built schedule can never actually do this by construction);
+  - a scheduled window's own span differs from the schedule's declared
+    `block_duration_days` (`ScheduleDurationMismatchError`);
+  - two scheduled windows overlap (`ScheduleOverlapError`);
+  - a scheduled window would touch or cross the immutable research cutoff
+    (`ScheduleCutoffViolationError`);
+  - a schedule is applied with a `block_duration_days` that does not match
+    the caller's own expectation (`ScheduleDurationMismatchError`).
+
 This module changes NOTHING about any strategy, parameter, threshold,
 risk/reward rule, fee, slippage, sizing, or execution behavior - it is a
 different BLOCK-CONSTRUCTION methodology only, reusing the exact same
@@ -53,6 +92,7 @@ from __future__ import annotations
 import bisect
 from dataclasses import dataclass, field
 from decimal import Decimal
+from itertools import pairwise
 
 from trading_agent.backtest.engine import run_segment
 from trading_agent.config.models import AppConfig
@@ -71,7 +111,7 @@ from trading_agent.research.blocked_chronological_evaluation import (
     CandidateBlockedChronologicalResult,
 )
 from trading_agent.research.candidate_registry import CandidateSpec
-from trading_agent.research.cutoff import assert_pre_cutoff
+from trading_agent.research.cutoff import RESEARCH_CUTOFF_MS, assert_pre_cutoff
 from trading_agent.risk.engine import RiskEngine
 from trading_agent.sizing.exchange_filters import SymbolFilters
 from trading_agent.strategy.base import CandidateStrategy
@@ -80,7 +120,39 @@ from trading_agent.strategy.base import CandidateStrategy
 #: sensitivity block. Never tuned per candidate or per result.
 DEFAULT_BLOCK_DURATION_DAYS = 365
 _MS_PER_DAY = 24 * 60 * 60 * 1000
-_BLOCK_DURATION_MS = DEFAULT_BLOCK_DURATION_DAYS * _MS_PER_DAY
+
+
+class FixedDurationScheduleError(Exception):
+    """Base class for every fail-closed fixed-duration schedule violation
+    - see the module docstring's "SECOND FINDING" section."""
+
+
+class InsufficientWarmUpForScheduleError(FixedDurationScheduleError):
+    """A candidate's own `min_required_candles` exceeds the warm-up length
+    a `FixedDurationBlockSchedule` was anchored for."""
+
+
+class ScheduleWindowOutOfRangeError(FixedDurationScheduleError):
+    """A scheduled window does not resolve to a valid, non-empty,
+    single-segment candle range - the concrete way a window could
+    otherwise "cross a gap"; unreachable for a schedule this module built
+    itself, kept as a fail-closed check against a hand-built or corrupted
+    schedule."""
+
+
+class ScheduleDurationMismatchError(FixedDurationScheduleError):
+    """A scheduled window's own span does not equal the schedule's
+    declared `block_duration_days`, or a caller applied a schedule built
+    for a different `block_duration_days` than it asked for."""
+
+
+class ScheduleOverlapError(FixedDurationScheduleError):
+    """Two windows in the same schedule overlap in time."""
+
+
+class ScheduleCutoffViolationError(FixedDurationScheduleError):
+    """A scheduled window would touch or cross the immutable research
+    cutoff (`research/cutoff.py::RESEARCH_CUTOFF_MS`)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +190,192 @@ class LeftoverPartialWindow:
 
 
 @dataclass(frozen=True, slots=True)
+class ScheduledBlockWindow:
+    """One block's exact, candidate-agnostic trading window - a pure
+    timestamp pair plus its position, computed independently of any
+    candidate's own strategy object."""
+
+    segment_index: int
+    block_index: int
+    window_start_time_ms: int
+    window_end_time_ms: int  # exclusive
+
+
+@dataclass(frozen=True, slots=True)
+class FixedDurationBlockSchedule:
+    """An immutable, pre-built, candidate-agnostic schedule of duration
+    blocks - see the module docstring's "SECOND FINDING" section for why
+    this exists. Passing the SAME schedule to `run_candidate_fixed_duration_evaluation`
+    for two different candidates guarantees they trade IDENTICAL
+    `(window_start_time_ms, window_end_time_ms)` windows, regardless of
+    how their own warm-up lengths differ.
+    """
+
+    block_duration_days: int
+    #: The warm-up length (in candles) this schedule was anchored for -
+    #: i.e. `first_tradable_idx = anchor_warm_up_candles_required - 1`
+    #: within each segment. Must be >= every candidate's own
+    #: `min_required_candles` that will ever be evaluated against this
+    #: schedule (see `InsufficientWarmUpForScheduleError`).
+    anchor_warm_up_candles_required: int
+    windows: tuple[ScheduledBlockWindow, ...] = ()
+    fragments: tuple[InsufficientDurationFragment, ...] = ()
+    leftovers: tuple[LeftoverPartialWindow, ...] = ()
+
+
+def _segment_tradable_span(segment: list[Candle], first_tradable_idx: int, step_ms: int) -> tuple[list[int], int, int]:
+    open_times = [c.open_time_ms for c in segment]
+    tradable_start_ms = open_times[first_tradable_idx]
+    # +step_ms: the total covered span includes the LAST candle's own full
+    # duration, not just the gap between open timestamps.
+    total_tradable_span_ms = (open_times[-1] - tradable_start_ms) + step_ms
+    return open_times, tradable_start_ms, total_tradable_span_ms
+
+
+def build_fixed_duration_schedule(
+    pre_cutoff_candles: list[Candle],
+    config: AppConfig,
+    anchor_warm_up_candles_required: int,
+    block_duration_days: int = DEFAULT_BLOCK_DURATION_DAYS,
+) -> FixedDurationBlockSchedule:
+    """Build a candidate-agnostic schedule of duration blocks, ANCHORED
+    using `anchor_warm_up_candles_required` - pass the LARGEST
+    `min_required_candles` among every candidate this schedule will be
+    applied to (see `InsufficientWarmUpForScheduleError` otherwise).
+    Raises `ResearchCutoffViolation` (via `assert_pre_cutoff`) on any
+    on-or-after-cutoff candle. Every window is validated (duration,
+    non-overlap, no cutoff touch) before this function returns - a
+    schedule it hands back is always safe to apply.
+    """
+    assert_pre_cutoff(pre_cutoff_candles)
+    if anchor_warm_up_candles_required <= 0:
+        raise ValueError("anchor_warm_up_candles_required must be positive")
+    if block_duration_days <= 0:
+        raise ValueError("block_duration_days must be positive")
+    block_duration_ms = block_duration_days * _MS_PER_DAY
+
+    interval = config.market.interval
+    step_ms = interval_to_ms(interval)
+
+    windows: list[ScheduledBlockWindow] = []
+    fragments: list[InsufficientDurationFragment] = []
+    leftovers: list[LeftoverPartialWindow] = []
+
+    if not pre_cutoff_candles:
+        return FixedDurationBlockSchedule(block_duration_days, anchor_warm_up_candles_required)
+
+    segmentation = partition_into_segments(pre_cutoff_candles, interval)
+
+    for seg_idx, segment in enumerate(segmentation.segments):
+        n = len(segment)
+        if n < anchor_warm_up_candles_required:
+            fragments.append(
+                InsufficientDurationFragment(
+                    segment_index=seg_idx, segment_start_time_ms=segment[0].open_time_ms,
+                    segment_end_time_ms=segment[-1].close_time_ms, candle_count=n,
+                    available_tradable_duration_days=0.0,
+                    reason=(
+                        f"only {n} candle(s), fewer than the {anchor_warm_up_candles_required} the schedule "
+                        "was anchored for - no tradable candle exists at all."
+                    ),
+                )
+            )
+            continue
+
+        first_tradable_idx = anchor_warm_up_candles_required - 1
+        open_times, tradable_start_ms, total_tradable_span_ms = _segment_tradable_span(
+            segment, first_tradable_idx, step_ms
+        )
+        possible_blocks = total_tradable_span_ms // block_duration_ms
+
+        if possible_blocks == 0:
+            fragments.append(
+                InsufficientDurationFragment(
+                    segment_index=seg_idx, segment_start_time_ms=segment[0].open_time_ms,
+                    segment_end_time_ms=segment[-1].close_time_ms, candle_count=n,
+                    available_tradable_duration_days=total_tradable_span_ms / _MS_PER_DAY,
+                    reason=(
+                        f"only {total_tradable_span_ms / _MS_PER_DAY:.1f} tradable day(s) after warm-up, fewer "
+                        f"than one complete {block_duration_days}-day block - NO voting block(s) assigned "
+                        "(never reported as zero-trade negative votes)."
+                    ),
+                )
+            )
+            continue
+
+        segment_last_close_ms = segment[-1].close_time_ms
+        for block_idx in range(possible_blocks):
+            window_start_ms = tradable_start_ms + block_idx * block_duration_ms
+            window_end_ms = window_start_ms + block_duration_ms
+            # By construction (possible_blocks is floored), this can never
+            # exceed the segment's own bound - checked anyway, since a
+            # schedule must be safe to trust without re-deriving this math.
+            if window_end_ms > segment_last_close_ms + 1:
+                raise ScheduleWindowOutOfRangeError(  # pragma: no cover - defensive, unreachable by construction
+                    f"segment {seg_idx} block {block_idx}: computed window end {window_end_ms} exceeds this "
+                    f"segment's own last candle close {segment_last_close_ms}."
+                )
+            windows.append(ScheduledBlockWindow(seg_idx, block_idx, window_start_ms, window_end_ms))
+
+        leftover_start_ms = tradable_start_ms + possible_blocks * block_duration_ms
+        segment_end_ms = open_times[-1] + step_ms
+        if leftover_start_ms < segment_end_ms:
+            leftover_start_idx = bisect.bisect_left(open_times, leftover_start_ms, lo=first_tradable_idx)
+            if leftover_start_idx < n:
+                leftovers.append(
+                    LeftoverPartialWindow(
+                        segment_index=seg_idx,
+                        window_start_time_ms=segment[leftover_start_idx].open_time_ms,
+                        window_end_time_ms=segment[-1].close_time_ms,
+                        candle_count=n - leftover_start_idx,
+                        duration_days=(segment_end_ms - leftover_start_ms) / _MS_PER_DAY,
+                    )
+                )
+
+    schedule = FixedDurationBlockSchedule(
+        block_duration_days=block_duration_days,
+        anchor_warm_up_candles_required=anchor_warm_up_candles_required,
+        windows=tuple(windows),
+        fragments=tuple(fragments),
+        leftovers=tuple(leftovers),
+    )
+    _validate_schedule(schedule)
+    return schedule
+
+
+def _validate_schedule(schedule: FixedDurationBlockSchedule) -> None:
+    """Fail closed on: wrong-duration windows, overlapping windows, or a
+    window touching/crossing the immutable research cutoff. Called once,
+    automatically, at the end of `build_fixed_duration_schedule` - a
+    schedule that successfully returns from that function has already
+    passed this check."""
+    expected_duration_ms = schedule.block_duration_days * _MS_PER_DAY
+    for window in schedule.windows:
+        actual_duration_ms = window.window_end_time_ms - window.window_start_time_ms
+        if actual_duration_ms != expected_duration_ms:
+            raise ScheduleDurationMismatchError(
+                f"segment {window.segment_index} block {window.block_index}: window duration "
+                f"{actual_duration_ms}ms != declared {expected_duration_ms}ms."
+            )
+        if window.window_end_time_ms > RESEARCH_CUTOFF_MS:
+            raise ScheduleCutoffViolationError(
+                f"segment {window.segment_index} block {window.block_index}: window_end_time_ms="
+                f"{window.window_end_time_ms} touches or crosses the immutable research cutoff "
+                f"({RESEARCH_CUTOFF_MS})."
+            )
+
+    ordered = sorted(schedule.windows, key=lambda w: w.window_start_time_ms)
+    for earlier, later in pairwise(ordered):
+        if earlier.window_end_time_ms > later.window_start_time_ms:
+            raise ScheduleOverlapError(
+                f"window (segment={earlier.segment_index}, block={earlier.block_index}) "
+                f"[{earlier.window_start_time_ms}, {earlier.window_end_time_ms}) overlaps window "
+                f"(segment={later.segment_index}, block={later.block_index}) "
+                f"[{later.window_start_time_ms}, {later.window_end_time_ms})."
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class CandidateFixedDurationResult:
     candidate_id: str
     family: str
@@ -141,6 +399,124 @@ class CandidateFixedDurationResult:
         )
 
 
+def _evaluate_duration_block(
+    segment: list[Candle],
+    seg_idx: int,
+    block_idx: int,
+    window_start_ms: int,
+    window_end_ms: int,
+    min_required: int,
+    strategy: CandidateStrategy,
+    risk_engine: RiskEngine,
+    broker: BacktestBroker,
+    config: AppConfig,
+    filters: SymbolFilters,
+    journal: Journal | None,
+    interval: str,
+    starting_equity: Decimal,
+    warnings: list[str],
+    strict: bool,
+) -> BlockResult:
+    open_times = [c.open_time_ms for c in segment]
+    start_idx = bisect.bisect_left(open_times, window_start_ms)
+    end_idx = bisect.bisect_left(open_times, window_end_ms, lo=start_idx)
+    # A schedule window built against a DIFFERENT (or since-changed) candle
+    # series can resolve to a segment that runs out of candles before the
+    # window's own declared end (e.g. a gap now truncates this "segment"
+    # earlier than the schedule assumed) - `bisect_left` would otherwise
+    # silently clamp `end_idx` to `len(segment)` and hand back a SHORTER,
+    # not-actually-full-duration block. Caught explicitly rather than ever
+    # silently under-filling a block.
+    window_runs_past_available_candles = end_idx == len(segment) and (
+        len(segment) == 0 or segment[-1].close_time_ms + 1 < window_end_ms
+    )
+
+    if end_idx <= start_idx or window_runs_past_available_candles:
+        if strict:
+            raise ScheduleWindowOutOfRangeError(
+                f"segment {seg_idx} block {block_idx}: scheduled window [{window_start_ms}, {window_end_ms}) "
+                "does not resolve to a valid, complete, non-empty candle range within this segment - this "
+                "segment either has no candle in this range at all, or runs out of candles (e.g. a "
+                "confirmed gap) before the window's own declared end."
+            )
+        warnings.append(f"segment {seg_idx} duration-block {block_idx}: empty candle range - skipped.")
+        return BlockResult(
+            block=BlockSpec(seg_idx, block_idx, None, 0, None, None, 0, skipped_reason="empty duration-block range"),
+            performance=None, diagnostics=None, extended=None, open_position=None,
+            ends_with_open_position=False, unresolved_pending_signal=None,
+        )
+
+    warm_up_start_idx = start_idx - (min_required - 1)
+    if warm_up_start_idx < 0:
+        raise InsufficientWarmUpForScheduleError(
+            f"this candidate requires {min_required} warm-up candle(s) but segment {seg_idx} block "
+            f"{block_idx}'s window starts only {start_idx} candle(s) into its own segment - a schedule "
+            "must be anchored using the LARGEST warm-up requirement among every candidate it is "
+            "applied to (see build_fixed_duration_schedule's anchor_warm_up_candles_required)."
+        )
+
+    window_slice = segment[warm_up_start_idx:end_idx]
+    result = run_segment(
+        window_slice, config, filters, strategy, risk_engine, broker, journal, min_required, starting_equity,
+        use_fixed_risk_reward_policy=True,
+    )
+    window_candles = segment[start_idx:end_idx]
+    buy_and_hold = compute_buy_and_hold_report(window_candles, starting_equity, config.fees.taker_fee_pct)
+    report = compute_performance_report(
+        result.trades, result.equity_curve, interval, config.backtest.min_trades_for_significance,
+        buy_and_hold=buy_and_hold,
+    )
+    window_end_time_ms = segment[end_idx - 1].close_time_ms
+    extended = compute_extended_diagnostics(
+        trades=result.trades,
+        equity_curve=result.equity_curve,
+        window_end_time_ms=window_end_time_ms,
+        starting_equity=starting_equity,
+        ending_cash_quote=result.diagnostics.ending_cash_quote,
+        ending_base_quantity=result.diagnostics.ending_base_quantity,
+        final_mark_price=segment[end_idx - 1].close,
+        reported_ending_equity=result.diagnostics.ending_equity,
+        open_position=result.open_position,
+        executed_entries=result.diagnostics.executed_entries,
+        buy_signals_generated=result.diagnostics.buy_signals_generated,
+        exposure_pct=report.exposure_pct,
+        total_return_pct=report.total_return_pct,
+        annualized_return_pct=report.annualized_return_pct,
+        max_drawdown_pct=report.max_drawdown_pct,
+        shutdown_activations=result.diagnostics.shutdown_activations,
+        rejected_entries_by_reason=result.diagnostics.rejected_entries_by_reason,
+    )
+
+    if report.low_trade_count_warning:
+        warnings.append(
+            f"segment {seg_idx} duration-block {block_idx}: only {report.trade_count} trade(s), below "
+            f"the configured significance threshold of {config.backtest.min_trades_for_significance}."
+        )
+    if result.pending_signal_note is not None:
+        warnings.append(f"segment {seg_idx} duration-block {block_idx}: {result.pending_signal_note}")
+
+    return BlockResult(
+        block=BlockSpec(
+            segment_index=seg_idx,
+            block_index=block_idx,
+            warm_up_start_time_ms=segment[warm_up_start_idx].open_time_ms,
+            warm_up_candle_count=min_required - 1,
+            window_start_time_ms=segment[start_idx].open_time_ms,
+            window_end_time_ms=window_end_time_ms,
+            candle_count=end_idx - start_idx,
+            skipped_reason=None,
+        ),
+        performance=report,
+        diagnostics=result.diagnostics,
+        extended=extended,
+        open_position=result.open_position,
+        ends_with_open_position=result.ends_with_open_position,
+        unresolved_pending_signal=result.pending_signal_note,
+        risk_reward=result.risk_reward,
+        trades=tuple(result.trades),
+    )
+
+
 def run_candidate_fixed_duration_evaluation(
     candidate: CandidateSpec,
     pre_cutoff_candles: list[Candle],
@@ -149,14 +525,31 @@ def run_candidate_fixed_duration_evaluation(
     journal: Journal | None = None,
     block_duration_days: int = DEFAULT_BLOCK_DURATION_DAYS,
     strategy: CandidateStrategy | None = None,
+    schedule: FixedDurationBlockSchedule | None = None,
 ) -> CandidateFixedDurationResult:
-    """Evaluate one FIXED candidate (no fitting, no selection) across every
-    gap-free segment of `pre_cutoff_candles`, in as many complete
-    `block_duration_days`-day blocks as each segment's own post-warm-up
-    duration allows. Raises `ResearchCutoffViolation` (via
-    `assert_pre_cutoff`) if `pre_cutoff_candles` contains anything at or
-    after the immutable research cutoff - checked here regardless of what
-    the caller already did, exactly like the original module.
+    """Evaluate one FIXED candidate (no fitting, no selection).
+
+    Two modes:
+
+    - `schedule=None` (default): independently derives this candidate's
+      OWN block boundaries, anchored at ITS OWN `min_required_candles` -
+      exactly the original per-candidate behavior. Correct when comparing
+      a candidate only against itself (e.g. `research/
+      sensitivity_comparison.py`'s nine-candidate report) - see the
+      module docstring's "SECOND FINDING" section for why this is WRONG
+      when two different candidates must be compared on identical dates.
+    - `schedule=<a FixedDurationBlockSchedule>`: every block's
+      `(window_start_time_ms, window_end_time_ms)` comes from the
+      schedule verbatim, identical for every candidate it is applied to.
+      This candidate still gets its OWN warm-up length preceding that
+      window - fails closed (`InsufficientWarmUpForScheduleError`) if its
+      own `min_required_candles` exceeds what the schedule was anchored
+      for.
+
+    Raises `ResearchCutoffViolation` (via `assert_pre_cutoff`) if
+    `pre_cutoff_candles` contains anything at or after the immutable
+    research cutoff - checked here regardless of what the caller already
+    did, exactly like the original module.
 
     `strategy`: normally omitted (built fresh via `candidate.build()`,
     exactly like the original module). Pass an already-built instance only
@@ -180,9 +573,6 @@ def run_candidate_fixed_duration_evaluation(
     broker = BacktestBroker(config.fees)
     starting_equity = Decimal(str(config.backtest.starting_equity))
 
-    blocks: list[BlockResult] = []
-    fragments: list[InsufficientDurationFragment] = []
-    leftovers: list[LeftoverPartialWindow] = []
     warnings: list[str] = []
 
     if not pre_cutoff_candles:
@@ -190,6 +580,30 @@ def run_candidate_fixed_duration_evaluation(
         return CandidateFixedDurationResult(candidate.candidate_id, candidate.family, candidate.params, warnings=warnings)
 
     segmentation = partition_into_segments(pre_cutoff_candles, interval)
+
+    if schedule is not None:
+        if schedule.block_duration_days != block_duration_days:
+            raise ScheduleDurationMismatchError(
+                f"schedule.block_duration_days={schedule.block_duration_days} != "
+                f"block_duration_days={block_duration_days} requested for this evaluation."
+            )
+        blocks = [
+            _evaluate_duration_block(
+                segmentation.segments[window.segment_index], window.segment_index, window.block_index,
+                window.window_start_time_ms, window.window_end_time_ms, min_required, strategy, risk_engine,
+                broker, config, filters, journal, interval, starting_equity, warnings, strict=True,
+            )
+            for window in schedule.windows
+        ]
+        return CandidateFixedDurationResult(
+            candidate_id=candidate.candidate_id, family=candidate.family, params=candidate.params,
+            blocks=blocks, fragments=list(schedule.fragments), leftovers=list(schedule.leftovers),
+            warnings=warnings,
+        )
+
+    blocks = []
+    fragments: list[InsufficientDurationFragment] = []
+    leftovers: list[LeftoverPartialWindow] = []
 
     for seg_idx, segment in enumerate(segmentation.segments):
         n = len(segment)
@@ -208,11 +622,9 @@ def run_candidate_fixed_duration_evaluation(
             continue
 
         first_tradable_idx = min_required - 1
-        open_times = [c.open_time_ms for c in segment]
-        tradable_start_ms = open_times[first_tradable_idx]
-        # +step_ms: the total covered span includes the LAST candle's own
-        # full duration, not just the gap between open timestamps.
-        total_tradable_span_ms = (open_times[-1] - tradable_start_ms) + step_ms
+        open_times, tradable_start_ms, total_tradable_span_ms = _segment_tradable_span(
+            segment, first_tradable_idx, step_ms
+        )
         possible_blocks = total_tradable_span_ms // block_duration_ms
 
         if possible_blocks == 0:
@@ -233,82 +645,11 @@ def run_candidate_fixed_duration_evaluation(
         for block_idx in range(possible_blocks):
             window_start_ms = tradable_start_ms + block_idx * block_duration_ms
             window_end_ms = window_start_ms + block_duration_ms
-            start_idx = bisect.bisect_left(open_times, window_start_ms, lo=first_tradable_idx)
-            end_idx = bisect.bisect_left(open_times, window_end_ms, lo=start_idx)
-            if end_idx <= start_idx:
-                warnings.append(f"segment {seg_idx} duration-block {block_idx}: empty candle range - skipped.")
-                blocks.append(
-                    BlockResult(
-                        block=BlockSpec(
-                            seg_idx, block_idx, None, 0, None, None, 0, skipped_reason="empty duration-block range"
-                        ),
-                        performance=None, diagnostics=None, extended=None, open_position=None,
-                        ends_with_open_position=False, unresolved_pending_signal=None,
-                    )
-                )
-                continue
-
-            warm_up_start_idx = start_idx - (min_required - 1)
-            window_slice = segment[warm_up_start_idx:end_idx]
-            result = run_segment(
-                window_slice, config, filters, strategy, risk_engine, broker, journal, min_required, starting_equity,
-                use_fixed_risk_reward_policy=True,
-            )
-            window_candles = segment[start_idx:end_idx]
-            buy_and_hold = compute_buy_and_hold_report(window_candles, starting_equity, config.fees.taker_fee_pct)
-            report = compute_performance_report(
-                result.trades, result.equity_curve, interval, config.backtest.min_trades_for_significance,
-                buy_and_hold=buy_and_hold,
-            )
-            window_end_time_ms = segment[end_idx - 1].close_time_ms
-            extended = compute_extended_diagnostics(
-                trades=result.trades,
-                equity_curve=result.equity_curve,
-                window_end_time_ms=window_end_time_ms,
-                starting_equity=starting_equity,
-                ending_cash_quote=result.diagnostics.ending_cash_quote,
-                ending_base_quantity=result.diagnostics.ending_base_quantity,
-                final_mark_price=segment[end_idx - 1].close,
-                reported_ending_equity=result.diagnostics.ending_equity,
-                open_position=result.open_position,
-                executed_entries=result.diagnostics.executed_entries,
-                buy_signals_generated=result.diagnostics.buy_signals_generated,
-                exposure_pct=report.exposure_pct,
-                total_return_pct=report.total_return_pct,
-                annualized_return_pct=report.annualized_return_pct,
-                max_drawdown_pct=report.max_drawdown_pct,
-                shutdown_activations=result.diagnostics.shutdown_activations,
-                rejected_entries_by_reason=result.diagnostics.rejected_entries_by_reason,
-            )
-
-            if report.low_trade_count_warning:
-                warnings.append(
-                    f"segment {seg_idx} duration-block {block_idx}: only {report.trade_count} trade(s), below "
-                    f"the configured significance threshold of {config.backtest.min_trades_for_significance}."
-                )
-            if result.pending_signal_note is not None:
-                warnings.append(f"segment {seg_idx} duration-block {block_idx}: {result.pending_signal_note}")
-
             blocks.append(
-                BlockResult(
-                    block=BlockSpec(
-                        segment_index=seg_idx,
-                        block_index=block_idx,
-                        warm_up_start_time_ms=segment[warm_up_start_idx].open_time_ms,
-                        warm_up_candle_count=min_required - 1,
-                        window_start_time_ms=segment[start_idx].open_time_ms,
-                        window_end_time_ms=window_end_time_ms,
-                        candle_count=end_idx - start_idx,
-                        skipped_reason=None,
-                    ),
-                    performance=report,
-                    diagnostics=result.diagnostics,
-                    extended=extended,
-                    open_position=result.open_position,
-                    ends_with_open_position=result.ends_with_open_position,
-                    unresolved_pending_signal=result.pending_signal_note,
-                    risk_reward=result.risk_reward,
-                    trades=tuple(result.trades),
+                _evaluate_duration_block(
+                    segment, seg_idx, block_idx, window_start_ms, window_end_ms, min_required, strategy,
+                    risk_engine, broker, config, filters, journal, interval, starting_equity, warnings,
+                    strict=False,
                 )
             )
 

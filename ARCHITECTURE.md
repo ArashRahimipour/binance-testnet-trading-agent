@@ -321,7 +321,18 @@ reach or influence any of that.
   pass/fail calculation. Reuses the SAME `run_segment` primitive, fixed
   1:2 risk/reward policy, and warm-up-never-trades mechanism; `CandidateFixedDurationResult.
   as_blocked_chronological_result()` lets the UNMODIFIED `scorecard.score_candidate`
-  be reused verbatim.
+  be reused verbatim. Its DEFAULT mode anchors each candidate's block 0
+  independently at ITS OWN `min_required_candles` - correct only when
+  comparing a candidate against itself, WRONG for comparing two DIFFERENT
+  candidates on "identical dates" (a real defect caught in commit
+  50a5a5b: D1's ~220-candle warm-up vs B1's ~21 anchored them on different
+  calendar dates despite a claimed identical-dates comparison). Passing
+  an explicit `FixedDurationBlockSchedule` (via `build_fixed_duration_schedule`,
+  ANCHORED using the LARGEST warm-up requirement among every candidate it
+  will be applied to) instead fixes every candidate's block windows to
+  the SAME timestamps - fail-closed on insufficient warm-up, a window
+  that can no longer resolve to a complete candle range (e.g. a gap),
+  wrong window duration, overlap, or a cutoff touch.
 - `research/sensitivity_comparison.py` - for a candidate, reproduces
   `round_1_original_evaluation` (calling the original, unmodified
   evaluation + scorecard functions directly - a label, never a
@@ -344,9 +355,13 @@ reach or influence any of that.
   untouched, pre-registered test. `research/round2_report.py` evaluates it
   ONLY on pre-cutoff data via the fixed-duration blocks, scored against
   the SAME unmodified scorecard thresholds, reused with `research/post_mortem.py`
-  for its detailed report, and separately re-runs the original
-  `breakout_B1` through the SAME fixed-duration blocks (identical block
-  dates) for a fair comparison that never alters B1's own round-1 status.
+  for its detailed report, and builds ONE shared `FixedDurationBlockSchedule`
+  (anchored at `max(d1_min_required, b1_min_required)`) passed to BOTH D1
+  and the original `breakout_B1` so both trade IDENTICAL block window
+  timestamps despite their very different warm-up requirements - a
+  runtime assertion (`_assert_identical_trading_windows`) re-verifies this
+  on every call rather than merely trusting it. Never alters B1's own
+  round-1 status.
 - `research/fingerprint.py` - deterministic SHA-256 fingerprints for
   reproducible candidate freezing: a strategy-implementation fingerprint
   (the candidate's own source module plus the shared causal

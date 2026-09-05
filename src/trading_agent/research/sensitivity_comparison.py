@@ -24,6 +24,25 @@ by importing or calling anything in this module.
 changes a candidate's original verdict and never creates a retroactive
 `RESEARCH_SURVIVOR` - see `SENSITIVITY_NON_BINDING_NOTE`, attached to
 every comparison.
+
+CROSS-CANDIDATE DATE DIVERGENCE (disclosed, not a defect here): this
+module still uses `run_candidate_fixed_duration_evaluation`'s DEFAULT,
+INDEPENDENT per-candidate anchoring (`schedule=None` - each candidate's
+own `min_required_candles` decides where its own block 0 starts). That is
+correct here, because every comparison this module makes is a candidate
+AGAINST ITSELF (`round_1_original_evaluation` vs `duration_normalized_
+sensitivity` for the SAME candidate_id) - it never needs two DIFFERENT
+candidates to share identical dates. Consequently, candidate A's
+`duration_normalized_sensitivity` blocks and candidate B's can legitimately
+fall on DIFFERENT calendar dates (a candidate with a longer warm-up
+requirement starts its block 0 later) - see `CROSS_CANDIDATE_DATE_
+DIVERGENCE_NOTE`. Never treat those per-candidate dates as comparable
+across candidates or as any kind of ranking; a comparison that genuinely
+needs two candidates to share identical trading windows (`research/
+round2_report.py`'s D1-vs-B1 comparison) instead builds ONE shared
+`fixed_duration_evaluation.FixedDurationBlockSchedule` and passes it to
+both - see that module for why independent per-candidate anchoring would
+be wrong there.
 """
 
 from __future__ import annotations
@@ -65,6 +84,17 @@ SENSITIVITY_NON_BINDING_NOTE = (
     "expectancy, stability across history) is sensitive to the block-construction methodology itself."
 )
 
+CROSS_CANDIDATE_DATE_DIVERGENCE_NOTE = (
+    "duration_normalized_sensitivity below uses INDEPENDENT, per-candidate block anchoring (this "
+    "candidate's own min_required_candles decides where its own block 0 starts) - correct for scoring "
+    "this ONE candidate against its own round_1_original_evaluation, but it means a DIFFERENT candidate's "
+    "duration_normalized_sensitivity blocks can fall on DIFFERENT calendar dates (a longer warm-up "
+    "requirement starts block 0 later). These per-candidate dates must NEVER be compared across "
+    "candidates or treated as an identical-date ranking - a comparison that genuinely needs two "
+    "candidates on identical dates (e.g. research/round2_report.py's D1-vs-B1) instead builds one "
+    "shared FixedDurationBlockSchedule (research/fixed_duration_evaluation.py) and passes it to both."
+)
+
 
 @dataclass(frozen=True, slots=True)
 class CandidateSensitivityComparison:
@@ -78,6 +108,7 @@ class CandidateSensitivityComparison:
     round_1_label: str = ROUND_1_LABEL
     methodology_note: str = SENSITIVITY_METHODOLOGY_NOTE
     non_binding_note: str = SENSITIVITY_NON_BINDING_NOTE
+    cross_candidate_date_divergence_note: str = CROSS_CANDIDATE_DATE_DIVERGENCE_NOTE
 
 
 def build_candidate_sensitivity_comparison(

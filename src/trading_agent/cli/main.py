@@ -850,6 +850,7 @@ def research_sensitivity_cmd(ctx: click.Context) -> None:
         )
         _print_scorecard_entry_summary(comparison.duration_normalized_sensitivity, indent="    ")
         click.echo(f"  {comparison.non_binding_note}")
+        click.echo(f"  {comparison.cross_candidate_date_divergence_note}")
         for fragment in comparison.fragments:
             click.echo(
                 f"  INSUFFICIENT-DURATION FRAGMENT: segment={fragment.segment_index} "
