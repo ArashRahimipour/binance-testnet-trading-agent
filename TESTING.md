@@ -1,6 +1,6 @@
 # Testing
 
-351 tests, all offline: nothing in the suite makes a real network call or
+415 tests, all offline: nothing in the suite makes a real network call or
 requires real credentials. HTTP is mocked with the `responses` library at
 the point where `requests` would otherwise reach the network; time-
 sensitive behavior is tested by passing explicit reference timestamps
@@ -72,6 +72,14 @@ ruff check src tests       # lint
 | An ending open position never becomes an invented closed trade (no fabricated exit price, fee, or timestamp) | `test_extended_diagnostics.py::test_no_invented_liquidation_for_an_ending_open_position` |
 | The test window is visibly marked already-consumed; train/validation are not | `test_extended_diagnostics.py::test_already_consumed_warning_only_on_test_window` |
 | Continuous-mode train/validation/test splits are scope-noted as whole-segment evidence, `overall` and independent segments/windows are not | `test_extended_diagnostics.py::test_scope_note_present_on_continuous_splits_but_not_overall` |
+| Immutable research cutoff (2025-05-16): rejects any dev/scoring run touching on-or-after-cutoff data; splits candles correctly | `tests/unit/test_research_cutoff.py` |
+| Frozen `ema_crossover_v0_1_rejected` baseline: reproduces exactly (ignores a caller's own strategy config), is the only path allowed to touch the consumed period | `tests/unit/test_research_frozen_baseline.py` |
+| Candidate families (trend+regime, breakout+vol-normalized, mean-reversion-in-range): causal/no-lookahead, correct entry/exit/regime-filter behavior, `InsufficientDataError`, correct `min_required_candles` | `tests/unit/test_research_candidates.py` |
+| Declared candidate registry: exactly 9 configurations, 3 per family, unique ids, all buildable | `test_research_candidates.py::test_total_candidate_count_is_nine`, `::test_registry_has_exactly_three_configurations_per_family`, `::test_registry_candidate_ids_are_unique` |
+| Walk-forward folds: cutoff enforcement, every fold reported (including zero-trade and skipped folds, never only the best), fold isolation (fresh risk state per fold), chronological non-overlapping boundaries, never crosses a confirmed gap, exchange-filter rejections surfaced, deterministic | `tests/unit/test_research_walk_forward.py` |
+| Scorecard: INSUFFICIENT_EVIDENCE / REJECTED (each criterion individually) / RESEARCH_SURVIVOR, forbidden-language check, multiple-testing warning, deterministic | `tests/unit/test_research_scorecard_and_freeze.py` |
+| Freeze: only a RESEARCH_SURVIVOR may be frozen, save/load round-trip, a frozen candidate's next test rejects any previously-observed candle | `test_research_scorecard_and_freeze.py::test_freeze_candidate_requires_research_survivor_status`, `::test_freeze_candidate_save_and_load_round_trip`, `::test_validate_future_paper_test_rejects_previously_observed_candles` |
+| `research-backtest` CLI: end-to-end (frozen baseline + all 9 candidates + scorecard printed), mode gating | `tests/unit/test_cli_commands.py::test_research_backtest_command_end_to_end`, `::test_research_backtest_command_requires_backtest_mode` |
 | `testnet-health`: GET-only, no order-placement capability reachable | `tests/unit/test_testnet_health.py::test_happy_path_passes_and_only_get_requests_occur`, `::test_testnet_health_module_never_references_place_market_order`, `::test_testnet_readonly_module_never_references_place_market_order`, `test_testnet_readonly.py::test_has_no_order_placing_method_at_all`, `::test_no_request_is_ever_a_post_put_patch_or_delete` |
 | `testnet-health`: no local state created or modified | `tests/unit/test_testnet_health.py::test_no_database_or_local_state_file_created_when_none_exists`, `::test_existing_local_state_is_not_modified`, `::test_pending_orders_reported_but_not_reconciled`, `test_execution_store.py::test_open_read_only_returns_none_and_creates_nothing_when_file_absent`, `::test_open_read_only_connection_rejects_writes` |
 | `testnet-health`: secrets/signatures never leak | `tests/unit/test_testnet_health.py::test_secret_never_appears_in_report_on_happy_path`, `::test_secret_never_appears_on_invalid_credentials_failure`, `::test_secret_never_appears_in_cli_stdout_or_stderr` |

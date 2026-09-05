@@ -38,6 +38,16 @@ from trading_agent.journal.journal import Journal
 from trading_agent.metrics.extended_report import ExtendedDiagnosticsReport
 from trading_agent.persistence.execution_store import ExecutionStateStore
 from trading_agent.persistence.risk_state_store import RiskStateStore
+from trading_agent.research.candidate_registry import CANDIDATE_REGISTRY, TOTAL_CANDIDATE_COUNT
+from trading_agent.research.cutoff import RESEARCH_CUTOFF_ISO, split_at_cutoff
+from trading_agent.research.freeze import freeze_candidate, save_frozen_candidate
+from trading_agent.research.frozen_baseline import reproduce_frozen_baseline_report
+from trading_agent.research.scorecard import ScorecardStatus, build_scorecard
+from trading_agent.research.walk_forward import (
+    CandidateWalkForwardResult,
+    FoldResult,
+    run_candidate_walk_forward,
+)
 from trading_agent.risk.kill_switch import KillSwitch
 from trading_agent.sizing.exchange_filters import SymbolFilters
 
@@ -421,6 +431,133 @@ def _print_extended_diagnostics(extended: ExtendedDiagnosticsReport, indent: str
 
     if extended.already_consumed_warning:
         click.echo(f"{indent}WARNING: {extended.already_consumed_warning}")
+
+
+@cli.command("research-backtest")
+@click.pass_context
+def research_backtest_cmd(ctx: click.Context) -> None:
+    """Leakage-resistant strategy-development research phase.
+
+    Reproduces the frozen, REJECTED v0.1 EMA baseline's report (unchanged,
+    for regression comparison only), then walk-forward-evaluates the
+    declared candidate registry (three families, a small fixed set of
+    configurations) using ONLY data strictly before the immutable research
+    cutoff (2025-05-16). The already-observed 2025-05-16..2026-09-04
+    period is never used to develop, filter, threshold, rank, or select
+    any candidate - see `research/cutoff.py`. Every fold of every
+    candidate is reported, never only the best. A RESEARCH_SURVIVOR is
+    automatically frozen (see `research/freeze.py`) so it cannot later be
+    "tested" again on data this run already saw.
+    """
+    config: AppConfig = ctx.obj["config"]
+    if config.mode != Mode.BACKTEST:
+        click.echo("The research-backtest command requires --mode backtest.", err=True)
+        sys.exit(1)
+
+    with CandleStore(config.paths.db_path) as store:
+        candles = store.get_candles(config.market.symbol, config.market.interval)
+    if not candles:
+        click.echo("No candles found. Run `fetch-data` first.", err=True)
+        sys.exit(1)
+
+    client = BinancePublicMarketDataClient(PRODUCTION_MARKET_DATA_HOST)
+    try:
+        filters = SymbolFilters.from_exchange_info(client.get_exchange_info(config.market.symbol))
+    except Exception as exc:  # noqa: BLE001 - surfaced to the user, then exit
+        click.echo(f"Failed to fetch exchange filters: {exc}", err=True)
+        sys.exit(1)
+
+    pre_cutoff, consumed = split_at_cutoff(candles)
+    click.echo(
+        f"research cutoff: {RESEARCH_CUTOFF_ISO}  pre_cutoff_candles={len(pre_cutoff)}  "
+        f"consumed_candles={len(consumed)} (already observed - reproduces the frozen baseline ONLY)"
+    )
+
+    journal_path = config.paths.data_dir / "journal.db"
+    with Journal(journal_path) as journal:
+        click.echo("\n=== FROZEN BASELINE (ema_crossover_v0_1_rejected) - regression reproduction only ===")
+        try:
+            frozen = reproduce_frozen_baseline_report(candles, config, filters, journal)
+        except ValueError as exc:
+            click.echo(f"Frozen baseline reproduction failed: {exc}", err=True)
+            sys.exit(1)
+        click.echo(f"verdict: {frozen.verdict}")
+
+        click.echo(
+            f"\n=== CANDIDATE DEVELOPMENT: {TOTAL_CANDIDATE_COUNT} declared configurations, "
+            "pre-cutoff data only ==="
+        )
+        if not pre_cutoff:
+            click.echo("No pre-cutoff candles available - cannot develop any candidate.", err=True)
+            sys.exit(1)
+
+        results: list[CandidateWalkForwardResult] = []
+        for spec in CANDIDATE_REGISTRY:
+            result = run_candidate_walk_forward(spec, pre_cutoff, config, filters, journal)
+            results.append(result)
+            click.echo(f"\n--- {spec.candidate_id} ({spec.family}) params={spec.params} ---")
+            for fold in result.folds:
+                _print_fold_result(fold)
+            for warning in result.warnings:
+                click.echo(f"  WARNING: {warning}", err=True)
+
+    scorecard = build_scorecard(results)
+    click.echo(f"\n=== SCORECARD ===\n{scorecard.multiple_testing_warning}\n")
+    frozen_dir = config.paths.data_dir / "research" / "frozen_candidates"
+    now_ms = int(time.time() * 1000)
+    freeze_boundary_ms = max([now_ms] + [c.close_time_ms for c in candles]) if candles else now_ms
+
+    for entry in scorecard.entries:
+        click.echo(f"{entry.candidate_id} ({entry.family}): status={entry.status.value}")
+        click.echo(
+            f"  total_trades={entry.total_trade_count} folds_with_a_trade={entry.folds_with_a_trade}/"
+            f"{entry.fold_count} median_fold_return_pct={entry.median_fold_return_pct} "
+            f"aggregate_realized_pnl_quote={entry.aggregate_realized_pnl_quote} "
+            f"worst_fold_return_pct={entry.worst_fold_return_pct} "
+            f"worst_fold_max_drawdown_pct={entry.worst_fold_max_drawdown_pct} "
+            f"positive_fold_fraction={entry.positive_fold_fraction} "
+            f"max_best_trade_contribution_pct={entry.max_best_trade_contribution_pct} "
+            f"mean_buy_and_hold_return_pct={entry.mean_buy_and_hold_return_pct}"
+        )
+        for criterion in entry.criteria:
+            click.echo(f"    [{'PASS' if criterion.passed else 'FAIL'}] {criterion.name}: {criterion.detail}")
+        click.echo(f"  {entry.caveat}")
+
+        if entry.status == ScorecardStatus.RESEARCH_SURVIVOR:
+            record = freeze_candidate(entry, frozen_at_ms=now_ms, freeze_boundary_ms=freeze_boundary_ms)
+            path = save_frozen_candidate(record, frozen_dir)
+            click.echo(
+                f"  FROZEN at {path} - next valid test requires candles with open_time_ms >= "
+                f"{freeze_boundary_ms} (i.e. genuinely new data, never data this run already saw)."
+            )
+
+    click.echo(
+        "\nNote: this is exploratory research on simulated fills over historical data, not a "
+        "claim of profitability and not approval for live or Testnet trading. REJECTED, "
+        "RESEARCH_SURVIVOR, and INSUFFICIENT_EVIDENCE are the only statuses this command ever "
+        "reports."
+    )
+
+
+def _print_fold_result(fold_result: FoldResult) -> None:
+    fold = fold_result.fold
+    if fold.skipped_reason is not None:
+        click.echo(f"  segment {fold.segment_index} fold {fold.fold_index}: SKIPPED - {fold.skipped_reason}")
+        return
+    report = fold_result.performance
+    assert report is not None
+    start_date = datetime.fromtimestamp(fold.window_start_time_ms / 1000, tz=UTC).date() if fold.window_start_time_ms else None
+    end_date = datetime.fromtimestamp(fold.window_end_time_ms / 1000, tz=UTC).date() if fold.window_end_time_ms else None
+    click.echo(
+        f"  segment {fold.segment_index} fold {fold.fold_index}: {start_date} to {end_date} "
+        f"({fold.candle_count} candles) trades={report.trade_count} "
+        f"return_pct={report.total_return_pct:.2f} max_drawdown_pct={report.max_drawdown_pct:.2f} "
+        f"buy_and_hold_pct={report.buy_and_hold_return_pct} "
+        f"ends_open_position={fold_result.ends_with_open_position}"
+    )
+    if fold_result.diagnostics is not None and fold_result.diagnostics.rejected_entries_by_reason:
+        reasons = ", ".join(f"{code}={count}" for code, count in sorted(fold_result.diagnostics.rejected_entries_by_reason.items()))
+        click.echo(f"    rejected_entries_by_reason (includes exchange-filter/min-notional rejections): {reasons}")
 
 
 @cli.command("run")

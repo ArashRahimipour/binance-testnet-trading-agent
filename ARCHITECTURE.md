@@ -231,6 +231,49 @@ never rank or select a configuration. `metrics/diagnostics.py` holds
 `backtest/engine.py` specifically so `extended_report.py` can depend on
 them without a circular import.
 
+## Research phase (`research/`): leakage-resistant candidate development
+
+`backtest/engine.py::run_segment` was made public (previously `_run_segment`)
+specifically so this package can reuse it unchanged - every candidate goes
+through the identical broker/fill/fee/slippage/sizing/risk-engine/
+accounting path the frozen baseline uses, via the narrow
+`strategy/base.py::SignalGenerator` protocol (`generate_signal(candles,
+current_position) -> Signal`, nothing else) - a candidate has no way to
+reach or influence any of that.
+
+- `research/cutoff.py` - `RESEARCH_CUTOFF_MS` (2025-05-16T00:00:00Z,
+  immutable) and `assert_pre_cutoff`, called at the entry point of every
+  development/scoring function so a caller mistake can never silently
+  score a candidate on already-observed data.
+- `research/frozen_baseline.py` - `ema_crossover_v0_1_rejected`, frozen
+  exactly as evaluated when rejected; `reproduce_frozen_baseline_report`
+  is the only function permitted to touch the consumed 2025-05-16..
+  2026-09-04 period, and takes no candidate parameter at all.
+- `research/candidates/` - three families (trend+regime filter,
+  volatility-normalized breakout, conservative mean reversion restricted
+  to non-trending regimes), each a `SignalGenerator` plus its own
+  `min_required_candles`. `indicators/volatility.py` (ATR, rolling std/
+  min/max, all causal) backs all three.
+- `research/candidate_registry.py` - exactly nine configurations (three
+  per family), a literal tuple declared before any evaluation runs - never
+  a grid search, optimizer, or ML selection.
+- `research/walk_forward.py` - gap-aware (`data/gap_detection.py::
+  partition_into_segments` - a fold never crosses a confirmed gap),
+  chronological, expanding-window folds per segment. Each fold is its own
+  independent `run_segment` call with a warm-up-prefixed slice (the exact
+  mechanism `run_independent_holdout_evaluation` already proved), so no
+  position or risk state of any kind crosses a fold boundary. Every fold
+  is appended to the result, including skipped and zero-trade ones -
+  nothing is ever trimmed to "the best fold."
+- `research/scorecard.py` - a fixed, pre-declared, rule-based pass/fail
+  test (never a ranking) producing exactly one of `REJECTED` /
+  `RESEARCH_SURVIVOR` / `INSUFFICIENT_EVIDENCE` per candidate, plus a
+  multiple-testing warning sized to the actual candidate count.
+- `research/freeze.py` - freezes a `RESEARCH_SURVIVOR` (candidate id/
+  params/scorecard + a forward-only boundary) and rejects, via
+  `validate_future_paper_test`, any attempt to "test" it again on a
+  candle that predates that boundary.
+
 ## Crash recovery, the pending-order state machine, and the atomic transaction boundary
 
 A process can die at any point: before sending an order, mid-HTTP-call, after

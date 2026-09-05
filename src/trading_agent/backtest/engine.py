@@ -142,7 +142,7 @@ from trading_agent.sizing.position_sizer import (
     compute_risk_based_buy_quantity,
     compute_sell_quantity,
 )
-from trading_agent.strategy.base import PositionSide, SignalType
+from trading_agent.strategy.base import PositionSide, SignalGenerator, SignalType
 from trading_agent.strategy.trend_baseline import EmaCrossoverTrendStrategy
 
 _MS_PER_DAY = 24 * 60 * 60 * 1000
@@ -296,7 +296,7 @@ class _LoopState:
 
 @dataclass
 class _DiagBuilder:
-    """Mutable diagnostics accumulator for one `_run_segment` call - frozen
+    """Mutable diagnostics accumulator for one `run_segment` call - frozen
     into a `RunDiagnostics` once the run completes."""
 
     buy_signals_generated: int = 0
@@ -318,7 +318,7 @@ class _DiagBuilder:
 
 
 @dataclass(frozen=True, slots=True)
-class _SegmentRunResult:
+class SegmentRunResult:
     trades: list[Trade]
     equity_curve: list[EquityPoint]
     ends_with_open_position: bool
@@ -369,7 +369,7 @@ def run_backtest(
     segment_reports: list[SegmentReport] = []
     warnings: list[str] = []
     unexecuted_final_signal: str | None = None
-    used_results: list[tuple[int, list[Candle], _SegmentRunResult]] = []
+    used_results: list[tuple[int, list[Candle], SegmentRunResult]] = []
 
     for seg_idx, segment in enumerate(raw_segments):
         is_last_segment = seg_idx == len(raw_segments) - 1
@@ -394,7 +394,7 @@ def run_backtest(
             )
             continue
 
-        result = _run_segment(segment, config, filters, strategy, risk_engine, broker, journal, min_required, starting_equity)
+        result = run_segment(segment, config, filters, strategy, risk_engine, broker, journal, min_required, starting_equity)
 
         if result.pending_signal_note is not None:
             if is_last_segment:
@@ -623,7 +623,7 @@ def run_independent_holdout_evaluation(
 
             warm_up_start_idx = start_idx - (min_required - 1)
             window_slice = segment[warm_up_start_idx:end_idx]
-            result = _run_segment(
+            result = run_segment(
                 window_slice, config, filters, strategy, risk_engine, broker, journal, min_required, starting_equity
             )
             window_candles = segment[start_idx:end_idx]
@@ -684,17 +684,17 @@ def _index_for_time(segment: list[Candle], time_ms: int, offset: int) -> int:
     return offset  # pragma: no cover - defensive; every trade time originates from this segment
 
 
-def _run_segment(
+def run_segment(
     segment: list[Candle],
     config: AppConfig,
     filters: SymbolFilters,
-    strategy: EmaCrossoverTrendStrategy,
+    strategy: SignalGenerator,
     risk_engine: RiskEngine,
     broker: BacktestBroker,
     journal: Journal | None,
     min_required: int,
     starting_equity: Decimal,
-) -> _SegmentRunResult:
+) -> SegmentRunResult:
     """Run one fully independent backtest over a single contiguous segment
     (or, from `run_independent_holdout_evaluation`, over one window's own
     warm-up-prefixed candle slice).
@@ -835,7 +835,7 @@ def _run_segment(
         ends_with_open_position=state.portfolio.position_side == PositionSide.LONG,
     )
 
-    return _SegmentRunResult(
+    return SegmentRunResult(
         trades=trades,
         equity_curve=equity_curve,
         ends_with_open_position=state.portfolio.position_side == PositionSide.LONG,

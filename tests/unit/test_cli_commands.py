@@ -90,6 +90,40 @@ def test_backtest_command_end_to_end(tmp_path):
     assert "not a claim of live profitability" in result.output
 
 
+@responses.activate
+def test_research_backtest_command_end_to_end(tmp_path):
+    config_path = _write_config(tmp_path)
+    # 60 candles: enough for the frozen baseline's ema_slow=50 warm-up
+    # (51) and for most declared candidates' own warm-up requirements.
+    rows = make_kline_series(START, INTERVAL, 60)
+    responses.add(responses.GET, f"{PROD_HOST}/api/v3/time", json={"serverTime": rows[-1][6] + 1}, status=200)
+    responses.add(responses.GET, f"{PROD_HOST}/api/v3/klines", json=rows, status=200)
+    fetch_result = CliRunner().invoke(cli, ["--config", config_path, "fetch-data", "--limit", "60"])
+    assert fetch_result.exit_code == 0, fetch_result.output
+
+    responses.add(
+        responses.GET, f"{PROD_HOST}/api/v3/exchangeInfo", json=make_exchange_info(min_notional="1"), status=200,
+    )
+    result = CliRunner().invoke(cli, ["--config", config_path, "research-backtest"])
+    assert result.exit_code == 0, result.output
+    assert "research cutoff: 2025-05-16T00:00:00Z" in result.output
+    assert "FROZEN BASELINE (ema_crossover_v0_1_rejected)" in result.output
+    assert "9 declared configurations" in result.output
+    assert "SCORECARD" in result.output
+    assert "candidates were evaluated together" in result.output
+    assert "REJECTED, RESEARCH_SURVIVOR, and INSUFFICIENT_EVIDENCE" in result.output
+    # every candidate id from the registry must appear (nothing hidden)
+    for spec_id in ("trend_regime_A1", "breakout_B1", "mean_reversion_C1"):
+        assert spec_id in result.output
+
+
+def test_research_backtest_command_requires_backtest_mode(tmp_path):
+    config_path = _write_config(tmp_path)
+    result = CliRunner().invoke(cli, ["--config", config_path, "--mode", "testnet", "research-backtest"])
+    assert result.exit_code != 0
+    assert "requires --mode backtest" in result.output
+
+
 def test_backtest_command_requires_backtest_mode(tmp_path):
     config_path = _write_config(tmp_path)
     result = CliRunner().invoke(cli, ["--config", config_path, "--mode", "testnet", "backtest"])

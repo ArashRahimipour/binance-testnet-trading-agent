@@ -11,6 +11,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Protocol, runtime_checkable
+
+from trading_agent.data.models import Candle
 
 
 class SignalType(str, Enum):
@@ -36,3 +39,29 @@ class Signal:
 
 class InsufficientDataError(Exception):
     """Raised when there are not enough completed candles to form a signal."""
+
+
+@runtime_checkable
+class SignalGenerator(Protocol):
+    """The ONLY interface the backtest engine (`backtest/engine.py::
+    run_segment`) requires of a strategy - a pure function of (completed
+    candles, current position) -> Signal. Deliberately narrow: a strategy
+    object implementing only this method has no way to reach the broker,
+    fill assumptions, fees, slippage, position sizing, the risk engine, or
+    accounting - all of that lives inside the engine and is never passed to
+    or reachable from a strategy. Both the frozen `EmaCrossoverTrendStrategy`
+    baseline and every research candidate (`research/candidates/`) satisfy
+    this structurally, without needing to inherit from it.
+    """
+
+    def generate_signal(self, candles: list[Candle], current_position: PositionSide) -> Signal: ...
+
+
+@runtime_checkable
+class CandidateStrategy(SignalGenerator, Protocol):
+    """A research candidate additionally declares its own required warm-up
+    length, so a generic walk-forward evaluator (`research/walk_forward.py`)
+    can size each candidate's warm-up correctly without hardcoding any
+    family's specific indicator periods."""
+
+    min_required_candles: int

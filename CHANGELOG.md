@@ -2,6 +2,84 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.0] - Leakage-resistant strategy-development research phase
+
+The v0.1 `ema_crossover_v0_1_rejected` baseline was formally REJECTED
+against its observed test window (headline return -1.22%, closed-trade
+bootstrap mean -9.67% [95% CI -21.65%/+3.75%], max drawdown 14.07%, max
+consecutive losses 7). Per that verdict, this release does not repair or
+tune the rejected strategy - it builds the next research phase: a new
+`trading-agent research-backtest` command with an immutable research
+cutoff, three new candidate strategy families, and gap-aware walk-forward
+development, entirely additive and never touching the existing `backtest`
+command's frozen baseline behavior. Adds 64 tests (351 -> 415 total).
+
+### Added
+
+- **Immutable research cutoff** (`research/cutoff.py::RESEARCH_CUTOFF_MS`,
+  2025-05-16T00:00:00Z): `assert_pre_cutoff` rejects any candidate
+  development/scoring run touching a candle at or after it; the consumed
+  2025-05-16..2026-09-04 period may only reproduce the frozen baseline's
+  own report (`research/frozen_baseline.py::reproduce_frozen_baseline_report`,
+  which takes no candidate parameter at all).
+- **Frozen baseline preservation**: `ema_crossover_v0_1_rejected`
+  (`FROZEN_BASELINE_STRATEGY_CONFIG`, ema_fast=20/ema_slow=50) and its
+  rejection verdict are preserved exactly for regression comparison,
+  ignoring whatever strategy config a caller happens to pass.
+- **A narrow strategy interface** (`strategy/base.py::SignalGenerator`,
+  `CandidateStrategy`): `backtest/engine.py::run_segment` (made public,
+  previously `_run_segment`) is reused unchanged for every candidate, so a
+  candidate object has no way to reach or influence the broker, fill
+  assumptions, fees, slippage, position sizing, the risk engine, or
+  accounting - it only ever returns a `Signal`.
+- **Three candidate families** (`research/candidates/`), backed by new
+  causal volatility indicators (`indicators/volatility.py`: ATR, rolling
+  std/min/max):
+  - Trend-following with a volatility/regime filter - an EMA crossover
+    gated on the fast/slow spread exceeding an ATR multiple.
+  - Breakout with volatility-normalized entry - a Donchian channel
+    breakout gated on the breakout distance exceeding an ATR multiple.
+  - Conservative mean reversion restricted to non-trending regimes - a
+    Bollinger Band dip-buy gated on a separate trend-strength filter,
+    which also forces an exit if a real trend emerges while holding.
+- **A small, fixed, declared candidate search space**
+  (`research/candidate_registry.py`): exactly nine configurations (three
+  per family), a literal tuple written before any candidate ever sees
+  data - never a grid search, genetic/Bayesian optimizer, or ML selection.
+- **Gap-aware, chronological, expanding-window walk-forward development**
+  (`research/walk_forward.py`): folds never cross a confirmed historical
+  gap; each fold is its own independent call into `run_segment` with a
+  warm-up-prefixed slice (warm-up candles never trade), so no position or
+  risk state of any kind crosses a fold boundary. Every fold is reported,
+  including zero-trade and skipped-too-small folds - never only the best.
+- **A rule-based robustness scorecard** (`research/scorecard.py`): fixed,
+  pre-declared pass/fail thresholds (positive median fold return, positive
+  aggregate realized PnL, no materially negative fold even if the
+  aggregate is positive, an acceptable max drawdown, limited dependence on
+  the single best trade, stability across folds) produce exactly one of
+  `REJECTED` / `RESEARCH_SURVIVOR` / `INSUFFICIENT_EVIDENCE` per candidate
+  - never "profitable" or "approved for live trading" - plus an explicit
+  multiple-testing warning against selection bias.
+- **Freezing a survivor** (`research/freeze.py`): a `RESEARCH_SURVIVOR` is
+  automatically frozen (candidate id/params/scorecard + a forward-only
+  boundary); `validate_future_paper_test` rejects any attempt to test it
+  again using a candle that predates that boundary - previously observed
+  data (development or consumed) can never become a new "untouched"
+  holdout for it.
+- `trading-agent research-backtest`: wires all of the above together,
+  printing every candidate's every fold (never hiding unsuccessful
+  results) and the full scorecard.
+
+### Unchanged, deliberately
+
+- No EMA period, entry/exit rule, fee, slippage, stop-loss, sizing, or
+  risk threshold was changed - this release only adds a new,
+  leakage-resistant research pathway alongside the existing, untouched
+  `backtest`/`research-backtest`-frozen-baseline behavior.
+- This phase implements no Testnet BUY, production execution, scheduling,
+  leverage, futures, short selling, forex, machine learning, news trading,
+  or copy trading - it is backtest-only research.
+
 ## [0.1.6] - Extended backtest diagnostics after the first real holdout result
 
 The first real run of v0.1.5's independent holdout evaluation against the

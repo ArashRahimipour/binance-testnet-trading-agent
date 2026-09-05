@@ -258,6 +258,79 @@ curve, never re-simulating or tuning anything:
   have been reported, with a warning against reusing it as an untouched
   final holdout for any future strategy selection.
 
+## Research phase: leakage-resistant strategy development
+
+The v0.1 `ema_crossover_v0_1_rejected` baseline (`strategy/trend_baseline.py`,
+frozen at ema_fast=20/ema_slow=50) was formally REJECTED against its
+observed test window (headline return -1.22%, closed-trade bootstrap mean
+-9.67%, max drawdown 14.07%, max consecutive losses 7 - see
+`research/frozen_baseline.py::FROZEN_BASELINE_VERDICT`). It is preserved
+exactly, unmodified, as a frozen regression point - never repaired, tuned,
+or reconsidered.
+
+```bash
+trading-agent research-backtest
+```
+
+This runs two things, in order, over the stored history:
+
+1. **Reproduces the frozen baseline's report** (`run_backtest` +
+   `run_independent_holdout_evaluation`, unchanged) over the FULL stored
+   history, including the already-observed 2025-05-16..2026-09-04 period -
+   the only thing in this codebase permitted to touch that period, since
+   it takes no candidate parameter at all.
+2. **Walk-forward develops nine declared candidates** - three simple,
+   economically-defensible families (trend-following with a volatility/
+   regime filter, breakout with volatility-normalized entry, conservative
+   mean reversion restricted to non-trending regimes -
+   `research/candidates/`) across a small, FIXED set of configurations
+   (`research/candidate_registry.py`) declared in code before any of them
+   ever sees data - never a grid search, optimizer, or ML selection - using
+   ONLY data strictly before the **immutable research cutoff**
+   (`research/cutoff.py::RESEARCH_CUTOFF_MS`, 2025-05-16T00:00:00Z). Any
+   attempt to develop or score a candidate on data at or after that
+   timestamp raises `ResearchCutoffViolation` outright.
+
+Each candidate is evaluated in gap-aware, chronological, expanding-window
+folds (`research/walk_forward.py`) - a confirmed historical gap always
+starts a new segment, folds never cross it; each fold's own indicator
+warm-up precedes it and never trades; no position or risk state of any
+kind carries from one fold to the next (every fold is its own independent
+call into the SAME `run_segment` primitive the frozen baseline uses, so a
+candidate has no way to reach or influence the broker, fill assumptions,
+fees, slippage, position sizing, the risk engine, or accounting - it only
+ever returns a `Signal`). Every fold is reported, including zero-trade and
+skipped folds - never only the best one.
+
+Each candidate then gets a **scorecard** (`research/scorecard.py`) - a
+rule-based, pre-declared pass/fail test (positive median fold return,
+positive aggregate realized PnL, no materially negative fold even if the
+aggregate is positive, an acceptable max drawdown, limited dependence on
+its single best trade, and stability across folds), never a "pick the
+best-performing candidate" ranking. The final status is always exactly one
+of:
+
+- **`REJECTED`** - failed at least one criterion (see the printed reasons).
+- **`RESEARCH_SURVIVOR`** - passed every criterion. **This is never a claim
+  of profitability or approval for live/Testnet trading.** It must be
+  frozen (`research/freeze.py`) before any further test - and it always is,
+  automatically, by this command - and its only valid next test is
+  genuinely new candles that arrive after this evaluation; previously
+  observed data (development or already-consumed) can never become a new
+  "untouched" holdout for it.
+- **`INSUFFICIENT_EVIDENCE`** - too few trades occurred to judge either way.
+
+A **multiple-testing warning** is always printed alongside the scorecard:
+evaluating nine candidates and reporting whichever looks best after the
+fact is a classic selection-bias trap - the scorecard's pass/fail
+thresholds are fixed and declared before scoring specifically to guard
+against this, and more than one (or none) of the nine may become a
+`RESEARCH_SURVIVOR`.
+
+This phase does not implement Testnet BUY, production execution,
+scheduling, leverage, futures, short selling, forex, machine learning,
+news trading, or copy trading - it is a backtest-only research tool.
+
 ## Running on the Spot Testnet
 
 ```bash
