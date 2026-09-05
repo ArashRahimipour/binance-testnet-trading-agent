@@ -5,8 +5,9 @@ textbook-standard parameter values (a classic Donchian 20/40/55 lookback
 set, MACD-style 12/26 EMA periods, a standard 20-period/2-std-dev
 Bollinger setup) BEFORE any of them were run against pre-cutoff data -
 never fitted, tuned, or adjusted against a result. This tuple is declared
-here, in code, and frozen before evaluation: `research/walk_forward.py`
-iterates over exactly this list and nothing else. There is no grid search,
+here, in code, and frozen before evaluation:
+`research/blocked_chronological_evaluation.py` iterates over exactly this
+list and nothing else. There is no grid search,
 no optimizer, no genetic/Bayesian search, and no machine learning anywhere
 in this module or its callers that could add, remove, or adjust an entry
 based on a result.

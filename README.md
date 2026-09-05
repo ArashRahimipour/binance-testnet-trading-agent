@@ -291,24 +291,43 @@ This runs two things, in order, over the stored history:
    attempt to develop or score a candidate on data at or after that
    timestamp raises `ResearchCutoffViolation` outright.
 
-Each candidate is evaluated in gap-aware, chronological, expanding-window
-folds (`research/walk_forward.py`) - a confirmed historical gap always
-starts a new segment, folds never cross it; each fold's own indicator
-warm-up precedes it and never trades; no position or risk state of any
-kind carries from one fold to the next (every fold is its own independent
-call into the SAME `run_segment` primitive the frozen baseline uses, so a
-candidate has no way to reach or influence the broker, fill assumptions,
-fees, slippage, position sizing, the risk engine, or accounting - it only
-ever returns a `Signal`). Every fold is reported, including zero-trade and
-skipped folds - never only the best one.
+Each candidate is evaluated with a **BLOCKED CHRONOLOGICAL EVALUATION**
+(`research/blocked_chronological_evaluation.py`) - renamed from
+"walk-forward" as a pre-real-evaluation code review correction, because
+that is NOT what this does: walk-forward optimization re-fits or
+re-selects a model on each successive expanding window, and nothing here
+fits, trains, or selects anything per block. Every candidate's parameters
+are fixed in `candidate_registry.py` before this module ever runs and stay
+identical across every block; the same one fixed candidate is simply
+independently re-run, unchanged, over successive non-overlapping
+chronological blocks of the same pre-cutoff data, purely as a robustness
+check. A confirmed historical gap always starts a new segment, blocks
+never cross it; each block's own indicator warm-up precedes it and never
+trades; no position or risk state of any kind carries from one block to
+the next (every block is its own independent call into the SAME
+`run_segment` primitive the frozen baseline uses, so a candidate has no
+way to reach or influence the broker, fill assumptions, fees, slippage,
+position sizing, the risk engine, or accounting - it only ever returns a
+`Signal`). Every block is reported, including zero-trade and skipped
+blocks - never only the best one.
 
 Each candidate then gets a **scorecard** (`research/scorecard.py`) - a
-rule-based, pre-declared pass/fail test (positive median fold return,
-positive aggregate realized PnL, no materially negative fold even if the
-aggregate is positive, an acceptable max drawdown, limited dependence on
-its single best trade, and stability across folds), never a "pick the
-best-performing candidate" ranking. The final status is always exactly one
-of:
+rule-based, pre-declared pass/fail test, scored on REALIZED closed-trade
+PnL only (normalized by each block's own starting equity) and never on
+marked-to-market total return, so an unfinished open position can never by
+itself make a block - or a candidate - pass: at least 30 total closed
+trades across at least 4 evaluated blocks, a positive median block
+realized return, a positive aggregate realized PnL, no materially negative
+block (worst block realized return >= -10%) even if the aggregate is
+positive, a max drawdown across blocks no worse than 15%, limited
+dependence on its single best trade (<= 50% of a positive block's PnL,
+and an undefined ratio never auto-passes), and at least 60% of blocks with
+positive realized PnL. Marked-to-market total return and its excess over
+buy-and-hold are still reported for every block for visibility, but are
+never a pass/fail input - beating buy-and-hold in every bullish block is
+never required; absolute profitability and drawdown control remain the
+primary bar. None of this is a "pick the best-performing candidate"
+ranking. The final status is always exactly one of:
 
 - **`REJECTED`** - failed at least one criterion (see the printed reasons).
 - **`RESEARCH_SURVIVOR`** - passed every criterion. **This is never a claim

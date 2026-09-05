@@ -10,6 +10,36 @@ choice, a ranking signal, or a deployment decision for any NEW candidate.
 The only thing it may ever be used for is reproducing the ALREADY-FROZEN
 baseline's own report (see `research/frozen_baseline.py`), which takes no
 candidate parameter at all - structurally incapable of scoring anything new.
+
+WHAT IS - AND IS NOT - THE SECURITY BOUNDARY HERE (pre-real-evaluation code
+review correction): `assert_pre_cutoff` is a plain runtime check, not an
+access-control mechanism - calling it is what makes a code path safe, and
+NOTHING enforces that every path calls it. In particular,
+`backtest/engine.py::run_segment` - the shared low-level simulation
+primitive every code path in this project eventually calls (the frozen
+baseline, the continuous backtest, the independent holdout evaluation, AND
+every research candidate) - is deliberately GENERIC: it accepts whatever
+candles it is given, with no cutoff check of its own, because it is also
+the correct and only tool for legitimately simulating the ALREADY-CONSUMED
+period (`research/frozen_baseline.py::reproduce_frozen_baseline_report`
+does exactly this, on purpose). `run_segment` is therefore NOT itself a
+security boundary and must never be treated as one.
+
+The actual boundary is enforced only at the OFFICIAL, higher-level
+candidate-scoring entry points, each of which calls `assert_pre_cutoff`
+(directly, or transitively through one that does) before any candle ever
+reaches a candidate:
+  - `research/blocked_chronological_evaluation.py::
+    run_candidate_blocked_chronological_evaluation` - asserts at its own
+    entry, regardless of what the caller already did.
+  - The `research-backtest` CLI command (`cli/main.py::
+    research_backtest_cmd`) - calls `split_at_cutoff` before ever handing
+    candles to a candidate, and every candidate run then goes through
+    `run_candidate_blocked_chronological_evaluation` above, which asserts
+    again independently.
+`tests/unit/test_research_cutoff.py` contains a source-scanning
+architectural test proving both of these facts hold for the actual code,
+not just for this docstring.
 """
 
 from __future__ import annotations

@@ -257,18 +257,34 @@ reach or influence any of that.
 - `research/candidate_registry.py` - exactly nine configurations (three
   per family), a literal tuple declared before any evaluation runs - never
   a grid search, optimizer, or ML selection.
-- `research/walk_forward.py` - gap-aware (`data/gap_detection.py::
-  partition_into_segments` - a fold never crosses a confirmed gap),
-  chronological, expanding-window folds per segment. Each fold is its own
-  independent `run_segment` call with a warm-up-prefixed slice (the exact
-  mechanism `run_independent_holdout_evaluation` already proved), so no
-  position or risk state of any kind crosses a fold boundary. Every fold
-  is appended to the result, including skipped and zero-trade ones -
-  nothing is ever trimmed to "the best fold."
+- `research/blocked_chronological_evaluation.py` - renamed from
+  "walk_forward.py" as a pre-real-evaluation code review correction: this
+  is NOT expanding-window walk-forward optimization, since nothing here
+  fits, trains, or re-selects anything per block - every candidate's
+  parameters are fixed in `candidate_registry.py` before this module ever
+  runs and stay identical across every block. Gap-aware
+  (`data/gap_detection.py::partition_into_segments` - a block never
+  crosses a confirmed gap), chronological, non-overlapping blocks per
+  segment. Each block is its own independent `run_segment` call with a
+  warm-up-prefixed slice (the exact mechanism
+  `run_independent_holdout_evaluation` already proved), so no position or
+  risk state of any kind crosses a block boundary. Every block is
+  appended to the result, including skipped and zero-trade ones - nothing
+  is ever trimmed to "the best block." Only the official entry points
+  (this module's `run_candidate_blocked_chronological_evaluation` and the
+  `research-backtest` CLI command) are required to fail closed at the
+  cutoff - the shared low-level `run_segment` primitive is generic and
+  accepts any candles given to it, so it is NOT itself a security
+  boundary (see `research/cutoff.py`'s own docstring).
 - `research/scorecard.py` - a fixed, pre-declared, rule-based pass/fail
   test (never a ranking) producing exactly one of `REJECTED` /
   `RESEARCH_SURVIVOR` / `INSUFFICIENT_EVIDENCE` per candidate, plus a
-  multiple-testing warning sized to the actual candidate count.
+  multiple-testing warning sized to the actual candidate count. Scored on
+  REALIZED closed-trade PnL only (normalized by each block's own starting
+  equity), never on marked-to-market total return, so an unfinished open
+  position can never by itself make a block - or a candidate - pass;
+  marked-to-market return and its excess over buy-and-hold are still
+  reported per block for visibility only.
 - `research/freeze.py` - freezes a `RESEARCH_SURVIVOR` (candidate id/
   params/scorecard + a forward-only boundary) and rejects, via
   `validate_future_paper_test`, any attempt to "test" it again on a

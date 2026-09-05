@@ -60,7 +60,9 @@ class SignalGenerator(Protocol):
 @runtime_checkable
 class CandidateStrategy(SignalGenerator, Protocol):
     """A research candidate additionally declares its own required warm-up
-    length, so a generic walk-forward evaluator (`research/walk_forward.py`)
+    length, so the generic blocked chronological evaluator
+    (`research/blocked_chronological_evaluation.py` - fixed parameters
+    re-run over successive history blocks, NOT walk-forward optimization)
     can size each candidate's warm-up correctly without hardcoding any
     family's specific indicator periods."""
 

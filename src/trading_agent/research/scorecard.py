@@ -1,4 +1,6 @@
-"""Rule-based robustness scorecard for a candidate's walk-forward result.
+"""Rule-based robustness scorecard for a candidate's blocked chronological
+evaluation result (`research/blocked_chronological_evaluation.py` - NOT
+walk-forward optimization; see that module's docstring).
 
 Every threshold here is DECLARED in code, fixed the same for all candidates
 in `candidate_registry.py`, BEFORE any candidate is scored - never fitted,
@@ -7,13 +9,23 @@ these fixed thresholds, never a "pick the best-performing candidate"
 ranking - see `MULTIPLE_TESTING_WARNING` for why that distinction matters.
 There is no ML, optimizer, or search of any kind in this module.
 
+Survivor status is scored on REALIZED closed-trade PnL only (`extended.
+pnl_breakdown.realized_closed_trade_pnl_quote`, normalized by each block's
+own starting equity) - NEVER on marked-to-market total return, which can
+include a large paper gain (or loss) on a position that is still open and
+could reverse before ever being realized. An unfinished, still-open
+position can therefore never by itself make a block - or a candidate -
+pass. Marked-to-market total return is still reported separately
+(`median_fold_marked_to_market_return_pct` etc.) for visibility, just never
+used as a pass/fail input.
+
 Final status is always exactly one of:
   - REJECTED - failed one or more pre-declared robustness criteria.
   - RESEARCH_SURVIVOR - passed every pre-declared robustness criterion.
     NEVER "profitable" or "approved for live trading" - see
     `RESEARCH_SURVIVOR_CAVEAT`. Must be frozen (`research/freeze.py`)
     before any further paper testing.
-  - INSUFFICIENT_EVIDENCE - too few trades across all folds to judge
+  - INSUFFICIENT_EVIDENCE - too few trades across all blocks to judge
     either way.
 """
 
@@ -24,7 +36,10 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
 
-from trading_agent.research.walk_forward import CandidateWalkForwardResult
+from trading_agent.research.blocked_chronological_evaluation import (
+    BlockResult,
+    CandidateBlockedChronologicalResult,
+)
 
 
 class ScorecardStatus(str, Enum):
@@ -34,30 +49,43 @@ class ScorecardStatus(str, Enum):
 
 
 # --- Declared, fixed robustness thresholds - see module docstring. ---
-MIN_TOTAL_TRADES_FOR_EVIDENCE = 15
-MIN_FOLDS_WITH_A_TRADE = 3
-MATERIALLY_NEGATIVE_FOLD_RETURN_PCT = -15.0
-MAX_ACCEPTABLE_DRAWDOWN_PCT = 25.0
-MAX_BEST_TRADE_CONTRIBUTION_PCT = 75.0
-MIN_POSITIVE_FOLD_FRACTION = 0.6
+MIN_TOTAL_TRADES_FOR_EVIDENCE = 30
+MIN_BLOCKS_WITH_A_TRADE = 4
+MAX_ACCEPTABLE_DRAWDOWN_PCT = 15.0
+MATERIALLY_NEGATIVE_BLOCK_REALIZED_RETURN_PCT = -10.0
+MAX_BEST_TRADE_CONTRIBUTION_PCT = 50.0
+MIN_POSITIVE_REALIZED_PNL_BLOCK_FRACTION = 0.6
 
 RESEARCH_SURVIVOR_CAVEAT = (
-    "RESEARCH_SURVIVOR means this candidate passed every pre-declared robustness threshold on "
-    "PRE-CUTOFF development data. It is NOT a claim of profitability and NOT approval for live "
-    "or Testnet trading. It has not been tested on any data after the research cutoff, must be "
-    "frozen before any further test (see research/freeze.py), and its only valid next test is "
-    "genuinely new candles arriving after this evaluation - never previously observed data."
+    "RESEARCH_SURVIVOR means this candidate passed every pre-declared robustness threshold, "
+    "scored on REALIZED closed-trade PnL only, on PRE-CUTOFF development data. It is NOT a claim "
+    "of profitability and NOT approval for live or Testnet trading. It has not been tested on any "
+    "data after the research cutoff, must be frozen before any further test (see "
+    "research/freeze.py), and its only valid next test is genuinely new candles arriving after "
+    "this evaluation - never previously observed data."
 )
 
 INSUFFICIENT_EVIDENCE_CAVEAT = (
-    "Too few trades occurred across too few folds to judge this candidate's robustness either "
+    "Too few trades occurred across too few blocks to judge this candidate's robustness either "
     "way. This is NOT a pass, and it is not evidence of a working strategy - it means the "
-    "declared entry conditions rarely fired on this data."
+    "declared entry conditions rarely fired on this data. Zero trades is always insufficient "
+    "evidence, regardless of any other figure."
 )
 
 REJECTED_CAVEAT = (
     "REJECTED means this candidate failed at least one pre-declared robustness criterion on "
     "pre-cutoff development data. See `reasons` for exactly which one(s)."
+)
+
+BENCHMARK_NOTE = (
+    "excess_return_pct (strategy total marked-to-market return minus buy-and-hold return, same "
+    "block/dates) is reported for every block, along with the median across blocks, purely for "
+    "visibility - it is NEVER a pass/fail criterion, and beating buy-and-hold in every bullish "
+    "block is never required. Absolute profitability and drawdown control remain the primary "
+    "bar: a risk-managed strategy's job is capital preservation and a smoother realized equity "
+    "curve, not outrunning a passive holding during a strong rally - a candidate that loses less "
+    "than buy-and-hold in a crash, or forgoes some upside in a rally while controlling drawdown, "
+    "is doing its job even with a negative median excess return."
 )
 
 
@@ -89,88 +117,127 @@ class ScorecardEntry:
     criteria: list[CriterionResult]
     reasons: list[str]  # detail of every FAILED criterion only, for a quick read
     total_trade_count: int
-    folds_with_a_trade: int
-    fold_count: int
-    median_fold_return_pct: float | None
+    blocks_with_a_trade: int
+    block_count: int
+    # --- Realized-PnL-based figures actually used for scoring. ---
+    median_block_realized_return_pct: float | None
+    worst_block_realized_return_pct: float | None
     aggregate_realized_pnl_quote: Decimal
-    worst_fold_return_pct: float | None
-    worst_fold_max_drawdown_pct: float | None
-    positive_fold_fraction: float | None
+    positive_realized_pnl_block_fraction: float | None
     max_best_trade_contribution_pct: float | None
-    mean_buy_and_hold_return_pct: float | None
+    # --- Reported for visibility only - never used for survivor status. ---
+    worst_block_max_drawdown_pct: float | None
+    median_block_marked_to_market_return_pct: float | None
+    median_excess_return_vs_buy_and_hold_pct: float | None
+    benchmark_note: str
     caveat: str
 
 
-def score_candidate(result: CandidateWalkForwardResult) -> ScorecardEntry:
-    evaluated = [f for f in result.folds if f.performance is not None]
-    total_trades = sum(f.performance.trade_count for f in evaluated if f.performance is not None)
-    folds_with_a_trade = sum(1 for f in evaluated if f.performance is not None and f.performance.trade_count > 0)
+def _realized_return_pct(block: BlockResult) -> float:
+    """REALIZED closed-trade PnL as a percentage of the block's own
+    starting equity - never marked-to-market, so an unfinished open
+    position never contributes. Falls back to 0.0 (neither a pass nor a
+    materially-negative signal) for a block with no usable data."""
+    if block.extended is None or block.performance is None:
+        return 0.0
+    starting_equity = block.performance.starting_equity
+    if starting_equity <= 0:
+        return 0.0
+    return float(block.extended.pnl_breakdown.realized_closed_trade_pnl_quote / starting_equity * 100)
 
-    evidence_ok = total_trades >= MIN_TOTAL_TRADES_FOR_EVIDENCE and folds_with_a_trade >= MIN_FOLDS_WITH_A_TRADE
+
+def _excess_return_pct(block: BlockResult) -> float | None:
+    """Strategy total (marked-to-market) return minus buy-and-hold return
+    over the exact same block - reported for visibility only, see
+    `BENCHMARK_NOTE`."""
+    if block.performance is None or block.performance.buy_and_hold_return_pct is None:
+        return None
+    return block.performance.total_return_pct - block.performance.buy_and_hold_return_pct
+
+
+def score_candidate(result: CandidateBlockedChronologicalResult) -> ScorecardEntry:
+    evaluated = [b for b in result.blocks if b.performance is not None]
+    total_trades = sum(b.performance.trade_count for b in evaluated if b.performance is not None)
+    blocks_with_a_trade = sum(1 for b in evaluated if b.performance is not None and b.performance.trade_count > 0)
+
+    evidence_ok = total_trades >= MIN_TOTAL_TRADES_FOR_EVIDENCE and blocks_with_a_trade >= MIN_BLOCKS_WITH_A_TRADE
     if not evidence_ok:
         detail = (
             f"total_trades={total_trades} (need >= {MIN_TOTAL_TRADES_FOR_EVIDENCE}), "
-            f"folds_with_a_trade={folds_with_a_trade} (need >= {MIN_FOLDS_WITH_A_TRADE})"
+            f"blocks_with_a_trade={blocks_with_a_trade} (need >= {MIN_BLOCKS_WITH_A_TRADE})"
         )
         criteria = [CriterionResult("sufficient_evidence", False, detail)]
         return ScorecardEntry(
             candidate_id=result.candidate_id, family=result.family, params=result.params,
             status=ScorecardStatus.INSUFFICIENT_EVIDENCE, criteria=criteria, reasons=[detail],
-            total_trade_count=total_trades, folds_with_a_trade=folds_with_a_trade, fold_count=len(evaluated),
-            median_fold_return_pct=None, aggregate_realized_pnl_quote=Decimal(0),
-            worst_fold_return_pct=None, worst_fold_max_drawdown_pct=None, positive_fold_fraction=None,
-            max_best_trade_contribution_pct=None, mean_buy_and_hold_return_pct=None,
-            caveat=INSUFFICIENT_EVIDENCE_CAVEAT,
+            total_trade_count=total_trades, blocks_with_a_trade=blocks_with_a_trade, block_count=len(evaluated),
+            median_block_realized_return_pct=None, worst_block_realized_return_pct=None,
+            aggregate_realized_pnl_quote=Decimal(0), positive_realized_pnl_block_fraction=None,
+            max_best_trade_contribution_pct=None, worst_block_max_drawdown_pct=None,
+            median_block_marked_to_market_return_pct=None, median_excess_return_vs_buy_and_hold_pct=None,
+            benchmark_note=BENCHMARK_NOTE, caveat=INSUFFICIENT_EVIDENCE_CAVEAT,
         )
 
-    fold_returns = [f.performance.total_return_pct for f in evaluated if f.performance is not None]
-    fold_drawdowns = [f.performance.max_drawdown_pct for f in evaluated if f.performance is not None]
-    median_fold_return = statistics.median(fold_returns)
-    worst_fold_return = min(fold_returns)
-    worst_fold_dd = max(fold_drawdowns)
-    positive_fraction = sum(1 for r in fold_returns if r > 0) / len(fold_returns)
+    realized_returns = [_realized_return_pct(b) for b in evaluated]
+    median_realized_return = statistics.median(realized_returns)
+    worst_realized_return = min(realized_returns)
+    positive_realized_fraction = sum(1 for r in realized_returns if r > 0) / len(realized_returns)
     aggregate_realized = sum(
-        (f.extended.pnl_breakdown.realized_closed_trade_pnl_quote for f in evaluated if f.extended is not None),
+        (b.extended.pnl_breakdown.realized_closed_trade_pnl_quote for b in evaluated if b.extended is not None),
         Decimal(0),
     )
-    best_trade_contributions = [
-        f.extended.trade_distribution.best_trade_contribution_pct
-        for f in evaluated
-        if f.extended is not None and f.extended.trade_distribution is not None
-        and f.extended.trade_distribution.best_trade_contribution_pct is not None
+    worst_block_dd = max(b.performance.max_drawdown_pct for b in evaluated if b.performance is not None)
+    mtm_returns = [b.performance.total_return_pct for b in evaluated if b.performance is not None]
+    median_mtm_return = statistics.median(mtm_returns) if mtm_returns else None
+    excess_returns = [e for e in (_excess_return_pct(b) for b in evaluated) if e is not None]
+    median_excess_return = statistics.median(excess_returns) if excess_returns else None
+
+    # Best-trade dependence is only meaningful for a block that actually
+    # made money overall - a losing block's "contribution ratio" (a
+    # positive trade divided by a negative total) is not a dependence
+    # signal, so it is excluded rather than passed through. If NO block
+    # ever had a positive, well-defined contribution ratio, this is
+    # undefined and therefore FAILS (never auto-passes on undefined).
+    positive_block_contributions = [
+        b.extended.trade_distribution.best_trade_contribution_pct
+        for b in evaluated
+        if b.extended is not None and b.extended.trade_distribution is not None
+        and b.extended.trade_distribution.best_trade_contribution_pct is not None
+        and b.extended.pnl_breakdown.realized_closed_trade_pnl_quote > 0
     ]
-    max_best_trade_contribution = max(best_trade_contributions) if best_trade_contributions else None
-    bh_returns = [
-        f.performance.buy_and_hold_return_pct for f in evaluated
-        if f.performance is not None and f.performance.buy_and_hold_return_pct is not None
-    ]
-    mean_bh = sum(bh_returns) / len(bh_returns) if bh_returns else None
+    max_best_trade_contribution = max(positive_block_contributions) if positive_block_contributions else None
+    best_trade_dependence_passed = (
+        max_best_trade_contribution is not None and max_best_trade_contribution <= MAX_BEST_TRADE_CONTRIBUTION_PCT
+    )
 
     criteria = [
         CriterionResult(
-            "positive_median_fold_return", median_fold_return > 0,
-            f"median_fold_return_pct={median_fold_return:.2f} (need > 0)",
+            "positive_median_block_realized_return", median_realized_return > 0,
+            f"median_block_realized_return_pct={median_realized_return:.2f} (need > 0)",
         ),
         CriterionResult(
             "positive_aggregate_realized_pnl", aggregate_realized > 0,
             f"aggregate_realized_pnl_quote={aggregate_realized} (need > 0)",
         ),
         CriterionResult(
-            "no_materially_negative_fold", worst_fold_return >= MATERIALLY_NEGATIVE_FOLD_RETURN_PCT,
-            f"worst_fold_return_pct={worst_fold_return:.2f} (need >= {MATERIALLY_NEGATIVE_FOLD_RETURN_PCT})",
+            "no_materially_negative_block",
+            worst_realized_return >= MATERIALLY_NEGATIVE_BLOCK_REALIZED_RETURN_PCT,
+            f"worst_block_realized_return_pct={worst_realized_return:.2f} "
+            f"(need >= {MATERIALLY_NEGATIVE_BLOCK_REALIZED_RETURN_PCT})",
         ),
         CriterionResult(
-            "acceptable_max_drawdown", worst_fold_dd <= MAX_ACCEPTABLE_DRAWDOWN_PCT,
-            f"worst_fold_max_drawdown_pct={worst_fold_dd:.2f} (need <= {MAX_ACCEPTABLE_DRAWDOWN_PCT})",
+            "acceptable_max_drawdown", worst_block_dd <= MAX_ACCEPTABLE_DRAWDOWN_PCT,
+            f"worst_block_max_drawdown_pct={worst_block_dd:.2f} (need <= {MAX_ACCEPTABLE_DRAWDOWN_PCT})",
         ),
         CriterionResult(
-            "limited_best_trade_dependence",
-            max_best_trade_contribution is None or max_best_trade_contribution <= MAX_BEST_TRADE_CONTRIBUTION_PCT,
-            f"max_best_trade_contribution_pct={max_best_trade_contribution} (need <= {MAX_BEST_TRADE_CONTRIBUTION_PCT} or undefined)",
+            "limited_best_trade_dependence", best_trade_dependence_passed,
+            f"max_best_trade_contribution_pct={max_best_trade_contribution} "
+            f"(need a defined value <= {MAX_BEST_TRADE_CONTRIBUTION_PCT} - undefined never passes)",
         ),
         CriterionResult(
-            "stable_across_folds", positive_fraction >= MIN_POSITIVE_FOLD_FRACTION,
-            f"positive_fold_fraction={positive_fraction:.2f} (need >= {MIN_POSITIVE_FOLD_FRACTION})",
+            "stable_across_blocks", positive_realized_fraction >= MIN_POSITIVE_REALIZED_PNL_BLOCK_FRACTION,
+            f"positive_realized_pnl_block_fraction={positive_realized_fraction:.2f} "
+            f"(need >= {MIN_POSITIVE_REALIZED_PNL_BLOCK_FRACTION})",
         ),
     ]
     failed = [c.detail for c in criteria if not c.passed]
@@ -179,11 +246,13 @@ def score_candidate(result: CandidateWalkForwardResult) -> ScorecardEntry:
     return ScorecardEntry(
         candidate_id=result.candidate_id, family=result.family, params=result.params,
         status=status, criteria=criteria, reasons=failed,
-        total_trade_count=total_trades, folds_with_a_trade=folds_with_a_trade, fold_count=len(evaluated),
-        median_fold_return_pct=median_fold_return, aggregate_realized_pnl_quote=aggregate_realized,
-        worst_fold_return_pct=worst_fold_return, worst_fold_max_drawdown_pct=worst_fold_dd,
-        positive_fold_fraction=positive_fraction, max_best_trade_contribution_pct=max_best_trade_contribution,
-        mean_buy_and_hold_return_pct=mean_bh,
+        total_trade_count=total_trades, blocks_with_a_trade=blocks_with_a_trade, block_count=len(evaluated),
+        median_block_realized_return_pct=median_realized_return, worst_block_realized_return_pct=worst_realized_return,
+        aggregate_realized_pnl_quote=aggregate_realized, positive_realized_pnl_block_fraction=positive_realized_fraction,
+        max_best_trade_contribution_pct=max_best_trade_contribution, worst_block_max_drawdown_pct=worst_block_dd,
+        median_block_marked_to_market_return_pct=median_mtm_return,
+        median_excess_return_vs_buy_and_hold_pct=median_excess_return,
+        benchmark_note=BENCHMARK_NOTE,
         caveat=RESEARCH_SURVIVOR_CAVEAT if status == ScorecardStatus.RESEARCH_SURVIVOR else REJECTED_CAVEAT,
     )
 
@@ -194,6 +263,6 @@ class Scorecard:
     multiple_testing_warning: str = ""
 
 
-def build_scorecard(results: list[CandidateWalkForwardResult]) -> Scorecard:
+def build_scorecard(results: list[CandidateBlockedChronologicalResult]) -> Scorecard:
     entries = [score_candidate(r) for r in results]
     return Scorecard(entries=entries, multiple_testing_warning=multiple_testing_warning(len(results)))

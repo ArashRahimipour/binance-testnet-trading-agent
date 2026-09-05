@@ -38,16 +38,16 @@ from trading_agent.journal.journal import Journal
 from trading_agent.metrics.extended_report import ExtendedDiagnosticsReport
 from trading_agent.persistence.execution_store import ExecutionStateStore
 from trading_agent.persistence.risk_state_store import RiskStateStore
+from trading_agent.research.blocked_chronological_evaluation import (
+    BlockResult,
+    CandidateBlockedChronologicalResult,
+    run_candidate_blocked_chronological_evaluation,
+)
 from trading_agent.research.candidate_registry import CANDIDATE_REGISTRY, TOTAL_CANDIDATE_COUNT
 from trading_agent.research.cutoff import RESEARCH_CUTOFF_ISO, split_at_cutoff
 from trading_agent.research.freeze import freeze_candidate, save_frozen_candidate
 from trading_agent.research.frozen_baseline import reproduce_frozen_baseline_report
 from trading_agent.research.scorecard import ScorecardStatus, build_scorecard
-from trading_agent.research.walk_forward import (
-    CandidateWalkForwardResult,
-    FoldResult,
-    run_candidate_walk_forward,
-)
 from trading_agent.risk.kill_switch import KillSwitch
 from trading_agent.sizing.exchange_filters import SymbolFilters
 
@@ -439,15 +439,18 @@ def research_backtest_cmd(ctx: click.Context) -> None:
     """Leakage-resistant strategy-development research phase.
 
     Reproduces the frozen, REJECTED v0.1 EMA baseline's report (unchanged,
-    for regression comparison only), then walk-forward-evaluates the
-    declared candidate registry (three families, a small fixed set of
-    configurations) using ONLY data strictly before the immutable research
-    cutoff (2025-05-16). The already-observed 2025-05-16..2026-09-04
-    period is never used to develop, filter, threshold, rank, or select
-    any candidate - see `research/cutoff.py`. Every fold of every
-    candidate is reported, never only the best. A RESEARCH_SURVIVOR is
-    automatically frozen (see `research/freeze.py`) so it cannot later be
-    "tested" again on data this run already saw.
+    for regression comparison only), then runs a BLOCKED CHRONOLOGICAL
+    EVALUATION (see `research/blocked_chronological_evaluation.py` - this
+    is NOT walk-forward optimization; every candidate's parameters are
+    fixed before this command ever runs and nothing is fitted or selected
+    per block) of the declared candidate registry (three families, a
+    small fixed set of configurations) using ONLY data strictly before the
+    immutable research cutoff (2025-05-16). The already-observed
+    2025-05-16..2026-09-04 period is never used to develop, filter,
+    threshold, rank, or select any candidate - see `research/cutoff.py`.
+    Every block of every candidate is reported, never only the best. A
+    RESEARCH_SURVIVOR is automatically frozen (see `research/freeze.py`)
+    so it cannot later be "tested" again on data this run already saw.
     """
     config: AppConfig = ctx.obj["config"]
     if config.mode != Mode.BACKTEST:
@@ -491,13 +494,14 @@ def research_backtest_cmd(ctx: click.Context) -> None:
             click.echo("No pre-cutoff candles available - cannot develop any candidate.", err=True)
             sys.exit(1)
 
-        results: list[CandidateWalkForwardResult] = []
+        candidate_by_id = {spec.candidate_id: spec for spec in CANDIDATE_REGISTRY}
+        results: list[CandidateBlockedChronologicalResult] = []
         for spec in CANDIDATE_REGISTRY:
-            result = run_candidate_walk_forward(spec, pre_cutoff, config, filters, journal)
+            result = run_candidate_blocked_chronological_evaluation(spec, pre_cutoff, config, filters, journal)
             results.append(result)
             click.echo(f"\n--- {spec.candidate_id} ({spec.family}) params={spec.params} ---")
-            for fold in result.folds:
-                _print_fold_result(fold)
+            for block in result.blocks:
+                _print_block_result(block)
             for warning in result.warnings:
                 click.echo(f"  WARNING: {warning}", err=True)
 
@@ -510,25 +514,38 @@ def research_backtest_cmd(ctx: click.Context) -> None:
     for entry in scorecard.entries:
         click.echo(f"{entry.candidate_id} ({entry.family}): status={entry.status.value}")
         click.echo(
-            f"  total_trades={entry.total_trade_count} folds_with_a_trade={entry.folds_with_a_trade}/"
-            f"{entry.fold_count} median_fold_return_pct={entry.median_fold_return_pct} "
+            f"  total_trades={entry.total_trade_count} blocks_with_a_trade={entry.blocks_with_a_trade}/"
+            f"{entry.block_count} median_block_realized_return_pct={entry.median_block_realized_return_pct} "
             f"aggregate_realized_pnl_quote={entry.aggregate_realized_pnl_quote} "
-            f"worst_fold_return_pct={entry.worst_fold_return_pct} "
-            f"worst_fold_max_drawdown_pct={entry.worst_fold_max_drawdown_pct} "
-            f"positive_fold_fraction={entry.positive_fold_fraction} "
-            f"max_best_trade_contribution_pct={entry.max_best_trade_contribution_pct} "
-            f"mean_buy_and_hold_return_pct={entry.mean_buy_and_hold_return_pct}"
+            f"worst_block_realized_return_pct={entry.worst_block_realized_return_pct} "
+            f"worst_block_max_drawdown_pct={entry.worst_block_max_drawdown_pct} "
+            f"positive_realized_pnl_block_fraction={entry.positive_realized_pnl_block_fraction} "
+            f"max_best_trade_contribution_pct={entry.max_best_trade_contribution_pct}"
         )
+        click.echo(
+            f"  (marked-to-market, reported only) median_block_marked_to_market_return_pct="
+            f"{entry.median_block_marked_to_market_return_pct} median_excess_return_vs_buy_and_hold_pct="
+            f"{entry.median_excess_return_vs_buy_and_hold_pct}"
+        )
+        click.echo(f"  {entry.benchmark_note}")
         for criterion in entry.criteria:
             click.echo(f"    [{'PASS' if criterion.passed else 'FAIL'}] {criterion.name}: {criterion.detail}")
         click.echo(f"  {entry.caveat}")
 
         if entry.status == ScorecardStatus.RESEARCH_SURVIVOR:
-            record = freeze_candidate(entry, frozen_at_ms=now_ms, freeze_boundary_ms=freeze_boundary_ms)
+            spec = candidate_by_id[entry.candidate_id]
+            record = freeze_candidate(
+                entry, frozen_at_ms=now_ms, freeze_boundary_ms=freeze_boundary_ms,
+                candidate=spec, config=config, filters=filters,
+            )
             path = save_frozen_candidate(record, frozen_dir)
             click.echo(
-                f"  FROZEN at {path} - next valid test requires candles with open_time_ms >= "
-                f"{freeze_boundary_ms} (i.e. genuinely new data, never data this run already saw)."
+                f"  FROZEN at {path} (candidate_version={record.candidate_version}, "
+                f"source_commit_hash={record.source_commit_hash}) - next valid test requires candles "
+                f"with open_time_ms >= {freeze_boundary_ms} (i.e. genuinely new data, never data this "
+                "run already saw) AND must pass "
+                "freeze.assert_frozen_candidate_matches_current_implementation (fails closed on any "
+                "strategy/config drift)."
             )
 
     click.echo(
@@ -539,24 +556,31 @@ def research_backtest_cmd(ctx: click.Context) -> None:
     )
 
 
-def _print_fold_result(fold_result: FoldResult) -> None:
-    fold = fold_result.fold
-    if fold.skipped_reason is not None:
-        click.echo(f"  segment {fold.segment_index} fold {fold.fold_index}: SKIPPED - {fold.skipped_reason}")
+def _print_block_result(block_result: BlockResult) -> None:
+    block = block_result.block
+    if block.skipped_reason is not None:
+        click.echo(f"  segment {block.segment_index} block {block.block_index}: SKIPPED - {block.skipped_reason}")
         return
-    report = fold_result.performance
+    report = block_result.performance
     assert report is not None
-    start_date = datetime.fromtimestamp(fold.window_start_time_ms / 1000, tz=UTC).date() if fold.window_start_time_ms else None
-    end_date = datetime.fromtimestamp(fold.window_end_time_ms / 1000, tz=UTC).date() if fold.window_end_time_ms else None
-    click.echo(
-        f"  segment {fold.segment_index} fold {fold.fold_index}: {start_date} to {end_date} "
-        f"({fold.candle_count} candles) trades={report.trade_count} "
-        f"return_pct={report.total_return_pct:.2f} max_drawdown_pct={report.max_drawdown_pct:.2f} "
-        f"buy_and_hold_pct={report.buy_and_hold_return_pct} "
-        f"ends_open_position={fold_result.ends_with_open_position}"
+    start_date = datetime.fromtimestamp(block.window_start_time_ms / 1000, tz=UTC).date() if block.window_start_time_ms else None
+    end_date = datetime.fromtimestamp(block.window_end_time_ms / 1000, tz=UTC).date() if block.window_end_time_ms else None
+    excess_return_pct = (
+        report.total_return_pct - report.buy_and_hold_return_pct if report.buy_and_hold_return_pct is not None else None
     )
-    if fold_result.diagnostics is not None and fold_result.diagnostics.rejected_entries_by_reason:
-        reasons = ", ".join(f"{code}={count}" for code, count in sorted(fold_result.diagnostics.rejected_entries_by_reason.items()))
+    click.echo(
+        f"  segment {block.segment_index} block {block.block_index}: {start_date} to {end_date} "
+        f"({block.candle_count} candles) trades={report.trade_count} "
+        f"return_pct={report.total_return_pct:.2f} max_drawdown_pct={report.max_drawdown_pct:.2f} "
+        f"buy_and_hold_pct={report.buy_and_hold_return_pct} excess_return_pct={excess_return_pct} "
+        f"(marked-to-market - see SCORECARD's benchmark note; never used for survivor status) "
+        f"ends_open_position={block_result.ends_with_open_position}"
+    )
+    if block_result.extended is not None:
+        realized = block_result.extended.pnl_breakdown.realized_closed_trade_pnl_quote
+        click.echo(f"    realized_closed_trade_pnl_quote={realized} (this - not return_pct above - drives scoring)")
+    if block_result.diagnostics is not None and block_result.diagnostics.rejected_entries_by_reason:
+        reasons = ", ".join(f"{code}={count}" for code, count in sorted(block_result.diagnostics.rejected_entries_by_reason.items()))
         click.echo(f"    rejected_entries_by_reason (includes exchange-filter/min-notional rejections): {reasons}")
 
 

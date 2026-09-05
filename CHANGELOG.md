@@ -2,6 +2,94 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.1] - Pre-real-evaluation code review correction
+
+A code review of commit `85faa70` (the 0.2.0 research phase) found six
+pre-evaluation design issues. This release fixes all six BEFORE the first
+real candidate evaluation against the actual historical database, so the
+corrections are not influenced by any result - **no real candidate result
+was inspected before or during this release.** Adds 18 tests (419 -> 437
+total). No PR was opened, no Testnet connection was made, and no order was
+placed as part of this work.
+
+### Fixed
+
+- **Family A (`research/candidates/trend_regime.py`) was structurally
+  over-filtered**: the old rule required the EMA separation/ATR threshold
+  to already be satisfied on the SAME candle as the bullish crossover -
+  but separation is normally near zero exactly at a crossover, so the
+  filter could reject almost every real trend. Replaced with a causal,
+  finite-state rule with no persisted mutable state (derived fresh from
+  price history every call, since the same strategy instance is reused
+  across independent evaluation blocks): a bullish trend STATE begins the
+  moment fast EMA > slow EMA; while flat, entry fires only once the
+  normalized EMA separation reaches the declared threshold - which may
+  happen on a LATER candle than the crossover, never the same one only;
+  at most one entry per bullish cycle even if the position is closed
+  mid-cycle by the engine's own stop-loss; a bearish crossover always
+  exits and resets the cycle. A1/A2/A3's parameters were NOT retuned -
+  exactly the same three configurations, corrected logic only.
+- **Renamed "walk-forward" to `blocked_chronological_evaluation`**
+  (`research/walk_forward.py` -> `research/blocked_chronological_evaluation.py`,
+  `FoldResult`/`FoldSpec`/`CandidateWalkForwardResult` -> `BlockResult`/
+  `BlockSpec`/`CandidateBlockedChronologicalResult`, `fold_count` ->
+  `block_count`, throughout modules, tests, CLI output, and docs): the
+  prior name and its expanding-window terminology falsely implied
+  per-window fitting or optimization. Every candidate's parameters are
+  fixed in `candidate_registry.py` before this module ever runs and stay
+  identical across every block - nothing is fitted, trained, or selected
+  per block. What actually happens is a robustness check: the same one
+  fixed candidate is independently re-run, unchanged, over successive
+  non-overlapping chronological blocks of the same pre-cutoff data.
+- **Reproducible candidate freezing with fail-closed fingerprints**
+  (`research/fingerprint.py`, new; `research/freeze.py`, extended):
+  `FrozenCandidateRecord` now also carries a deterministic strategy
+  implementation fingerprint (hash of the candidate's own source module
+  plus the shared causal indicator/strategy-contract modules it depends
+  on), a candidate-registry fingerprint, a relevant config
+  snapshot/fingerprint (interval, starting equity, fees, slippage,
+  sizing, stop-loss, every risk limit), a symbol/exchange-filter
+  snapshot/fingerprint, a best-effort source commit hash, the research
+  cutoff and freeze boundary, and a scorecard-result fingerprint.
+  `assert_frozen_candidate_matches_current_implementation` recomputes
+  every fingerprint fresh and FAILS CLOSED
+  (`FrozenCandidateImplementationDriftError`) the moment any one no
+  longer matches - a frozen candidate is never silently reused once its
+  implementation or configuration has drifted. `save_frozen_candidate`
+  itself refuses (`FrozenCandidateVersionConflict`) to overwrite an
+  existing frozen file with different fingerprints; the sanctioned
+  response is `new_candidate_version_migration_id`, which mints a new
+  candidate id rather than editing the old frozen record. No secrets or
+  API credentials are ever fingerprinted or snapshotted - `AppConfig` has
+  no field for them at all.
+- **Strengthened, realized-PnL-only scorecard** (`research/scorecard.py`):
+  survivor status is now scored on REALIZED closed-trade PnL only
+  (normalized by each block's own starting equity), never on
+  marked-to-market total return - an unfinished open position can no
+  longer by itself make a block, or a candidate, pass. Thresholds
+  strengthened and made explicit: >= 30 total closed trades across >= 4
+  evaluated blocks, positive median block realized return, positive
+  aggregate realized PnL, no materially negative block (worst block
+  realized return >= -10%) even with a positive aggregate, max drawdown
+  <= 15%, best-trade contribution <= 50% of a POSITIVE block's PnL only
+  (an undefined ratio never auto-passes; a losing block's ratio is never
+  counted as a dependence signal), and >= 60% of blocks with positive
+  realized PnL. An explicit benchmark comparison (strategy return minus
+  buy-and-hold, every block, plus the median across blocks) is now always
+  reported - visibly, but never as a pass/fail input; beating buy-and-hold
+  in every bullish block is never required, since absolute profitability
+  and drawdown control remain the primary bar.
+- **Cutoff boundary honesty** (`research/cutoff.py`): documented explicitly
+  that `assert_pre_cutoff` is a plain runtime check, not an access-control
+  mechanism, and that the shared low-level `run_segment` primitive is
+  deliberately generic and NOT itself a security boundary (it is also the
+  correct tool for legitimately replaying the already-consumed period for
+  the frozen baseline). A new source-scanning architectural test
+  (`tests/unit/test_research_cutoff.py`) proves, from the real source of
+  the real functions, that every official candidate-scoring entry point
+  (`run_candidate_blocked_chronological_evaluation`, the `research-backtest`
+  CLI command) calls `assert_pre_cutoff`, and that `run_segment` does not.
+
 ## [0.2.0] - Leakage-resistant strategy-development research phase
 
 The v0.1 `ema_crossover_v0_1_rejected` baseline was formally REJECTED
