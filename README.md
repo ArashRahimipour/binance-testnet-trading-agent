@@ -306,10 +306,25 @@ never cross it; each block's own indicator warm-up precedes it and never
 trades; no position or risk state of any kind carries from one block to
 the next (every block is its own independent call into the SAME
 `run_segment` primitive the frozen baseline uses, so a candidate has no
-way to reach or influence the broker, fill assumptions, fees, slippage,
-position sizing, the risk engine, or accounting - it only ever returns a
-`Signal`). Every block is reported, including zero-trade and skipped
-blocks - never only the best one.
+way to reach or influence the broker, fill assumptions, the risk engine,
+or accounting - it only ever returns a `Signal`). Every block is reported,
+including zero-trade and skipped blocks - never only the best one.
+
+Every candidate is also gated by a **fixed minimum 1:2 planned reward/risk
+policy** (`backtest/risk_reward.py`), a user-mandated pre-real-evaluation
+risk policy applied identically to all nine without changing any declared
+signal parameter: each planned entry is sized to a fixed 1% of current
+equity maximum planned loss, with an explicit stop AND take-profit plan
+(target at exactly 2x the stop distance) computed from the REAL simulated
+fill price and persisted with the position; an entry is REJECTED outright
+if the NET (cost-adjusted) reward/risk ratio falls below 2.0, or if a
+risk-safe size cannot satisfy the exchange's minimum notional/lot-size
+(never satisfied by increasing risk). No leverage, one open position
+maximum, and fees are reserved so a fill can never overspend available
+balance. Under this project's current non-zero fee/slippage defaults this
+policy structurally rejects every entry (a disclosed, intended consequence
+of a maximally conservative policy that is never loosened to manufacture a
+trade) - see that module's docstring for the algebra.
 
 Each candidate then gets a **scorecard** (`research/scorecard.py`) - a
 rule-based, pre-declared pass/fail test, scored on REALIZED closed-trade

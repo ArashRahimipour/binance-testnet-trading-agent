@@ -582,6 +582,24 @@ def _print_block_result(block_result: BlockResult) -> None:
     if block_result.diagnostics is not None and block_result.diagnostics.rejected_entries_by_reason:
         reasons = ", ".join(f"{code}={count}" for code, count in sorted(block_result.diagnostics.rejected_entries_by_reason.items()))
         click.echo(f"    rejected_entries_by_reason (includes exchange-filter/min-notional rejections): {reasons}")
+    if block_result.risk_reward is not None:
+        rr = block_result.risk_reward
+        click.echo(
+            f"    fixed_1_to_2_risk_reward_policy: entries_approved={rr.entries_approved} "
+            f"rejected_net_rr_below_2={rr.entries_rejected_net_rr_below_minimum} "
+            f"rejected_exchange_filter_within_risk_budget={rr.entries_rejected_exchange_filter_within_risk_budget} "
+            f"stop_loss_exits={rr.stop_loss_exits} take_profit_exits={rr.take_profit_exits} "
+            f"gap_losses_exceeding_planned_risk={rr.gap_losses_exceeding_planned_risk}"
+        )
+        if rr.entries_approved > 0:
+            click.echo(
+                f"      planned_risk_quote_total={rr.planned_risk_quote_total} "
+                f"planned_reward_quote_total={rr.planned_reward_quote_total} "
+                f"planned_risk_pct_per_entry={list(rr.planned_risk_pct_values)} "
+                f"planned_reward_pct_per_entry={list(rr.planned_reward_pct_values)} "
+                f"gross_reward_to_risk_per_entry={list(rr.gross_reward_to_risk_values)} "
+                f"net_reward_to_risk_per_entry={list(rr.net_reward_to_risk_values)}"
+            )
 
 
 @cli.command("run")

@@ -129,8 +129,14 @@ def test_blocked_chronological_evaluation_never_reports_only_the_best_block():
 
 def test_blocked_chronological_evaluation_block_isolation_resets_risk_state_between_blocks():
     candles = _zigzag_candles()
+    # Zero fees/slippage so the fixed 1:2 risk/reward gate's NET ratio
+    # equals its GROSS ratio (exactly 2.0, always approved) - this test is
+    # about block isolation, not the R/R gate's own cost-erosion mechanics
+    # (see test_backtest_risk_reward.py for those).
     strict = run_candidate_blocked_chronological_evaluation(
-        _BREAKOUT_B1, candles, _config(risk={"max_drawdown_pct": 0.0001}), _filters(), block_count=5
+        _BREAKOUT_B1, candles,
+        _config(risk={"max_drawdown_pct": 0.0001}, fees={"taker_fee_pct": 0.0, "slippage_pct": 0.0}),
+        _filters(), block_count=5,
     )
     evaluated = [b for b in strict.blocks if b.block.skipped_reason is None]
     # Every block starts fresh from the configured starting_equity - a
@@ -187,7 +193,8 @@ def test_blocked_chronological_evaluation_surfaces_exchange_filter_rejections():
         + [_candle(plateau_len, 110.0, high=111.0, low=109.0)]  # confirmed breakout candle
         + [_candle(plateau_len + 1, 110.0, high=111.0, low=109.0)]  # a following candle for the BUY to resolve against
     )
-    # min_notional far beyond what $50 starting equity risk-sized at 2% could ever satisfy.
+    # min_notional far beyond what $50 starting equity risk-sized at 1% (the fixed
+    # risk/reward policy's budget - see backtest/risk_reward.py) could ever satisfy.
     impossible_filters = _filters(min_notional="100000")
     result = run_candidate_blocked_chronological_evaluation(_BREAKOUT_B1, candles, _config(), impossible_filters, block_count=1)
     evaluated = [b for b in result.blocks if b.block.skipped_reason is None]
@@ -195,7 +202,7 @@ def test_blocked_chronological_evaluation_surfaces_exchange_filter_rejections():
     for block in evaluated:
         assert block.diagnostics is not None
         all_reasons.update(block.diagnostics.rejected_entries_by_reason)
-    assert "BELOW_MIN_NOTIONAL" in all_reasons
+    assert "RR_REJECTED_BELOW_MIN_NOTIONAL" in all_reasons
 
 
 # --- Deterministic reports. ---

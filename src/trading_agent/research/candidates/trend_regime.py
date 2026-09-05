@@ -58,6 +58,20 @@ A1/A2/A3 (`research/candidate_registry.py`) are UNCHANGED by this
 correction - same three (ema_fast, ema_slow, atr_period,
 min_trend_strength_atr) tuples as before. Only the entry LOGIC changed;
 no configuration was added, removed, or tuned.
+
+SECOND pre-real-evaluation correction (still before any real candidate
+evaluation): the initial version of the corrected rule above still had one
+flaw - if the bullish state (`fast EMA > slow EMA`) held for the ENTIRE
+causally-visible history (e.g. because an evaluation block's own warm-up
+window happens to start mid-trend), the crossover search would find no
+actual `fast <= slow` transition and fell back to treating the EARLIEST
+visible candle as though a crossover had just happened there. That
+fallback was a MANUFACTURED crossover, purely an artifact of where the
+block/warm-up window happens to begin - not evidence any crossover ever
+occurred. A cycle may now arm ONLY from an actually observed
+`fast <= slow` -> `fast > slow` transition within `candles`; if none
+exists, the strategy reports `HOLD_UNOBSERVED_CYCLE` and produces no BUY,
+however long the bullish state has visibly held.
 """
 
 from __future__ import annotations
@@ -128,14 +142,30 @@ class TrendWithRegimeFilterStrategy:
             return Signal(SignalType.HOLD, "HOLD_NOT_IN_BULLISH_STATE", last_candle.close_time_ms, inputs)
 
         # In a bullish state: find the most recent bullish crossover that
-        # started THIS still-ongoing run (scanning back from the current
-        # candle), falling back to the earliest causally-visible index if
-        # the bullish state has held for the entire visible history.
-        crossover_idx = earliest_idx
+        # started THIS still-ongoing run, scanning back from the current
+        # candle to (but never past) the earliest causally-visible index.
+        # If the bullish state has held for the ENTIRE visible history -
+        # i.e. no `fast <= slow` transition is ever observed within
+        # `candles` - there is NO evidence a crossover ever happened at
+        # all, only that one happened at or before the window this
+        # evaluation block can see. Pre-real-evaluation code review
+        # correction: the strategy must NEVER manufacture a crossover at
+        # the block's own warm-up boundary just because that is as far
+        # back as this call happens to look - doing so would silently
+        # arm (and could immediately confirm) a cycle from a state
+        # transition that was never actually observed, purely as an
+        # artifact of where a `blocked_chronological_evaluation.py` block
+        # or warm-up window happens to start. Such a state is reported as
+        # `HOLD_UNOBSERVED_CYCLE` and can never itself produce a BUY.
+        crossover_idx: int | None = None
         for k in range(current_idx, earliest_idx, -1):
             if fast_values[k - 1] <= slow_values[k - 1]:
                 crossover_idx = k
                 break
+
+        if crossover_idx is None:
+            return Signal(SignalType.HOLD, "HOLD_UNOBSERVED_CYCLE", last_candle.close_time_ms, inputs)
+
         inputs["cycle_crossover_time_ms"] = candles[crossover_idx].close_time_ms
 
         # The cycle's ONE confirmation candle: the first index in

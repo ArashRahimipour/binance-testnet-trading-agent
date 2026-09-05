@@ -44,11 +44,19 @@ blocks with negative or otherwise poor results -
 hide anything, and there is no mechanism anywhere in this module that
 reports only "the best block."
 
-Candidates go through EXACTLY the same broker/fill/fee/slippage/sizing/
-risk-engine/accounting path as the frozen baseline (`run_segment` is the
-identical function `run_backtest` and `run_independent_holdout_evaluation`
-use) - a candidate strategy object has no way to reach or influence any of
-that; it only ever returns a `Signal`.
+Candidates go through the SAME `run_segment` primitive `run_backtest` and
+`run_independent_holdout_evaluation` use for the frozen baseline - broker,
+fee/slippage model, risk engine, and accounting are all identical; a
+candidate strategy object has no way to reach or influence any of that, it
+only ever returns a `Signal`. The one deliberate difference: every call
+here passes `use_fixed_risk_reward_policy=True` (`backtest/risk_reward.py`),
+a USER-MANDATED pre-real-evaluation risk policy applied identically to all
+nine candidates WITHOUT changing any of their declared signal parameters -
+every planned entry is sized to a fixed 1% risk budget and gated on a
+minimum 1:2 net (cost-adjusted) planned reward/risk ratio, with an explicit
+stop AND take-profit plan persisted with the position. The frozen baseline
+(`research/frozen_baseline.py`) never receives this flag, so its own
+report continues to reproduce EXACTLY as it always has.
 """
 
 from __future__ import annotations
@@ -57,6 +65,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 from trading_agent.backtest.engine import run_segment
+from trading_agent.backtest.risk_reward import RiskRewardDiagnostics
 from trading_agent.config.models import AppConfig
 from trading_agent.data.gap_detection import partition_into_segments
 from trading_agent.data.models import Candle
@@ -106,6 +115,12 @@ class BlockResult:
     open_position: OpenPositionInfo | None
     ends_with_open_position: bool
     unresolved_pending_signal: str | None
+    #: Fixed 1:2 planned reward/risk policy diagnostics (`backtest/
+    #: risk_reward.py`) - every candidate is run under this policy (see
+    #: `run_candidate_blocked_chronological_evaluation`), so this is
+    #: populated for every non-skipped block. None only when `block.
+    #: skipped_reason` is set (nothing ran at all).
+    risk_reward: RiskRewardDiagnostics | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,7 +232,8 @@ def run_candidate_blocked_chronological_evaluation(
             warm_up_start_idx = start_idx - (min_required - 1)
             window_slice = segment[warm_up_start_idx:end_idx]
             result = run_segment(
-                window_slice, config, filters, strategy, risk_engine, broker, journal, min_required, starting_equity
+                window_slice, config, filters, strategy, risk_engine, broker, journal, min_required, starting_equity,
+                use_fixed_risk_reward_policy=True,
             )
             window_candles = segment[start_idx:end_idx]
             buy_and_hold = compute_buy_and_hold_report(window_candles, starting_equity, config.fees.taker_fee_pct)
@@ -272,6 +288,7 @@ def run_candidate_blocked_chronological_evaluation(
                     open_position=result.open_position,
                     ends_with_open_position=result.ends_with_open_position,
                     unresolved_pending_signal=result.pending_signal_note,
+                    risk_reward=result.risk_reward,
                 )
             )
 

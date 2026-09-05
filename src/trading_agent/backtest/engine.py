@@ -110,9 +110,17 @@ percentage return or drawdown) are produced.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 
+from trading_agent.backtest.risk_reward import (
+    EXCHANGE_FILTER_REJECTION_REASONS,
+    RR_REJECTED_NET_REWARD_TO_RISK_BELOW_MINIMUM,
+    RiskRewardDiagnostics,
+    RiskRewardPlan,
+    build_realized_plan,
+    plan_risk_reward_entry,
+)
 from trading_agent.config.models import AppConfig
 from trading_agent.data.gap_detection import GapRecord, partition_into_segments
 from trading_agent.data.models import Candle
@@ -128,6 +136,7 @@ from trading_agent.metrics.extended_report import (
 from trading_agent.metrics.performance import (
     EXIT_REASON_STOP_LOSS,
     EXIT_REASON_STRATEGY,
+    EXIT_REASON_TAKE_PROFIT,
     EquityPoint,
     PerformanceReport,
     Trade,
@@ -139,6 +148,7 @@ from trading_agent.risk.engine import RiskEngine
 from trading_agent.risk.limits import RiskContext, TradeIntent
 from trading_agent.sizing.exchange_filters import SymbolFilters
 from trading_agent.sizing.position_sizer import (
+    SizingDecision,
     compute_risk_based_buy_quantity,
     compute_sell_quantity,
 )
@@ -269,6 +279,13 @@ class _OpenTrade:
     #: for slippage-cost reporting only; changes no fee/slippage/fill
     #: calculation.
     entry_reference_price: Decimal
+    #: The REALIZED risk/reward plan (`backtest/risk_reward.py::
+    #: build_realized_plan`) - None unless this position was opened under
+    #: `use_fixed_risk_reward_policy=True`. `target_price` is checked
+    #: alongside `_LoopState.stop_price` on every subsequent candle;
+    #: `planned_risk_quote` is compared against a stop exit's actual
+    #: realized loss to detect a gap exceeding the planned risk budget.
+    realized_plan: RiskRewardPlan | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,6 +309,15 @@ class _LoopState:
     daily_realized_pnl_pct: float
     daily_start_equity: Decimal
     cooldown_bars_remaining: int
+    #: Take-profit price under the fixed risk/reward policy - always None
+    #: otherwise. Checked alongside `stop_price`; STOP takes precedence
+    #: when both would trigger on the same candle (see `run_segment`).
+    target_price: Decimal | None = None
+    #: `open_time_ms` of the candle whose fill just opened the current
+    #: position - the stop/target check is skipped for exactly this one
+    #: candle so an entry can never also exit within the same candle (no
+    #: same-candle entry/exit lookahead). None when flat.
+    entry_candle_open_time_ms: int | None = None
 
 
 @dataclass
@@ -306,6 +332,19 @@ class _DiagBuilder:
     shutdown_first_activation: dict[str, tuple[int, Decimal, float]] = field(default_factory=dict)
     shutdown_last_active: dict[str, int] = field(default_factory=dict)
     last_approved_buy_time_ms: int | None = None
+
+    #: Populated only when `run_segment` is called with
+    #: `use_fixed_risk_reward_policy=True` - see `backtest/risk_reward.py`.
+    rr_entries_approved: int = 0
+    rr_rejected_net_rr_below_minimum: int = 0
+    rr_rejected_exchange_filter: int = 0
+    rr_gap_losses_exceeding_planned_risk: int = 0
+    rr_planned_risk_quote_total: Decimal = field(default_factory=lambda: Decimal(0))
+    rr_planned_reward_quote_total: Decimal = field(default_factory=lambda: Decimal(0))
+    rr_planned_risk_pct_values: list[float] = field(default_factory=list)
+    rr_planned_reward_pct_values: list[float] = field(default_factory=list)
+    rr_gross_reward_to_risk_values: list[float] = field(default_factory=list)
+    rr_net_reward_to_risk_values: list[float] = field(default_factory=list)
 
     def record_rejected_entry(self, reason_code: str) -> None:
         self.rejected_entries_by_reason[reason_code] = self.rejected_entries_by_reason.get(reason_code, 0) + 1
@@ -333,6 +372,10 @@ class SegmentRunResult:
     #: `equity_curve` - lets a caller reconstruct the EXACT state at any
     #: split boundary within this run (see `_PortfolioSnapshot`).
     portfolio_snapshots: list[_PortfolioSnapshot]
+    #: Populated only when this call used `use_fixed_risk_reward_policy=True`
+    #: (candidate evaluation - see `research/blocked_chronological_evaluation.py`)
+    #: - None for the unmodified frozen-baseline path.
+    risk_reward: RiskRewardDiagnostics | None = None
 
 
 def run_backtest(
@@ -694,6 +737,7 @@ def run_segment(
     journal: Journal | None,
     min_required: int,
     starting_equity: Decimal,
+    use_fixed_risk_reward_policy: bool = False,
 ) -> SegmentRunResult:
     """Run one fully independent backtest over a single contiguous segment
     (or, from `run_independent_holdout_evaluation`, over one window's own
@@ -703,6 +747,17 @@ def run_segment(
     `segment[: i + 1]`, never reaching back into a previous segment or
     window), fresh day/cooldown state - nothing from a previous segment (or
     a gap before this one) is ever visible here.
+
+    `use_fixed_risk_reward_policy` (default False, preserving the
+    unmodified frozen-baseline path exactly): when True, every BUY is
+    sized and gated by the fixed 1:2 planned reward/risk policy
+    (`backtest/risk_reward.py`) instead of the plain fixed-percentage
+    stop-only sizing, and each open position also carries a take-profit
+    target checked alongside its stop on every subsequent candle. Set to
+    True ONLY by `research/blocked_chronological_evaluation.py` (every
+    research candidate) - `run_backtest`/`run_independent_holdout_evaluation`
+    (the frozen v0.1 baseline) never pass it, so that baseline continues to
+    reproduce EXACTLY as before this policy existed.
     """
     state = _LoopState(
         portfolio=PortfolioState.initial(starting_equity),
@@ -741,16 +796,31 @@ def run_segment(
 
         if pending_signal is not None:
             state, trades, peak_equity = _resolve_pending_signal(
-                pending_signal, candle, state, trades, config, filters, risk_engine, broker, peak_equity, journal, diag
+                pending_signal, candle, state, trades, config, filters, risk_engine, broker, peak_equity, journal, diag,
+                use_fixed_risk_reward_policy,
             )
             pending_signal = None
 
+        # No same-candle entry/exit lookahead under the fixed risk/reward
+        # policy: the stop/target check is skipped for exactly the candle
+        # whose fill just opened this position - checks begin only on the
+        # NEXT candle. The legacy stop-only path (policy disabled) is
+        # unaffected - it never sets `entry_candle_open_time_ms`.
+        just_entered_this_candle = (
+            use_fixed_risk_reward_policy and state.entry_candle_open_time_ms == candle.open_time_ms
+        )
         if (
             state.portfolio.position_side == PositionSide.LONG
             and state.stop_price is not None
-            and candle.low <= state.stop_price
+            and not just_entered_this_candle
         ):
-            state, trades = _execute_stop_exit(candle, state, trades, broker, config, journal)
+            if candle.low <= state.stop_price:
+                # Conservative same-candle ambiguity rule: if both the stop
+                # and (under the R/R policy) the take-profit are touched
+                # within one candle, STOP is assumed to occur first.
+                state, trades = _execute_stop_exit(candle, state, trades, broker, config, journal, diag)
+            elif use_fixed_risk_reward_policy and state.target_price is not None and candle.high >= state.target_price:
+                state, trades = _execute_take_profit_exit(candle, state, trades, broker, config, journal, diag)
 
         equity_now = state.portfolio.equity(candle.close)
         peak_equity = max(peak_equity, equity_now)
@@ -794,6 +864,7 @@ def run_segment(
 
     strategy_exits = sum(1 for t in trades if t.exit_reason == EXIT_REASON_STRATEGY)
     stop_exits = sum(1 for t in trades if t.exit_reason == EXIT_REASON_STOP_LOSS)
+    take_profit_exits = sum(1 for t in trades if t.exit_reason == EXIT_REASON_TAKE_PROFIT)
     max_dd_pct, max_dd_time_ms = _max_drawdown_with_time(equity_curve)
     segment_end_time_ms = segment[-1].close_time_ms
 
@@ -822,6 +893,7 @@ def run_segment(
         executed_entries=diag.executed_entries,
         executed_strategy_exits=strategy_exits,
         executed_stop_loss_exits=stop_exits,
+        executed_take_profit_exits=take_profit_exits,
         rejected_entries_by_reason=dict(diag.rejected_entries_by_reason),
         first_executed_trade_time_ms=trades[0].entry_time_ms if trades else None,
         last_executed_trade_time_ms=trades[-1].exit_time_ms if trades else None,
@@ -835,6 +907,23 @@ def run_segment(
         ends_with_open_position=state.portfolio.position_side == PositionSide.LONG,
     )
 
+    risk_reward_diagnostics = None
+    if use_fixed_risk_reward_policy:
+        risk_reward_diagnostics = RiskRewardDiagnostics(
+            entries_approved=diag.rr_entries_approved,
+            entries_rejected_net_rr_below_minimum=diag.rr_rejected_net_rr_below_minimum,
+            entries_rejected_exchange_filter_within_risk_budget=diag.rr_rejected_exchange_filter,
+            stop_loss_exits=stop_exits,
+            take_profit_exits=take_profit_exits,
+            gap_losses_exceeding_planned_risk=diag.rr_gap_losses_exceeding_planned_risk,
+            planned_risk_quote_total=diag.rr_planned_risk_quote_total,
+            planned_reward_quote_total=diag.rr_planned_reward_quote_total,
+            planned_risk_pct_values=tuple(diag.rr_planned_risk_pct_values),
+            planned_reward_pct_values=tuple(diag.rr_planned_reward_pct_values),
+            gross_reward_to_risk_values=tuple(diag.rr_gross_reward_to_risk_values),
+            net_reward_to_risk_values=tuple(diag.rr_net_reward_to_risk_values),
+        )
+
     return SegmentRunResult(
         trades=trades,
         equity_curve=equity_curve,
@@ -843,6 +932,7 @@ def run_segment(
         diagnostics=diagnostics,
         open_position=_open_trade_to_info(state.open_trade),
         portfolio_snapshots=portfolio_snapshots,
+        risk_reward=risk_reward_diagnostics,
     )
 
 
@@ -870,19 +960,28 @@ def _resolve_pending_signal(
     peak_equity: Decimal,
     journal: Journal | None,
     diag: _DiagBuilder,
+    use_fixed_risk_reward_policy: bool = False,
 ) -> tuple[_LoopState, list[Trade], Decimal]:
     reference_price = candle.open
     equity = state.portfolio.equity(reference_price)
     peak_equity = max(peak_equity, equity)
     drawdown_pct = float((peak_equity - equity) / peak_equity) if peak_equity > 0 else 0.0
 
+    risk_reward_plan: RiskRewardPlan | None = None
     if signal_type == SignalType.BUY:
-        stop_price = reference_price * (1 - Decimal(str(config.stop_loss.stop_distance_pct)))
-        sizing = compute_risk_based_buy_quantity(
-            equity, reference_price, stop_price,
-            config.risk.max_risk_per_trade_pct, config.risk.max_position_pct,
-            config.fees.taker_fee_pct, config.fees.slippage_pct, filters,
-        )
+        if use_fixed_risk_reward_policy:
+            risk_reward_plan = plan_risk_reward_entry(
+                equity, state.portfolio.quote_balance, reference_price,
+                config.stop_loss.stop_distance_pct, config.fees.taker_fee_pct, config.fees.slippage_pct, filters,
+            )
+            sizing = SizingDecision(risk_reward_plan.approved, risk_reward_plan.quantity, risk_reward_plan.reason_code)
+        else:
+            stop_price = reference_price * (1 - Decimal(str(config.stop_loss.stop_distance_pct)))
+            sizing = compute_risk_based_buy_quantity(
+                equity, reference_price, stop_price,
+                config.risk.max_risk_per_trade_pct, config.risk.max_position_pct,
+                config.fees.taker_fee_pct, config.fees.slippage_pct, filters,
+            )
     else:
         sizing = compute_sell_quantity(state.portfolio.base_balance, reference_price, filters)
 
@@ -895,6 +994,11 @@ def _resolve_pending_signal(
     if not sizing.approved or sizing.quantity is None:
         if signal_type == SignalType.BUY:
             diag.record_rejected_entry(sizing.reason_code)
+            if risk_reward_plan is not None:
+                if risk_reward_plan.reason_code in EXCHANGE_FILTER_REJECTION_REASONS:
+                    diag.rr_rejected_exchange_filter += 1
+                elif risk_reward_plan.reason_code == RR_REJECTED_NET_REWARD_TO_RISK_BELOW_MINIMUM:
+                    diag.rr_rejected_net_rr_below_minimum += 1
         return state, trades, peak_equity
 
     intent = TradeIntent(signal_type, candle.symbol, sizing.quantity, reference_price)
@@ -939,15 +1043,47 @@ def _resolve_pending_signal(
     if signal_type == SignalType.BUY:
         fill = broker.simulate_buy(quantity, reference_price)
         state.portfolio = apply_buy(state.portfolio, quantity, fill.fill_price, fill.fee_quote)
-        state.stop_price = fill.fill_price * (1 - Decimal(str(config.stop_loss.stop_distance_pct)))
-        state.open_trade = _OpenTrade(candle.open_time_ms, fill.fill_price, quantity, fill.fee_quote, reference_price)
+        if use_fixed_risk_reward_policy and risk_reward_plan is not None:
+            # Persist the FINAL plan computed from the REAL fill price
+            # (never the earlier reference price or signal close), anchored
+            # to the actual quantity that filled.
+            plan_for_fill = (
+                risk_reward_plan if quantity == risk_reward_plan.quantity else replace(risk_reward_plan, quantity=quantity)
+            )
+            realized_plan = build_realized_plan(
+                plan_for_fill, fill.fill_price, config.stop_loss.stop_distance_pct,
+                config.fees.taker_fee_pct, config.fees.slippage_pct, equity,
+            )
+            state.stop_price = realized_plan.stop_price
+            state.target_price = realized_plan.target_price
+            state.entry_candle_open_time_ms = candle.open_time_ms
+            state.open_trade = _OpenTrade(
+                candle.open_time_ms, fill.fill_price, quantity, fill.fee_quote, reference_price,
+                realized_plan=realized_plan,
+            )
+            diag.rr_entries_approved += 1
+            if realized_plan.planned_risk_quote is not None:
+                diag.rr_planned_risk_quote_total += realized_plan.planned_risk_quote
+            if realized_plan.planned_reward_quote is not None:
+                diag.rr_planned_reward_quote_total += realized_plan.planned_reward_quote
+            if realized_plan.planned_risk_pct is not None:
+                diag.rr_planned_risk_pct_values.append(realized_plan.planned_risk_pct)
+            if realized_plan.planned_reward_pct is not None:
+                diag.rr_planned_reward_pct_values.append(realized_plan.planned_reward_pct)
+            if realized_plan.gross_reward_to_risk is not None:
+                diag.rr_gross_reward_to_risk_values.append(realized_plan.gross_reward_to_risk)
+            if realized_plan.net_reward_to_risk is not None:
+                diag.rr_net_reward_to_risk_values.append(realized_plan.net_reward_to_risk)
+        else:
+            state.stop_price = fill.fill_price * (1 - Decimal(str(config.stop_loss.stop_distance_pct)))
+            state.open_trade = _OpenTrade(candle.open_time_ms, fill.fill_price, quantity, fill.fee_quote, reference_price)
         state.trades_today += 1
         diag.executed_entries += 1
         diag.last_approved_buy_time_ms = candle.open_time_ms
     else:
         fill = broker.simulate_sell(quantity, reference_price)
         state = _apply_exit_fill(
-            state, candle.open_time_ms, quantity, fill, trades, config, EXIT_REASON_STRATEGY, reference_price
+            state, candle.open_time_ms, quantity, fill, trades, config, EXIT_REASON_STRATEGY, reference_price, diag
         )
 
     return state, trades, peak_equity
@@ -960,6 +1096,7 @@ def _execute_stop_exit(
     broker: BacktestBroker,
     config: AppConfig,
     journal: Journal | None,
+    diag: _DiagBuilder,
 ) -> tuple[_LoopState, list[Trade]]:
     if state.stop_price is None:  # pragma: no cover - guarded by caller
         raise ValueError("_execute_stop_exit called without an active stop price")
@@ -969,12 +1106,43 @@ def _execute_stop_exit(
     quantity = state.portfolio.base_balance
     fill = broker.simulate_sell(quantity, fill_reference_price)
     state = _apply_exit_fill(
-        state, candle.open_time_ms, quantity, fill, trades, config, EXIT_REASON_STOP_LOSS, fill_reference_price
+        state, candle.open_time_ms, quantity, fill, trades, config, EXIT_REASON_STOP_LOSS, fill_reference_price, diag
     )
     if journal is not None:
         journal.record(
             "STOP_LOSS_TRIGGERED",
             {"stop_price": str(fill_reference_price), "quantity": str(quantity)},
+            candle.open_time_ms,
+        )
+    return state, trades
+
+
+def _execute_take_profit_exit(
+    candle: Candle,
+    state: _LoopState,
+    trades: list[Trade],
+    broker: BacktestBroker,
+    config: AppConfig,
+    journal: Journal | None,
+    diag: _DiagBuilder,
+) -> tuple[_LoopState, list[Trade]]:
+    if state.target_price is None:  # pragma: no cover - guarded by caller
+        raise ValueError("_execute_take_profit_exit called without an active target price")
+    # Fill AT the planned target - a gap beyond it (favourable for a LONG
+    # exit) is never credited as an improvement; `broker.simulate_sell`
+    # then applies its own (adverse) slippage on top, exactly like every
+    # other exit in this project, so the realized fill is never better
+    # than what that shared fill model would give any other sell.
+    fill_reference_price = state.target_price
+    quantity = state.portfolio.base_balance
+    fill = broker.simulate_sell(quantity, fill_reference_price)
+    state = _apply_exit_fill(
+        state, candle.open_time_ms, quantity, fill, trades, config, EXIT_REASON_TAKE_PROFIT, fill_reference_price, diag
+    )
+    if journal is not None:
+        journal.record(
+            "TAKE_PROFIT_TRIGGERED",
+            {"target_price": str(fill_reference_price), "quantity": str(quantity)},
             candle.open_time_ms,
         )
     return state, trades
@@ -989,6 +1157,7 @@ def _apply_exit_fill(
     config: AppConfig,
     exit_reason: str,
     exit_reference_price: Decimal,
+    diag: _DiagBuilder,
 ) -> _LoopState:
     pnl_before = state.portfolio.realized_pnl_quote
     open_trade = state.open_trade
@@ -1012,6 +1181,17 @@ def _apply_exit_fill(
                 exit_reference_price=exit_reference_price,
             )
         )
+        # A gap through the stop can still exceed the planned risk budget -
+        # a disclosed, expected limitation of a fixed-percentage stop (see
+        # backtest/risk_reward.py), tracked here for reporting rather than
+        # silently absorbed into the realized PnL figure alone.
+        if (
+            exit_reason == EXIT_REASON_STOP_LOSS
+            and open_trade.realized_plan is not None
+            and open_trade.realized_plan.planned_risk_quote is not None
+            and -realized > open_trade.realized_plan.planned_risk_quote
+        ):
+            diag.rr_gap_losses_exceeding_planned_risk += 1
 
     if state.daily_start_equity > 0:
         state.daily_realized_pnl_pct += float(realized / state.daily_start_equity)
@@ -1019,6 +1199,8 @@ def _apply_exit_fill(
         state.cooldown_bars_remaining = config.risk.cooldown_bars_after_loss
     state.trades_today += 1
     state.stop_price = None
+    state.target_price = None
+    state.entry_candle_open_time_ms = None
     state.open_trade = None
     return state
 

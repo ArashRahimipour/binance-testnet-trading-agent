@@ -31,10 +31,14 @@ from trading_agent.data.models import Candle, interval_to_ms
 _MS_PER_YEAR = 365 * 24 * 60 * 60 * 1000
 
 #: Values `Trade.exit_reason` can take - kept as plain strings (not an enum)
-#: so journal/report serialization stays trivial, but these are the only
-#: two values ever produced by the backtest engine.
+#: so journal/report serialization stays trivial. `EXIT_REASON_TAKE_PROFIT`
+#: is produced only when `backtest/engine.py::run_segment` is run under the
+#: fixed 1:2 risk/reward policy (`use_fixed_risk_reward_policy=True`,
+#: `backtest/risk_reward.py`) - a user-mandated pre-real-evaluation risk
+#: policy, never produced by the unmodified frozen-baseline path.
 EXIT_REASON_STRATEGY = "STRATEGY_EXIT"
 EXIT_REASON_STOP_LOSS = "STOP_LOSS"
+EXIT_REASON_TAKE_PROFIT = "TAKE_PROFIT"
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +113,7 @@ class PerformanceReport:
     ending_equity: Decimal = Decimal(0)
     strategy_exit_count: int = 0
     stop_loss_exit_count: int = 0
+    take_profit_exit_count: int = 0
     buy_and_hold: BuyAndHoldReport | None = None
     assumptions: dict = field(default_factory=dict)
 
@@ -283,6 +288,7 @@ def compute_performance_report(
 
     strategy_exit_count = sum(1 for t in trades if t.exit_reason == EXIT_REASON_STRATEGY)
     stop_loss_exit_count = sum(1 for t in trades if t.exit_reason == EXIT_REASON_STOP_LOSS)
+    take_profit_exit_count = sum(1 for t in trades if t.exit_reason == EXIT_REASON_TAKE_PROFIT)
 
     return PerformanceReport(
         trade_count=len(trades),
@@ -304,6 +310,7 @@ def compute_performance_report(
         ending_equity=equity_curve[-1].equity,
         strategy_exit_count=strategy_exit_count,
         stop_loss_exit_count=stop_loss_exit_count,
+        take_profit_exit_count=take_profit_exit_count,
         buy_and_hold=buy_and_hold,
         assumptions=assumptions,
     )

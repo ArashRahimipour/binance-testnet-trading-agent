@@ -7,9 +7,14 @@ survivor status, and - as of this pre-real-evaluation code review
 correction - a full set of REPRODUCIBILITY FINGERPRINTS (`research/
 fingerprint.py`) covering everything that could silently change its
 behavior between now and any future paper test: the strategy's own
-implementation source, its declared registry entry, the relevant slice of
-config (interval, starting equity, fees, slippage, sizing, stop-loss,
-every risk limit), and the symbol's exchange filters. A forward-only
+implementation source, the shared EXECUTION-SEMANTICS modules that decide
+what happens to a Signal once emitted (backtest engine, simulated broker,
+portfolio/accounting, risk engine, sizing, exchange-filter validation,
+order validation, performance/PnL calculations - kept as a SEPARATE
+fingerprint from the strategy's own source so a drift report can say which
+layer changed), its declared registry entry, the relevant slice of config
+(interval, starting equity, fees, slippage, sizing, stop-loss, every risk
+limit), and the symbol's exchange filters. A forward-only
 freeze boundary is recorded too - the earliest timestamp any future test
 candle must be at or after. Previously observed data (both the pre-cutoff
 development data AND the already-consumed 2025-05-16..2026-09-04 period)
@@ -52,6 +57,7 @@ from trading_agent.research.fingerprint import (
     compute_candidate_registry_fingerprint,
     compute_config_fingerprint,
     compute_exchange_filters_fingerprint,
+    compute_execution_semantics_fingerprint,
     compute_scorecard_result_fingerprint,
     compute_strategy_implementation_fingerprint,
     get_source_commit_hash,
@@ -75,8 +81,10 @@ class FrozenCandidateForwardTestViolation(Exception):
 
 class FrozenCandidateImplementationDriftError(Exception):
     """Raised when a frozen candidate's stored fingerprints no longer
-    match the CURRENT strategy implementation, candidate registry entry,
-    relevant configuration, or exchange filters. Deliberately fail-closed:
+    match the CURRENT strategy implementation, execution semantics
+    (backtest engine/broker/portfolio/risk/sizing/exchange-filter-
+    validation/order-validation/performance code), candidate registry
+    entry, relevant configuration, or exchange filters. Deliberately fail-closed:
     a future paper-test attempt must be blocked outright, never silently
     run against a strategy or config that has since changed from what was
     actually evaluated and frozen. See `new_candidate_version_migration_id`
@@ -114,7 +122,14 @@ class FrozenCandidateRecord:
 
     #: Reproducibility fingerprints (SHA-256 hex digests) - see
     #: `research/fingerprint.py`. ANY mismatch on reload must fail closed.
+    #: `strategy_implementation_fingerprint` and
+    #: `execution_semantics_fingerprint` are deliberately SEPARATE so a
+    #: drift report can say which layer changed: the candidate's own
+    #: decision logic, or the shared simulation machinery (engine/broker/
+    #: portfolio/risk/sizing/exchange-filter-validation/order-validation/
+    #: performance) every candidate and the frozen baseline run through.
     strategy_implementation_fingerprint: str
+    execution_semantics_fingerprint: str
     candidate_registry_fingerprint: str
     config_fingerprint: str
     exchange_filters_fingerprint: str
@@ -167,6 +182,7 @@ def freeze_candidate(
         candidate_version=candidate_version,
         research_cutoff_ms=RESEARCH_CUTOFF_MS,
         strategy_implementation_fingerprint=compute_strategy_implementation_fingerprint(candidate),
+        execution_semantics_fingerprint=compute_execution_semantics_fingerprint(),
         candidate_registry_fingerprint=compute_candidate_registry_fingerprint(candidate),
         config_fingerprint=compute_config_fingerprint(config),
         exchange_filters_fingerprint=compute_exchange_filters_fingerprint(filters),
@@ -196,6 +212,7 @@ def new_candidate_version_migration_id(candidate_id: str, new_version: int) -> s
 def _fingerprints_match(record: FrozenCandidateRecord, other: FrozenCandidateRecord) -> bool:
     return (
         record.strategy_implementation_fingerprint == other.strategy_implementation_fingerprint
+        and record.execution_semantics_fingerprint == other.execution_semantics_fingerprint
         and record.candidate_registry_fingerprint == other.candidate_registry_fingerprint
         and record.config_fingerprint == other.config_fingerprint
         and record.exchange_filters_fingerprint == other.exchange_filters_fingerprint
@@ -266,6 +283,11 @@ def assert_frozen_candidate_matches_current_implementation(
     mismatches: list[str] = []
     if compute_strategy_implementation_fingerprint(candidate) != record.strategy_implementation_fingerprint:
         mismatches.append("strategy implementation (candidate source code or a shared indicator module changed)")
+    if compute_execution_semantics_fingerprint() != record.execution_semantics_fingerprint:
+        mismatches.append(
+            "execution semantics (backtest engine, broker, portfolio/accounting, risk engine, sizing, "
+            "exchange-filter validation, order validation, or performance/PnL calculations changed)"
+        )
     if compute_candidate_registry_fingerprint(candidate) != record.candidate_registry_fingerprint:
         mismatches.append("candidate registry entry (declared id/family/params changed)")
     if compute_config_fingerprint(config) != record.config_fingerprint:

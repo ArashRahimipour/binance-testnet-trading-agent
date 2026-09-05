@@ -285,10 +285,47 @@ reach or influence any of that.
   position can never by itself make a block - or a candidate - pass;
   marked-to-market return and its excess over buy-and-hold are still
   reported per block for visibility only.
+- `research/fingerprint.py` - deterministic SHA-256 fingerprints for
+  reproducible candidate freezing: a strategy-implementation fingerprint
+  (the candidate's own source module plus the shared causal
+  indicator/strategy-contract modules), a SEPARATE execution-semantics
+  fingerprint (backtest engine, simulated broker, portfolio/accounting,
+  risk engine, sizing, exchange-filter validation, order validation,
+  performance/PnL calculations - everything that can change a simulated
+  result once a Signal is emitted, kept apart from the strategy fingerprint
+  so a drift report can name which layer changed), a candidate-registry
+  fingerprint, a config fingerprint/snapshot (interval, starting equity,
+  fees, slippage, sizing, stop-loss, every risk limit - no secrets, since
+  `AppConfig` has no field for them), a symbol/exchange-filter fingerprint/
+  snapshot, and a scorecard-result fingerprint.
 - `research/freeze.py` - freezes a `RESEARCH_SURVIVOR` (candidate id/
-  params/scorecard + a forward-only boundary) and rejects, via
-  `validate_future_paper_test`, any attempt to "test" it again on a
-  candle that predates that boundary.
+  params/scorecard/every fingerprint above + a forward-only boundary +
+  candidate version + best-effort source commit hash) and rejects, via
+  `validate_future_paper_test`, any attempt to "test" it again on a candle
+  that predates that boundary. `assert_frozen_candidate_matches_current_
+  implementation` recomputes every fingerprint fresh and FAILS CLOSED
+  (`FrozenCandidateImplementationDriftError`) on any mismatch; the
+  sanctioned response to an intentional change is
+  `new_candidate_version_migration_id` (mint a new id, never edit or
+  silently overwrite the old frozen record - `save_frozen_candidate`
+  itself refuses to overwrite a differing one).
+- `backtest/risk_reward.py` - the fixed minimum 1:2 planned reward/risk
+  policy, a user-mandated pre-real-evaluation risk policy wired into
+  `backtest/engine.py::run_segment` via `use_fixed_risk_reward_policy`
+  (always enabled for every research candidate via
+  `run_candidate_blocked_chronological_evaluation`, never for the frozen
+  baseline). Every planned BUY is sized to a fixed 1% of current equity
+  maximum planned loss with an explicit stop AND take-profit plan (target
+  at exactly 2x the stop distance) computed from the REAL simulated fill
+  price and persisted with the position; an entry is rejected outright if
+  the NET (cost-adjusted) reward/risk ratio falls below 2.0, or if a
+  risk-safe size cannot satisfy the exchange's minimum notional/lot-size.
+  If both the stop and take-profit are touched within one candle, STOP is
+  assumed to occur first; a gap through the stop fills at the worse
+  available price; a gap beyond the take-profit target is never credited
+  as a favourable improvement; a position's own stop/target checks begin
+  only on the candle after its entry filled (no same-candle entry/exit
+  lookahead). Candidates' declared signal parameters are unchanged.
 
 ## Crash recovery, the pending-order state machine, and the atomic transaction boundary
 

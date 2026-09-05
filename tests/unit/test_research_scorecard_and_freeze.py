@@ -44,6 +44,7 @@ from trading_agent.research.fingerprint import (
     compute_candidate_registry_fingerprint,
     compute_config_fingerprint,
     compute_exchange_filters_fingerprint,
+    compute_execution_semantics_fingerprint,
     compute_strategy_implementation_fingerprint,
 )
 from trading_agent.research.freeze import (
@@ -456,6 +457,7 @@ def _frozen_a1(config: AppConfig | None = None, filters: SymbolFilters | None = 
 def test_frozen_record_carries_every_required_fingerprint_and_snapshot():
     record = _frozen_a1()
     assert record.strategy_implementation_fingerprint == compute_strategy_implementation_fingerprint(_TREND_A1)
+    assert record.execution_semantics_fingerprint == compute_execution_semantics_fingerprint()
     assert record.candidate_registry_fingerprint == compute_candidate_registry_fingerprint(_TREND_A1)
     assert record.config_fingerprint == compute_config_fingerprint(_app_config())
     assert record.exchange_filters_fingerprint == compute_exchange_filters_fingerprint(_symbol_filters())
@@ -465,6 +467,22 @@ def test_frozen_record_carries_every_required_fingerprint_and_snapshot():
     assert record.exchange_filters_snapshot["symbol"] == "BTCUSDT"
     # source_commit_hash is best-effort - either a non-empty string or None, never raises.
     assert record.source_commit_hash is None or isinstance(record.source_commit_hash, str)
+
+
+def test_execution_semantics_fingerprint_is_independent_of_the_strategy_fingerprint():
+    # A1 and A2 have different declared params (different strategy instances built
+    # from the same module), so their strategy-implementation fingerprints match
+    # (identical source) while execution semantics is identical for both - the two
+    # fingerprints must never be conflated into one.
+    record_a1 = _frozen_a1()
+    entry_a2 = score_candidate(_result(_TREND_A2.candidate_id, _passing_blocks()))
+    record_a2 = freeze_candidate(
+        entry_a2, frozen_at_ms=1_000_000, freeze_boundary_ms=2_000_000,
+        candidate=_TREND_A2, config=_app_config(), filters=_symbol_filters(),
+    )
+    assert record_a1.strategy_implementation_fingerprint == record_a2.strategy_implementation_fingerprint
+    assert record_a1.execution_semantics_fingerprint == record_a2.execution_semantics_fingerprint
+    assert record_a1.candidate_registry_fingerprint != record_a2.candidate_registry_fingerprint
 
 
 def test_frozen_record_contains_no_secrets_or_credentials():
@@ -522,6 +540,20 @@ def test_assert_frozen_candidate_matches_current_implementation_fails_closed_on_
     with pytest.raises(FrozenCandidateImplementationDriftError) as excinfo:
         assert_frozen_candidate_matches_current_implementation(drifted_record, _TREND_A1, _app_config(), _symbol_filters())
     assert "strategy implementation" in str(excinfo.value)
+
+
+def test_assert_frozen_candidate_matches_current_implementation_fails_closed_on_execution_semantics_drift():
+    # Simulates the shared simulation machinery (engine/broker/portfolio/risk/sizing/
+    # exchange-filter-validation/order-validation/performance code) having changed since
+    # freezing, WITHOUT touching the candidate's own source, registry entry, config, or
+    # filters - isolates the execution-semantics-fingerprint check specifically, and
+    # proves it is reported as a DIFFERENT layer than a strategy-implementation drift.
+    record = _frozen_a1()
+    drifted_record = replace(record, execution_semantics_fingerprint="0" * 64)
+    with pytest.raises(FrozenCandidateImplementationDriftError) as excinfo:
+        assert_frozen_candidate_matches_current_implementation(drifted_record, _TREND_A1, _app_config(), _symbol_filters())
+    assert "execution semantics" in str(excinfo.value)
+    assert "strategy implementation" not in str(excinfo.value)
 
 
 def test_assert_frozen_candidate_matches_current_implementation_rejects_wrong_candidate():

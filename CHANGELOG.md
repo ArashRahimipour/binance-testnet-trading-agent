@@ -2,6 +2,72 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.2] - Second pre-real-evaluation code review correction
+
+A further code review of the 0.2.1 correction found one more pre-
+evaluation design issue and mandated a new risk policy, both fixed here
+BEFORE the first real candidate evaluation against the actual historical
+database - **no real candidate result was inspected before or during this
+release.** Adds 15 tests (437 -> 452 total). No PR was opened, no Testnet
+connection was made, and no order was placed as part of this work.
+
+### Fixed
+
+- **Family A's SECOND manufactured-crossover flaw**
+  (`research/candidates/trend_regime.py`): if the bullish state held for
+  the ENTIRE causally-visible history (e.g. a block's own warm-up window
+  starts mid-trend), the crossover search fell back to treating the
+  EARLIEST visible candle as though a crossover had just happened there -
+  a crossover that was never actually observed, purely an artifact of
+  where the block/warm-up window happens to begin. A cycle can now arm
+  ONLY from an actually observed `fast<=slow` -> `fast>slow` transition
+  within the causally-visible candles; otherwise the strategy reports
+  `HOLD_UNOBSERVED_CYCLE` and produces no BUY, however long the bullish
+  state has visibly held. A1/A2/A3's parameters are unchanged.
+- **Execution-semantics fingerprint** (`research/fingerprint.py::
+  compute_execution_semantics_fingerprint`, new): `FrozenCandidateRecord`
+  now also fingerprints the shared simulation machinery every candidate
+  (and the frozen baseline) runs through - backtest engine, simulated
+  broker, portfolio/accounting, risk engine, sizing, exchange-filter
+  validation, order validation, and performance/PnL calculations -
+  SEPARATELY from the strategy's own implementation fingerprint, so a
+  fail-closed drift report can say which layer changed.
+  `assert_frozen_candidate_matches_current_implementation` checks both.
+- **Fixed minimum 1:2 planned reward/risk policy**
+  (`backtest/risk_reward.py`, new; wired into `backtest/engine.py::
+  run_segment` via `use_fixed_risk_reward_policy`, always enabled for
+  every research candidate via `research/blocked_chronological_
+  evaluation.py`, never for the frozen baseline): every planned BUY is now
+  sized to a fixed 1% of current equity maximum planned loss, with an
+  explicit stop AND take-profit plan (target at exactly 2x the stop
+  distance, so the GROSS reward/risk ratio is exactly 2.0 by construction)
+  computed from the REAL simulated entry fill price (never the earlier
+  reference price or signal close) and persisted with the position. An
+  entry is REJECTED outright if the NET (cost-adjusted, after estimated
+  entry fee, exit fee, and slippage) reward/risk ratio falls below 2.0, or
+  if a risk-safe size cannot satisfy the exchange's minimum notional/lot-
+  size (never satisfied by increasing risk - rounds down and rejects
+  only). No leverage; sizing reserves the entry fee so a fill can never
+  overspend available quote balance; one open position maximum
+  (structural). Backtest rules: entries still fill no earlier than the
+  next candle's open; if both the stop and take-profit are touched within
+  one candle, STOP is assumed to occur first (conservative); a gap through
+  the stop fills at the worse available price (can still exceed the
+  planned risk budget - disclosed, not "fixed" by sizing); a gap beyond
+  the take-profit target is never credited as a favourable improvement
+  (fills at exactly the target, then the existing broker fee/slippage
+  model applies on top); no same-candle entry/exit lookahead (a position's
+  own stop/target checks begin only on the candle AFTER its entry filled).
+  Every candidate's declared signal parameters are unchanged. **Disclosed
+  mathematical property**: because the gross ratio is fixed at exactly the
+  2.0 minimum, ANY nonzero fee or slippage makes the net ratio strictly
+  less than 2.0 for every possible stop distance - under this project's
+  current non-zero fee/slippage defaults, this policy rejects every
+  entry. This is the direct, intended consequence of a maximally
+  conservative, user-mandated policy that never forces a trade and is
+  never loosened to manufacture one - see `backtest/risk_reward.py`'s
+  module docstring.
+
 ## [0.2.1] - Pre-real-evaluation code review correction
 
 A code review of commit `85faa70` (the 0.2.0 research phase) found six

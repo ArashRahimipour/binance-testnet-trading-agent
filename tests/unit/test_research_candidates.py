@@ -44,7 +44,15 @@ def _candles(closes: list[float]) -> list[Candle]:
 # entry per cycle, reset by a bearish crossover) rather than a same-candle
 # crossover+separation check.
 
-_CROSSOVER_CLOSES = [100, 99, 98, 97, 96, 95, 100, 105, 110, 115, 60, 60]
+# The crossover must land STRICTLY AFTER earliest_idx (6, for
+# ema_fast=3/ema_slow=6/atr_period=3) so it is genuinely OBSERVED - i.e.
+# there is a valid prior in-window candle (fast<=slow) to compare against,
+# not merely the ambiguous case of a single already-bullish candle sitting
+# exactly at the warm-up boundary with nothing causally-valid before it to
+# compare to (that ambiguous case must never be treated as a crossover -
+# see test_trend_regime_never_manufactures_a_crossover_at_the_block_boundary).
+# Verified: fast<=slow through index 6, crossover at index 7.
+_CROSSOVER_CLOSES = [100, 99, 98, 97, 96, 95, 94, 100, 105, 110, 115, 60, 60]
 
 # A crossover at index 8 (warm-up 0-5 is a downtrend so fast<=slow), then a
 # GRADUALLY accelerating uptrend whose normalized separation only clears
@@ -59,6 +67,17 @@ _DELAYED_CONFIRMATION_CLOSES = [100, 99, 98, 97, 96, 95] + [
 _TWO_CYCLE_CLOSES = _DELAYED_CONFIRMATION_CLOSES + [180, 160, 140, 120, 100, 90] + [
     92, 95, 99, 104, 110, 117, 125, 134, 144, 155, 167, 180, 195, 212, 230,
 ]
+
+# Strictly increasing from the VERY FIRST candle (index 0). With
+# ema_fast=3/ema_slow=6/atr_period=3 (earliest_idx=6), fast EMA is already
+# above slow EMA well before index 6 - the true crossover happened between
+# index 0 and 1, entirely outside the causally-visible/indicator-valid
+# window this strategy is ever allowed to scan. From `earliest_idx` (6)
+# onward, `fast > slow` holds for the ENTIRE visible history with no
+# observed transition anywhere in it - exactly the "warm-up/block begins
+# already bullish" scenario a manufactured block-boundary crossover would
+# wrongly treat as an armed cycle.
+_ALWAYS_BULLISH_NO_OBSERVED_CROSSOVER_CLOSES = [100.0 + 2.0 * i for i in range(30)]
 
 
 def _wicked_candles(closes: list[float], wick: float = 3.0) -> list[Candle]:
@@ -163,6 +182,23 @@ def test_trend_regime_bearish_crossover_resets_the_cycle_for_a_fresh_entry():
     assert buys[0][0] < exits[0][0] < buys[1][0]
 
 
+def test_trend_regime_never_manufactures_a_crossover_at_the_block_boundary():
+    # THIRD pre-real-evaluation correction: if the ENTIRE causally-visible
+    # window (warm-up included) is already bullish with no OBSERVED
+    # fast<=slow -> fast>slow transition anywhere in it, the strategy must
+    # report HOLD_UNOBSERVED_CYCLE and produce ZERO BUY signals - never
+    # fall back to treating the earliest visible candle as a manufactured
+    # crossover, which would otherwise let every evaluation block that
+    # happens to start mid-trend fabricate its own artificial entry.
+    strat = TrendWithRegimeFilterStrategy(ema_fast=3, ema_slow=6, atr_period=3, min_trend_strength_atr=0.0)
+    candles = _candles(_ALWAYS_BULLISH_NO_OBSERVED_CROSSOVER_CLOSES)
+    signals = _run(strat, candles)
+    signal_types = {s[1] for s in signals}
+    assert SignalType.BUY not in signal_types
+    assert SignalType.EXIT not in signal_types
+    assert all(s[2] == "HOLD_UNOBSERVED_CYCLE" for s in signals)
+
+
 def test_trend_regime_no_lookahead():
     # Prove causality the same way test_strategy_trend_baseline.py does:
     # append wildly different future candles and confirm the EARLIER
@@ -188,9 +224,9 @@ def test_trend_regime_no_same_close_execution_is_the_engines_job():
     # this module's own test file.
     strat = TrendWithRegimeFilterStrategy(ema_fast=3, ema_slow=6, atr_period=3, min_trend_strength_atr=0.0)
     candles = _candles(_CROSSOVER_CLOSES)
-    sig = strat.generate_signal(candles[:7], PositionSide.FLAT)
+    sig = strat.generate_signal(candles[:8], PositionSide.FLAT)
     assert sig.type == SignalType.BUY
-    assert sig.candle_close_time_ms == candles[6].close_time_ms  # a SIGNAL, not a fill
+    assert sig.candle_close_time_ms == candles[7].close_time_ms  # a SIGNAL, not a fill
 
 
 # --- Family B: breakout with volatility-normalized entry. ---

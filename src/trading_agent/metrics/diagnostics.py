@@ -56,6 +56,12 @@ class RunDiagnostics:
     ending_cash_quote: Decimal
     ending_base_quantity: Decimal
     ends_with_open_position: bool
+    #: Only ever non-zero under `backtest/engine.py::run_segment`'s fixed
+    #: 1:2 risk/reward policy (`use_fixed_risk_reward_policy=True`) - a
+    #: take-profit exit is impossible on the unmodified legacy/frozen-
+    #: baseline stop-only path. Defaults to 0 so existing positional/
+    #: keyword construction predating this field is unaffected.
+    executed_take_profit_exits: int = 0
 
 
 @dataclass(frozen=True, slots=True)
