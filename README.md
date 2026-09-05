@@ -171,6 +171,24 @@ provenance (source, retrieval time, component count, first/last
 timestamp, validation result, deterministic SHA-256 content hash) for
 every candle they classify as recoverable.
 
+**Bounded, observable, and resumable** (post-incident fix - a real run
+once appeared to hang for 90 minutes with zero output; see CHANGELOG.md's
+`[0.6.1]` entry for the full root cause): every HTTP request has an
+explicit, bounded connect/read timeout and at most 3 attempts with capped
+backoff; each gap's entire missing range is fetched in as few batched
+requests as possible (never one request per hour or minute); each gap
+also has its own wall-clock budget (`--max-seconds-per-gap`, default 60s)
+- exceeding it marks that gap's remaining hours `UNRESOLVED` rather than
+waiting further. Both commands print live, immediately-flushed progress
+(`gap 3/28: ...`, each fetch attempt with its outcome) and checkpoint
+every completed gap to `<data_dir>/gap_audit_checkpoint.json`: Ctrl+C
+exits cleanly with a partial summary, and re-running later resumes
+without re-downloading anything already audited (pass `--reset-checkpoint`
+to force a full re-audit instead). `research-gap-recover --confirm`
+refuses to store anything at all if the audit was interrupted before
+finishing every confirmed gap - recovery is impossible without a
+completed audit.
+
 ## Backtesting
 
 ```bash

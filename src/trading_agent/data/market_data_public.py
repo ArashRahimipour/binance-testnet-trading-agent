@@ -27,7 +27,18 @@ class DisallowedHostError(ValueError):
 
 
 class BinancePublicMarketDataClient:
-    def __init__(self, base_url: str, timeout_seconds: float = 10.0) -> None:
+    def __init__(self, base_url: str, timeout_seconds: float | tuple[float, float] = 10.0) -> None:
+        """`timeout_seconds` is forwarded VERBATIM as every `requests` call's
+        own `timeout=` argument, which accepts either a single float
+        (applied to BOTH the connect and the read phase) or an explicit
+        `(connect_timeout, read_timeout)` tuple - every request this
+        client ever makes (`get_server_time_ms`, `get_klines`,
+        `get_exchange_info`) is bounded by it; there is no unbounded
+        request anywhere in this class. Callers that want the connect and
+        read phases bounded independently (e.g. `data/gap_recovery.py`,
+        see `DEFAULT_CONNECT_TIMEOUT_SECONDS`/`DEFAULT_READ_TIMEOUT_SECONDS`
+        there) should pass the tuple form explicitly.
+        """
         if base_url not in ALLOWED_HOSTS:
             raise DisallowedHostError(
                 f"host {base_url!r} is not permitted; allowed hosts are {sorted(ALLOWED_HOSTS)}"

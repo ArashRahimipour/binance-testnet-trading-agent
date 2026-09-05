@@ -2,6 +2,93 @@
 
 All notable changes to this project are documented here.
 
+## [0.6.1] - Fix: research-gap-audit operational hang (bounded, batched, resumable)
+
+**Operational fix**, found from a real 90-minute hang on the real local
+dataset (28 confirmed gaps, 128 missing hours): process state "sleeping",
+0% CPU, zero progress output, only Ctrl+C terminated it. Root cause (the
+exact code path capable of waiting this long): the previous
+`data/gap_recovery.py` fired ONE HTTP request per MISSING HOUR (up to 128
+of them), each independently retried up to 5 times with UNCAPPED
+exponential backoff (2s/4s/8s/16s/32s = 62s of pure `time.sleep` per
+exhausted hour), and printed NOTHING until the entire analysis - every
+hour of every gap - had finished. A handful of slow/failing hours alone
+could burn minutes of pure sleep; multiplied across 128 hours with zero
+interim output, the worst case was multiple hours, indistinguishable from
+a true hang. `research-gap-audit` was NOT run against the real dataset as
+part of this fix - root-caused from the process symptoms and the existing
+source, and fixed with synthetic fixtures only. No candle, strategy,
+parameter, scorecard, or execution logic was touched. Adds 25 new tests
+(686 total).
+
+### Fixed
+
+- **`data/market_data_public.py::BinancePublicMarketDataClient`**: now
+  documents and accepts an explicit `(connect_timeout, read_timeout)`
+  tuple for `timeout_seconds`, forwarded verbatim to every `requests`
+  call it makes (`get_server_time_ms`, `get_klines`, `get_exchange_info`)
+  - there is no unbounded request anywhere in this class.
+- **`data/gap_recovery.py`** (substantially rewritten orchestration -
+  reconstruction rule, aggregation math, and cutoff/provenance behavior
+  are unchanged): each gap's ENTIRE missing minute-range is now fetched
+  in as few BATCHED, paginated requests as possible (up to 1000
+  candles/request), never one request per hour or per minute
+  (`_fetch_1m_range`). At most `DEFAULT_MAX_RETRIES` (3, was 5) attempts
+  per request, with backoff CAPPED at `DEFAULT_MAX_BACKOFF_SECONDS` (was
+  uncapped exponential). Each gap now carries its own bounded wall-clock
+  deadline (`max_seconds_per_gap`, default 60s) - exceeding it marks that
+  gap's remaining unchecked hours `UNRESOLVED` ("time budget exceeded")
+  instead of continuing to wait; 28 gaps x 60s is a 28-minute absolute
+  worst case, versus the previous unbounded multi-hour hang. An optional
+  `on_progress` callback is invoked immediately at every gap start, every
+  fetch attempt (with attempt number and outcome), and every gap
+  completion. A `KeyboardInterrupt` (Ctrl+C) is now caught INSIDE
+  `run_gap_forensics` itself, which returns a normal `interrupted=True`
+  report covering whatever gaps completed so far, rather than propagating
+  a raw traceback. A new `GapAuditCheckpoint` persists every gap's
+  completed result to `<data_dir>/gap_audit_checkpoint.json` immediately
+  (atomic write) as it finishes, so re-running the audit after an
+  interruption never re-downloads an already-audited gap - a checkpoint
+  entry is only reused if the gap's own identity (all four `GapRecord`
+  fields) still matches exactly. `apply_gap_recovery` now raises the new
+  `IncompleteAuditError` when handed an `interrupted` report - recovery
+  remains impossible without a completed audit, regardless of `--confirm`.
+- **`cli/main.py::research-gap-audit` / `research-gap-recover`**: both
+  gained `--max-seconds-per-gap` (default 60.0) and `--reset-checkpoint`;
+  `--max-retries` now defaults to 3 (was 5, reusing `historical_fetch.py`'s
+  own default). Both commands now print live, immediately-flushed
+  progress and use a checkpoint at `<data_dir>/gap_audit_checkpoint.json`
+  by default. `research-gap-recover` checks `report.interrupted` BEFORE
+  checking `--confirm` and refuses to store anything (exit code 130) if
+  the audit was interrupted, even with `--confirm` passed.
+
+### Added
+
+- **`tests/unit/test_gap_recovery_resilience.py`** (25 tests): proves
+  bounded connect/read timeouts are forwarded on every client method; a
+  request that always fails is retried exactly `max_retries` times with
+  capped backoff and never more; a `Timeout` exception is handled
+  identically to any other request failure; a multi-hour gap is fetched
+  in ONE batched request (not one per hour), and a 20-hour gap needing
+  multiple 1000-candle pages still uses only a handful of requests; an
+  exchange that would otherwise paginate endlessly is still bounded by
+  the per-gap deadline, with hours already fetched before the cutoff
+  correctly classified and only the genuinely-unreached ones marked
+  `UNRESOLVED`; progress messages contain the gap index/total, timestamp
+  range, attempt number, and outcome, and the CLI's own progress printer
+  flushes stdout on every call; a `KeyboardInterrupt` raised mid-gap (from
+  a failing request or from within a backoff sleep) yields a clean
+  `interrupted=True` report with exactly the gaps completed so far, and
+  `apply_gap_recovery` refuses to store anything from such a report; a
+  second run against the same on-disk checkpoint (a fresh `GapAuditCheckpoint`
+  instance, proving real persistence) does not re-fetch an already-audited
+  gap at all, resuming after an interruption re-fetches only the
+  uncompleted gap, a changed gap's checkpoint entry is correctly treated
+  as a miss, a missing/corrupted checkpoint file is tolerated, and
+  `--reset-checkpoint`'s `clear()` forces a fresh re-audit; and a
+  source-level regression lock proving this module still never imports or
+  calls any backtest/execution/candidate-evaluation machinery.
+
 ## [0.6.0] - Research-data gap forensic and recovery tool
 
 A new, OPTIONAL tool for the 28 confirmed BTCUSDT 1h gaps: forensically
