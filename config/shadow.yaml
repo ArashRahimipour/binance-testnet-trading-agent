@@ -1,0 +1,67 @@
+# Shadow-mode configuration for the frozen multitimeframe_breakout_E1_round3
+# candidate (see shadow/engine.py). Forward-only, read-only-to-the-exchange
+# observation - no order, real or simulated-against-a-live-book, is ever
+# placed. Uses its OWN database (data/shadow_agent.db) - completely
+# separate from config/default.yaml's data/trading_agent.db and
+# config/round3_1h.yaml's research database, so shadow observation can
+# never read, write, or otherwise interact with either.
+#
+# Do not edit market.interval (must stay "1h" - E1's own requirement),
+# risk.max_risk_per_trade_pct (fixed at 1% per the shadow-mode mandate),
+# or backtest.starting_equity (fixed at $50, matching the mandate's own
+# "simulated $50 equity" - "backtest" here just names the config section;
+# shadow/engine.py reuses backtest/engine.py::run_segment UNMODIFIED as
+# its simulation core, it does not run a historical backtest).
+
+mode: shadow
+
+market:
+  symbol: BTCUSDT
+  interval: 1h          # completed candles only - REQUIRED by E1 and by shadow-run
+  timezone_display: Australia/Sydney   # internal storage/logic is always UTC
+
+strategy:
+  name: ema_crossover_trend
+  ema_fast: 20
+  ema_slow: 50
+  # Unused by shadow-run (E1 is its own fixed candidate, not this
+  # baseline strategy) - kept only so this file remains a fully valid
+  # AppConfig.
+
+sizing:
+  max_allocation_pct: 0.90
+  min_quote_buffer: 5.0
+
+fees:
+  taker_fee_pct: 0.001
+  maker_fee_pct: 0.001
+  slippage_pct: 0.0005
+
+risk:
+  max_position_pct: 0.90
+  # Fixed at 1% per the shadow-mode mandate - the fraction of the
+  # simulated $50 equity risked if E1's own stop is hit, sized by
+  # sizing/position_sizer.py exactly as backtest/research already do.
+  max_risk_per_trade_pct: 0.01
+  max_daily_loss_pct: 0.05
+  max_drawdown_pct: 0.15
+  max_trades_per_day: 4
+  cooldown_bars_after_loss: 2
+  stale_data_max_age_seconds: 21600
+  min_quote_balance: 5.0
+  max_consecutive_api_errors: 3
+
+stop_loss:
+  stop_distance_pct: 0.05
+
+backtest:
+  train_fraction: 0.6
+  validation_fraction: 0.2
+  test_fraction: 0.2
+  min_trades_for_significance: 20
+  starting_equity: 50.0   # the mandate's own "simulated $50 equity"
+
+paths:
+  data_dir: data
+  logs_dir: logs
+  db_path: data/shadow_agent.db   # SEPARATE from default.yaml/round3_1h.yaml - see this file's own header comment

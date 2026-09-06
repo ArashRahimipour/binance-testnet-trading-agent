@@ -26,8 +26,11 @@ def test_mode_rejects_arbitrary_string():
         AppConfig(mode="production")
 
 
-def test_mode_only_has_backtest_and_testnet():
-    assert {m.value for m in Mode} == {"backtest", "testnet"}
+def test_mode_has_exactly_backtest_testnet_and_shadow_never_live():
+    # A deliberately closed enum: BACKTEST, TESTNET, and (forward-only,
+    # never-order-placing) SHADOW - and, crucially, still no "live" mode.
+    assert {m.value for m in Mode} == {"backtest", "testnet", "shadow"}
+    assert "live" not in {m.value for m in Mode}
 
 
 def test_strategy_requires_fast_below_slow():

@@ -1,9 +1,19 @@
 """Typed, validated configuration models.
 
-`Mode` is intentionally a two-member enum. There is no "live" member, and no
-field anywhere in this module accepts a production Binance host. Adding a
-third mode or a configurable trading base URL would require editing this
-file directly - it cannot be done via a config file or environment variable.
+`Mode` is intentionally a small, closed enum. There is no "live" member,
+and no field anywhere in this module accepts a production Binance
+ORDER-PLACEMENT host. Adding a mode or a configurable trading base URL
+would require editing this file directly - it cannot be done via a
+config file or environment variable.
+
+`SHADOW` (forward-only shadow observation of the frozen
+`multitimeframe_breakout_E1_round3` candidate - see `shadow/`) is, like
+`BACKTEST`, structurally incapable of placing an order: nothing in
+`shadow/` ever imports `execution/testnet_adapter.py` or constructs a
+client for any host other than the public, unauthenticated market-data
+endpoints `data/market_data_public.py` already restricts requests to
+(see `ALLOWED_HOSTS`) - see `tests/unit/test_shadow_engine.py`'s own
+source-level regression lock for this.
 """
 
 from __future__ import annotations
@@ -16,10 +26,14 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class Mode(str, Enum):
-    """The only two supported execution modes in V0.1."""
+    """The only supported execution modes in V0.1."""
 
     BACKTEST = "backtest"
     TESTNET = "testnet"
+    #: Forward-only, read-only-to-the-exchange shadow observation of the
+    #: frozen E1 candidate - never places an order, real or simulated
+    #: against a live order book. See `shadow/engine.py`.
+    SHADOW = "shadow"
 
 
 class MarketConfig(BaseModel):

@@ -1,11 +1,13 @@
 # Binance Spot Testnet Trading Agent (V0.1)
 
 > **Live trading is not available in this version.** V0.1 supports exactly
-> two execution modes: `backtest` (simulated fills on historical data) and
+> three execution modes: `backtest` (simulated fills on historical data),
 > `testnet` (real orders against the Binance **Spot Testnet** only, using
-> play money). There is no `live` mode, no production Binance endpoint
-> anywhere in the order-submission code path, and no way to configure one -
-> see [SECURITY.md](SECURITY.md) for how that is enforced and tested.
+> play money), and `shadow` (forward-only, real-market simulation of one
+> frozen research candidate - see [Shadow mode](#shadow-mode-forward-only-observation-of-multitimeframe_breakout_e1_round3)
+> below). There is no `live` mode, no production Binance endpoint anywhere
+> in the order-submission code path, and no way to configure one - see
+> [SECURITY.md](SECURITY.md) for how that is enforced and tested.
 
 A modular, safety-first prototype for a multi-market trading agent. This
 version trades BTC/USDT spot only, on 4-hour candles, long-or-cash only -
@@ -709,6 +711,79 @@ trading-agent status
 
 Shows the current mode, kill switch state, and portfolio state (never
 secrets).
+
+## Shadow mode: forward-only observation of `multitimeframe_breakout_E1_round3`
+
+Shadow mode continuously simulates the frozen, already-evaluated E1
+candidate (`research/candidates/multitimeframe_breakout.py`) against real,
+completed Binance BTCUSDT 1h candles going forward from a fixed start
+boundary - **`2026-09-06T00:00:00Z`, and never earlier** (`shadow/boundary.py`).
+It exists to observe how E1 would have performed on data it has never
+seen, without a single dollar - real or Testnet - ever at risk. **It never
+places an order of any kind.** See `shadow/engine.py` for the full design.
+
+Everything about E1 itself - its rules, its 2R-net risk/reward policy, its
+1h/4h/weekly logic, fees, slippage, sizing, and its already-published
+research results - is completely unchanged by shadow mode. Shadow mode
+only ever adds a new, independent, forward-only observation of it, in its
+own database (`data/shadow_agent.db`, separate from every other database
+in this project) and its own config (`config/shadow.yaml`).
+
+### Exact local setup
+
+```bash
+git clone <this repository> && cd binance-testnet-trading-agent
+git checkout claude/binance-testnet-trading-agent-h9lx17   # or your merged main branch
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+python -m pytest -q            # 727 tests should pass
+ruff check .                   # should report no issues
+mypy src                       # should report no issues
+```
+
+### First-run commands
+
+```bash
+# 1. Sanity-check the config and confirm the store is empty (fully local, no network call):
+trading-agent --config config/shadow.yaml shadow-status
+
+# 2. Run one cycle by hand to confirm connectivity (reads Binance's public,
+#    unauthenticated market-data endpoint only - no API key is used or needed):
+trading-agent --config config/shadow.yaml shadow-run
+
+# 3. Schedule it to run once per completed 1h candle (5 minutes after each
+#    hour, server time is UTC) - e.g. via cron:
+crontab -e
+# 5 * * * * cd /path/to/binance-testnet-trading-agent && .venv/bin/trading-agent --config config/shadow.yaml shadow-run >> logs/shadow_cron.log 2>&1
+
+# 4. Check progress at any time (both are fully local/read-only, no network call):
+trading-agent --config config/shadow.yaml shadow-status
+trading-agent --config config/shadow.yaml shadow-report
+
+# 5. Pause shadow observation at any time without losing any state:
+trading-agent --config config/shadow.yaml shadow-kill-switch engage --reason "..."
+trading-agent --config config/shadow.yaml shadow-kill-switch status
+trading-agent --config config/shadow.yaml shadow-kill-switch disengage
+```
+
+`shadow-run` is idempotent and crash-recoverable: it re-derives its entire
+result from the immutable candle history plus the frozen E1 strategy on
+every invocation and persists only what is new since the last successful
+cycle, in one atomic transaction, keyed so a completed candle can never be
+scored twice - running it twice in the same hour, or resuming after a
+crash mid-cycle, is always safe. A file-based lock
+(`data/shadow.lock`) additionally refuses to let two `shadow-run`
+processes execute at the same time.
+
+**E1 requires ~7,564 completed 1h candles (~315 days) of warm-up before it
+can generate its first signal.** Every `shadow-run` cycle before then
+correctly reports `INSUFFICIENT_DATA` and simply keeps accumulating
+history - this is expected, not an error. A promotion review requires at
+least 30 CLOSED forward trades (`shadow-report` discloses progress toward
+this on every run) and is, in any case, a separate manual decision this
+tool does not make. **No output of this tool is ever a claim of
+profitability, and nothing it produces authorizes Testnet or live
+trading.**
 
 ## Documentation index
 

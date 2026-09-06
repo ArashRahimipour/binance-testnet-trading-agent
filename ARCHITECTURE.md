@@ -46,6 +46,7 @@ fact.
 | `journal/` | Append-only audit trail of every decision |
 | `metrics/` | Backtest performance report computation |
 | `backtest/` | The backtest engine tying the above together: a continuous operational simulation AND an independent fixed-parameter holdout evaluation - see below |
+| `shadow/` | Forward-only, real-market shadow observation of one frozen research candidate (`multitimeframe_breakout_E1_round3`) - reuses `backtest/engine.py::run_segment` unmodified as its simulation core; never places an order - see below |
 | `cli/` | The `trading-agent` command-line entry point |
 | `logging_setup.py` | Structured JSON logging with mandatory secret redaction |
 
@@ -497,6 +498,89 @@ reach or influence any of that.
   close before the entry - only the engine's own post-fill check reads
   this candle's OHLC, and only after the fill. Candidates' declared
   signal parameters are unchanged.
+
+## Shadow mode (`shadow/`): forward-only observation of a frozen candidate
+
+Shadow mode answers a different question from everything above: not "how
+did E1 perform on already-observed history" (the research phase already
+answered that) but "how is E1 performing on real market data it has never
+seen, going forward, starting from a fixed date" - without ever risking
+real or Testnet capital to find out.
+
+**Design constraint, honored throughout:** nothing in `shadow/` modifies
+E1 itself, its config, its risk policy, or any already-published research
+result. `shadow/engine.py::run_shadow_cycle` reuses `backtest/engine.py::
+run_segment` - the exact same simulation core `research/round3_report.py`
+uses for E1 - completely unmodified, so shadow mode's entry/stop/target/
+fee/slippage/sizing assumptions are byte-for-byte identical to the
+already-evaluated candidate.
+
+**"Recompute everything, every cycle" instead of incremental state.** A
+naive incremental design (carry a rolling strategy/portfolio state forward
+between cycles) would need to reimplement or duplicate the exact state
+transitions `run_segment` already owns. Instead, every `shadow-run`
+invocation re-runs `run_segment` from scratch over the ENTIRE accumulated
+shadow candle history (from the fixed start boundary through the latest
+completed candle). This is a pure, deterministic function of immutable
+inputs, so it is naturally idempotent: the same inputs always produce the
+same outputs. `shadow/store.py::ShadowStore` then diffs the freshly
+computed trades/equity/journal entries against a persisted high-water mark
+(`last_processed_close_time_ms`) and inserts only the rows strictly after
+it, in one atomic transaction that also advances the mark - so a crash
+between "candles fetched" and "this transaction commits" is always safe to
+retry, and a completed candle can never be scored twice into the
+persisted record. The cost of this design is that `run_segment`'s own
+per-candle loop re-aggregates E1's weekly/4h view of history on every
+call, so the recompute cost grows faster than linearly with the length of
+the accumulated history - acceptable for an hourly cycle over the
+multi-month/year horizon shadow mode is meant to run for, not a general
+performance guarantee for an unboundedly long-lived deployment.
+
+**The fixed shadow start boundary** (`shadow/boundary.py::
+SHADOW_START_BOUNDARY_MS`, `2026-09-06T00:00:00Z`) is a plain module
+constant, deliberately NOT a config field - a config field could be moved
+earlier by a user, which would violate "must be fixed at or after". Every
+candle shadow mode ever fetches, stores, or scores is filtered/asserted
+against it (`assert_no_pre_boundary_candles`) before it can reach the
+strategy. This is a completely different, independent boundary from
+`research/cutoff.py::RESEARCH_CUTOFF_MS` (2025-05-16T00:00:00Z, the
+pre-cutoff research/development boundary) - shadow mode never reads,
+writes, or otherwise interacts with the research cutoff module.
+
+**Structurally incapable of placing an order.** `shadow/` only ever
+constructs `data/market_data_public.py::BinancePublicMarketDataClient`
+against the read-only public market-data host - the same class every
+other backtest/research code path already uses, with no signing logic and
+no order-placement method of any kind. Nothing in `shadow/` imports
+`execution/testnet_adapter.py` (the ONLY class in this codebase capable of
+submitting a real order) - `tests/unit/test_shadow_engine.py` proves this
+at the source level, not just by code review.
+
+**Kill switch is a coarse, "pause everything" gate.** `shadow/engine.py`
+checks a dedicated shadow kill switch (`risk/kill_switch.py::KillSwitch`,
+reused unmodified, pointed at its own flag file) FIRST, before any fetch,
+lock acquisition, or processing - if engaged, the entire cycle
+short-circuits. This is coarser than `execution/live_runner.py`'s
+per-order `RiskContext.kill_switch_engaged` gating (which still lets a
+cycle run and only blocks the order itself); a finer-grained gate here
+would require modifying `run_segment`, which is forbidden by this
+package's own design constraint.
+
+**Overlap lock.** `shadow/lock.py::ShadowLock` is a non-blocking
+`fcntl.flock` advisory lock on a dedicated file - a second concurrent
+`shadow-run` invocation fails immediately with `ShadowLockError` rather
+than queuing or corrupting state; the OS releases the lock automatically
+if the holding process crashes.
+
+**Two SQLite connections, one file.** `data/storage.py::CandleStore`
+(candle history) and `shadow/store.py::ShadowStore` (everything else -
+trades, equity, journal entries, run state, the current open position)
+both point at `data/shadow_agent.db`, but as two independent connections.
+This is safe because, within one process, their writes are always
+sequential and never interleaved: a cycle upserts fetched candles
+(committing that write) strictly before it opens and commits
+`ShadowStore`'s own transaction - and `shadow/lock.py` guarantees only one
+process ever runs a cycle at a time.
 
 ## Crash recovery, the pending-order state machine, and the atomic transaction boundary
 

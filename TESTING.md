@@ -1,6 +1,6 @@
 # Testing
 
-415 tests, all offline: nothing in the suite makes a real network call or
+727 tests, all offline: nothing in the suite makes a real network call or
 requires real credentials. HTTP is mocked with the `responses` library at
 the point where `requests` would otherwise reach the network; time-
 sensitive behavior is tested by passing explicit reference timestamps
@@ -107,6 +107,12 @@ ruff check src tests       # lint
 | `testnet-health`: no local state created or modified | `tests/unit/test_testnet_health.py::test_no_database_or_local_state_file_created_when_none_exists`, `::test_existing_local_state_is_not_modified`, `::test_pending_orders_reported_but_not_reconciled`, `test_execution_store.py::test_open_read_only_returns_none_and_creates_nothing_when_file_absent`, `::test_open_read_only_connection_rejects_writes` |
 | `testnet-health`: secrets/signatures never leak | `tests/unit/test_testnet_health.py::test_secret_never_appears_in_report_on_happy_path`, `::test_secret_never_appears_on_invalid_credentials_failure`, `::test_secret_never_appears_in_cli_stdout_or_stderr` |
 | `testnet-health`: balance/open-order reporting, fail-closed behavior | `tests/unit/test_testnet_health.py::test_nonzero_btc_balance_is_reported_as_information_not_a_failure`, `::test_locked_balances_are_reported`, `::test_open_orders_are_displayed_without_modification`, `::test_excessive_clock_drift_fails_closed_before_any_signed_request`, `::test_malformed_exchange_information_fails_closed`, `::test_invalid_credentials_produce_a_sanitized_failure` |
+| Shadow start boundary (`shadow/boundary.py`): exactly `2026-09-06T00:00:00Z`, rejects any candle strictly before it, passes on an all-at-or-after list and an empty list, `filter_from_boundary` drops only the early candles and preserves order | `tests/unit/test_shadow_boundary.py` |
+| Shadow overlap lock (`shadow/lock.py`): acquire-then-release allows reacquisition, a concurrent acquisition attempt raises `ShadowLockError` immediately (never blocks), the context manager releases on exit even when the body raises, parent directory is created | `tests/unit/test_shadow_lock.py` |
+| Shadow store atomicity/idempotency (`shadow/store.py`): a cycle's trades/equity/journal entries/open-position/high-water-mark are all persisted together; retrying the identical call 3 times never duplicates a row; `touch_cycle` advances observability fields but never the high-water mark; a fault injected at any of 4 points inside the atomic transaction (after trades, after equity, after journal entries, before commit) rolls back completely - every table and the high-water mark are left exactly as before; an open position is correctly cleared once its closing trade is persisted | `tests/unit/test_shadow_store.py` |
+| Shadow report math (`shadow/report.py`, reuses `metrics/performance.py::compute_performance_report` unmodified): win rate/expectancy-in-R/expectancy-in-$/longest-losing-streak computed correctly from a mixed win/loss trade sequence, the 30-closed-trade promotion gate flips exactly at 30 (never before), a still-open position's unrealized PnL is computed from the latest stored candle's close, and a confirmed gap between two stored segments is correctly reported (gap count, missing intervals, current segment length) | `tests/unit/test_shadow_report.py` |
+| Shadow engine (`shadow/engine.py`): rejects a non-shadow mode and a non-1h interval before any I/O; the kill switch and the overlap lock both short-circuit BEFORE any network call is even attempted (proven by registering zero HTTP mocks - an unexpected request fails loudly rather than silently reaching the network); the first-ever fetch floors `startTime` at the fixed boundary and correctly reports `INSUFFICIENT_DATA` while still storing what it fetched; a full cycle through the real E1 strategy and the real `run_segment` persists exactly one approved entry (as a closed trade or a still-open position) and is idempotent on an immediate retry (no new candle -> `NO_NEW_CANDLES`, zero duplicate rows); fetching exactly one new candle advances the high-water mark and the equity curve by exactly one point; and a source-level regression lock proving `shadow/` never imports `execution/testnet_adapter.py` | `tests/unit/test_shadow_engine.py` |
+| Shadow CLI (`shadow-run`/`shadow-status`/`shadow-report`/`shadow-kill-switch`): `--mode shadow` is a valid CLI choice and `--mode live` is still rejected; all four commands require `--mode shadow`; `shadow-run` reports `KILL_SWITCH_ENGAGED` and touches no network when the shadow kill switch is engaged; the shadow kill-switch group (engage/status/disengage) round-trips correctly and is completely independent of the Testnet `kill-switch` group; `shadow-status`/`shadow-report` work correctly against a fresh, empty store | `tests/unit/test_shadow_cli.py` |
 
 ## Fixtures
 
@@ -121,11 +127,16 @@ ruff check src tests       # lint
   This is a real gap: the mocked adapter tests prove the code *would*
   behave correctly given a certain HTTP response, not that the Testnet
   actually returns that response in every case.
-- Concurrency / multi-process access to the SQLite files - V0.1 assumes
-  one CLI invocation at a time (see ARCHITECTURE.md). Automatic scheduling
-  is not implemented at all yet - see
-  [SCHEDULING_DESIGN.md](SCHEDULING_DESIGN.md) for the overlap-guard
-  design required before it can be, which therefore also has no tests.
+- Concurrency / multi-process access to the SQLite files for `backtest`/
+  `testnet` mode - V0.1 assumes one CLI invocation at a time there (see
+  ARCHITECTURE.md). Automatic scheduling of those modes is not implemented
+  at all yet - see [SCHEDULING_DESIGN.md](SCHEDULING_DESIGN.md) for the
+  overlap-guard design required before it can be, which therefore also has
+  no tests. `shadow` mode is the one exception: it IS meant to run
+  unattended on a schedule (e.g. cron, once per completed 1h candle), so
+  it has its own overlap guard (`shadow/lock.py::ShadowLock`) with real
+  concurrent-acquisition tests (`tests/unit/test_shadow_lock.py`) - this
+  bullet does not apply to it.
 - A Testnet-native protective order (OCO / `STOP_LOSS_LIMIT`) - not
   implemented at all in this revision, so there is nothing to test; see
   RISK_POLICY.md's "Protective exits" section for why, and what would need

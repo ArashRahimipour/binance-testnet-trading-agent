@@ -2,6 +2,90 @@
 
 All notable changes to this project are documented here.
 
+## [0.7.0] - Add shadow mode: forward-only observation of the frozen `multitimeframe_breakout_E1_round3` candidate
+
+**New capability, additive only.** Nothing about E1 itself (`research/
+candidates/multitimeframe_breakout.py`), its 2R-net risk/reward policy,
+its weekly/4h/1h rules, `backtest/engine.py::run_segment`,
+`backtest/risk_reward.py`, `risk/engine.py`, or any already-published
+research result was touched. This adds a completely new, independent
+package (`shadow/`) that continuously simulates E1 against real,
+completed Binance BTCUSDT 1h candles going forward from a fixed boundary
+(`2026-09-06T00:00:00Z`, never earlier), in its own database
+(`data/shadow_agent.db`) and its own config (`config/shadow.yaml`). **It
+never places an order of any kind - real, Testnet, or otherwise -** and
+makes no claim of profitability. Developed entirely against synthetic
+fixtures; no real network call was made during development. Adds 41 new
+tests (727 total).
+
+### Added
+
+- **`config/models.py::Mode.SHADOW`** - a third execution mode, alongside
+  the existing `BACKTEST`/`TESTNET`. Structurally incapable of placing an
+  order, exactly like `BACKTEST` - see the module's rewritten docstring
+  and `tests/unit/test_shadow_engine.py`'s source-level regression lock.
+  `test_config.py`'s old `test_mode_only_has_backtest_and_testnet` is
+  replaced by `test_mode_has_exactly_backtest_testnet_and_shadow_never_live`,
+  which still asserts "live" is rejected.
+- **`config/shadow.yaml`** - a new, dedicated config: `mode: shadow`,
+  `market.interval: "1h"` (E1's own requirement), `risk.max_risk_per_trade_pct: 0.01`,
+  `backtest.starting_equity: 50.0` (the mandate's "simulated $50 equity"),
+  and `paths.db_path: data/shadow_agent.db` - completely separate from
+  every other database in this project.
+- **`shadow/boundary.py`**: `SHADOW_START_BOUNDARY_MS` (`2026-09-06T00:00:00Z`)
+  - a plain module constant, deliberately NOT a config field (a config
+    field could be moved earlier by a user). `assert_no_pre_boundary_candles`/
+    `filter_from_boundary` guard every candle shadow mode ever touches.
+    Independent of, and never interacting with, `research/cutoff.py`'s
+    own immutable pre-cutoff research boundary.
+- **`shadow/lock.py::ShadowLock`**: a non-blocking `fcntl.flock`-based
+  overlap guard - a second concurrent `shadow-run` fails immediately with
+  `ShadowLockError` rather than queuing or corrupting state; the OS
+  releases the lock automatically on a crash.
+- **`shadow/store.py::ShadowStore`**: the durable, atomic store for
+  everything one shadow cycle produces (`shadow_trades`, `shadow_equity`,
+  `shadow_journal_entries`, `shadow_run_state` incl. the current open
+  position). `record_cycle_atomically` inserts only rows strictly after a
+  persisted high-water mark (`last_processed_close_time_ms`) and advances
+  it, all in one transaction (`BEGIN IMMEDIATE` / `COMMIT` / `ROLLBACK`,
+  with a test-only fault-injection seam at 4 points) - idempotent on
+  retry, crash-recoverable, and a completed candle can never be scored
+  twice into the persisted record.
+- **`shadow/engine.py::run_shadow_cycle`**: the orchestration for one
+  cycle - kill switch check (first, before any I/O) -> overlap lock ->
+  fetch only new completed candles (`data/ingestion.py::fetch_completed_candles`,
+  floored at `max(SHADOW_START_BOUNDARY_MS, latest_stored_close_ms + 1)`)
+  -> upsert into `data/storage.py::CandleStore` (unmodified) -> partition
+  into gap-free segments (`data/gap_detection.py::partition_into_segments`,
+  unmodified) and evaluate only the latest one -> guard `len(segment) >=
+  E1.min_required_candles` (else `INSUFFICIENT_DATA`, ~315 days of
+  warm-up) -> call `backtest/engine.py::run_segment` UNMODIFIED, over the
+  full latest segment, with a fresh throwaway `Journal(":memory:")`, with
+  `use_fixed_risk_reward_policy=True` matching E1's own already-evaluated
+  policy exactly -> diff against the store's high-water mark and persist
+  atomically. A deliberate "recompute everything, every cycle" design
+  (see ARCHITECTURE.md) rather than hand-rolled incremental state, so
+  idempotency falls directly out of `run_segment` being a pure function.
+- **`shadow/report.py::build_shadow_report`**: strictly local/read-only
+  (no Binance call). Reuses `metrics/performance.py::compute_performance_report`
+  unmodified for trade count/win rate/max drawdown/profit factor; adds
+  expectancy in R-multiples and in quote currency, total fees + adverse
+  slippage cost, the longest losing streak, the still-open position's
+  unrealized PnL (from the latest stored candle, no invented exit), a
+  data-gap summary, and the fixed 30-closed-trade promotion-review gate
+  (`SHADOW_MIN_CLOSED_TRADES_FOR_PROMOTION_REVIEW`) - never claims
+  profitability, never approves Testnet/live trading.
+- **CLI**: `shadow-run` (one cycle; requires `--mode shadow`),
+  `shadow-status` (local state, no network), `shadow-report` (the full
+  report above, no network), and `shadow-kill-switch` (`engage`/`disengage`/
+  `status`, completely independent of the existing Testnet `kill-switch`
+  group and flag file).
+
+### Fixed
+
+- **`tests/unit/test_config.py`**: the one pre-existing test regression
+  from adding `Mode.SHADOW` (see above).
+
 ## [0.6.1] - Fix: research-gap-audit operational hang (bounded, batched, resumable)
 
 **Operational fix**, found from a real 90-minute hang on the real local

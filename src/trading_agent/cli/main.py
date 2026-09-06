@@ -1,8 +1,8 @@
 """Command-line entry point.
 
-The `--mode` option is a `click.Choice` restricted to the two Mode enum
-values ("backtest", "testnet"). There is no "live" choice and no way to pass
-one - click rejects any other value before any application code runs.
+The `--mode` option is a `click.Choice` built directly from the `Mode` enum
+("backtest", "testnet", "shadow"). There is no "live" choice and no way to
+pass one - click rejects any other value before any application code runs.
 """
 
 from __future__ import annotations
@@ -76,6 +76,14 @@ from trading_agent.research.sensitivity_comparison import (
     build_candidate_sensitivity_comparison,
 )
 from trading_agent.risk.kill_switch import KillSwitch
+from trading_agent.shadow.boundary import SHADOW_START_BOUNDARY_ISO
+from trading_agent.shadow.engine import (
+    ShadowConfigError,
+    run_shadow_cycle,
+    shadow_kill_switch_path,
+)
+from trading_agent.shadow.lock import ShadowLockError
+from trading_agent.shadow.report import ShadowReport, build_shadow_report
 from trading_agent.sizing.exchange_filters import SymbolFilters
 
 
@@ -1476,6 +1484,159 @@ def kill_switch_disengage(ctx: click.Context) -> None:
 def kill_switch_status(ctx: click.Context) -> None:
     config: AppConfig = ctx.obj["config"]
     switch = KillSwitch(config.paths.data_dir / "KILL_SWITCH")
+    click.echo(f"ENGAGED: {switch.reason()}" if switch.is_engaged() else "disengaged")
+
+
+@cli.command("shadow-run")
+@click.pass_context
+def shadow_run_cmd(ctx: click.Context) -> None:
+    """Run one forward-only shadow cycle for the frozen
+    multitimeframe_breakout_E1_round3 candidate (see shadow/engine.py).
+
+    Fetches only completed Binance BTCUSDT candles (read-only, no API key),
+    never before SHADOW_START_BOUNDARY_ISO, simulates entries/stops/targets
+    against E1's own already-evaluated rules, and persists everything to
+    data/shadow_agent.db. NEVER submits a Testnet or live order of any kind.
+    Intended to be invoked once per completed 1h candle (e.g. by an
+    external scheduler/cron) - see README.md for exact setup.
+    """
+    config: AppConfig = ctx.obj["config"]
+    if config.mode != Mode.SHADOW:
+        click.echo("The shadow-run command requires --mode shadow.", err=True)
+        sys.exit(1)
+    try:
+        result = run_shadow_cycle(config)
+    except ShadowLockError as exc:
+        click.echo(str(exc), err=True)
+        sys.exit(1)
+    except ShadowConfigError as exc:
+        click.echo(str(exc), err=True)
+        sys.exit(1)
+    click.echo(
+        f"status={result.status} new_candles_fetched={result.new_candles_fetched} "
+        f"segment_length={result.segment_length} min_required_candles={result.min_required_candles} "
+        f"new_trades={result.new_trades_persisted} new_equity_points={result.new_equity_points_persisted} "
+        f"new_journal_entries={result.new_journal_entries_persisted}"
+    )
+    click.echo(result.detail)
+    click.echo(
+        "This is a forward-only shadow simulation - no order was placed, and no profitability is claimed."
+    )
+
+
+@cli.command("shadow-status")
+@click.pass_context
+def shadow_status_cmd(ctx: click.Context) -> None:
+    """Show shadow mode's current local state (no Binance call is made)."""
+    config: AppConfig = ctx.obj["config"]
+    if config.mode != Mode.SHADOW:
+        click.echo("The shadow-status command requires --mode shadow.", err=True)
+        sys.exit(1)
+    switch = KillSwitch(shadow_kill_switch_path(config))
+    click.echo(f"shadow_start_boundary: {SHADOW_START_BOUNDARY_ISO}")
+    click.echo(f"shadow kill_switch: {'ENGAGED (' + (switch.reason() or '') + ')' if switch.is_engaged() else 'disengaged'}")
+    report = build_shadow_report(config)
+    state = report.run_state
+    click.echo(f"total_cycles: {state.total_cycles}")
+    click.echo(f"last_run_at_ms: {state.last_run_at_ms}")
+    click.echo(f"last_processed_close_time_ms: {state.last_processed_close_time_ms}")
+    click.echo(f"last_cycle_status: {state.last_cycle_status}  detail: {state.last_cycle_detail}")
+    click.echo(
+        f"data: {report.data_gaps.stored_candle_count} stored candle(s), "
+        f"{report.data_gaps.latest_segment_length}/{report.data_gaps.min_required_candles} in current segment, "
+        f"{report.data_gaps.gap_count} confirmed gap(s)"
+    )
+    click.echo(f"closed_trades: {report.performance.trade_count}")
+    if report.open_position is not None:
+        click.echo(
+            f"open_position: entry_time_ms={report.open_position.entry_time_ms} "
+            f"entry_price={report.open_position.entry_price} quantity={report.open_position.quantity} "
+            f"unrealized_pnl_quote={report.open_position.unrealized_pnl_quote}"
+        )
+    else:
+        click.echo("open_position: none")
+    click.echo(report.promotion_review_note)
+
+
+@cli.command("shadow-report")
+@click.pass_context
+def shadow_report_cmd(ctx: click.Context) -> None:
+    """Print the full shadow-mode report: closed trades, win rate,
+    expectancy (in R and in quote currency), drawdown, costs, longest
+    losing streak, open position, and data gaps. Strictly local/read-only -
+    no Binance call is ever made. See shadow/report.py.
+    """
+    config: AppConfig = ctx.obj["config"]
+    if config.mode != Mode.SHADOW:
+        click.echo("The shadow-report command requires --mode shadow.", err=True)
+        sys.exit(1)
+    report: ShadowReport = build_shadow_report(config)
+    perf = report.performance
+
+    click.echo(f"=== Shadow report: multitimeframe_breakout_E1_round3 (since {SHADOW_START_BOUNDARY_ISO}) ===")
+    click.echo(f"closed_trades: {perf.trade_count}")
+    click.echo(f"win_rate_pct: {perf.win_rate}")
+    click.echo(f"expectancy_r: {report.expectancy_r}")
+    click.echo(f"expectancy_quote: {report.expectancy_quote}")
+    click.echo(f"profit_factor: {perf.profit_factor}")
+    click.echo(f"max_drawdown_pct: {perf.max_drawdown_pct}")
+    click.echo(f"starting_equity: {perf.starting_equity}  ending_equity: {perf.ending_equity}")
+    click.echo(
+        f"exit_reasons: strategy={perf.strategy_exit_count} stop_loss={perf.stop_loss_exit_count} "
+        f"take_profit={perf.take_profit_exit_count}"
+    )
+    click.echo(f"longest_losing_streak: {report.longest_losing_streak}")
+    click.echo(f"total_fees_paid_quote: {report.total_fees_paid_quote}")
+    click.echo(f"total_slippage_cost_quote: {report.total_slippage_cost_quote}")
+    click.echo(
+        f"data_gaps: {report.data_gaps.gap_count} confirmed gap(s), "
+        f"{report.data_gaps.total_missing_intervals} missing interval(s) total, "
+        f"{report.data_gaps.stored_candle_count} stored candle(s), "
+        f"current segment {report.data_gaps.latest_segment_length}/{report.data_gaps.min_required_candles}"
+    )
+    if report.open_position is not None:
+        pos = report.open_position
+        click.echo(
+            f"open_position: entry_time_ms={pos.entry_time_ms} entry_price={pos.entry_price} "
+            f"quantity={pos.quantity} latest_close_price={pos.latest_close_price} "
+            f"unrealized_pnl_quote={pos.unrealized_pnl_quote}"
+        )
+    else:
+        click.echo("open_position: none")
+    click.echo(f"promotion_review: {report.promotion_review_note}")
+    click.echo(report.not_profitable_note)
+
+
+@cli.group("shadow-kill-switch")
+def shadow_kill_switch_group() -> None:
+    """Manually controlled shadow-mode kill switch - halts shadow-run
+    entirely when engaged. Completely separate from the testnet
+    `kill-switch` group and flag file."""
+
+
+@shadow_kill_switch_group.command("engage")
+@click.option("--reason", default="", help="Why the shadow kill switch is being engaged.")
+@click.pass_context
+def shadow_kill_switch_engage(ctx: click.Context, reason: str) -> None:
+    config: AppConfig = ctx.obj["config"]
+    switch = KillSwitch(shadow_kill_switch_path(config))
+    switch.engage(reason)
+    click.echo(f"Shadow kill switch ENGAGED: {switch.reason()}")
+
+
+@shadow_kill_switch_group.command("disengage")
+@click.pass_context
+def shadow_kill_switch_disengage(ctx: click.Context) -> None:
+    config: AppConfig = ctx.obj["config"]
+    KillSwitch(shadow_kill_switch_path(config)).disengage()
+    click.echo("Shadow kill switch DISENGAGED.")
+
+
+@shadow_kill_switch_group.command("status")
+@click.pass_context
+def shadow_kill_switch_status(ctx: click.Context) -> None:
+    config: AppConfig = ctx.obj["config"]
+    switch = KillSwitch(shadow_kill_switch_path(config))
     click.echo(f"ENGAGED: {switch.reason()}" if switch.is_engaged() else "disengaged")
 
 
