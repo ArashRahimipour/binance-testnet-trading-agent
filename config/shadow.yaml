@@ -65,3 +65,18 @@ paths:
   data_dir: data
   logs_dir: logs
   db_path: data/shadow_agent.db   # SEPARATE from default.yaml/round3_1h.yaml - see this file's own header comment
+
+# Optional Telegram notifications for shadow-run (entry/exit/daily-summary
+# messages) - see shadow/notifications/ and README.md's "Shadow mode"
+# section. Disabled by default; shadow trading is completely unaffected
+# either way (a Telegram outage or misconfiguration never blocks, delays,
+# or corrupts a shadow-run cycle - see shadow/notifications/sender.py).
+#
+# The bot token and chat ID are NEVER set here - they are secrets, read
+# ONLY from the environment (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in your
+# .env file, never committed - see .env.example). Setting enabled: true
+# without both environment variables present just means no notification
+# is ever sent; run `trading-agent --config config/shadow.yaml
+# telegram-config-check` to verify without revealing the secret values.
+telegram:
+  enabled: false

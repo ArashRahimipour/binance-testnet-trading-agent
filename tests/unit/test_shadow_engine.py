@@ -24,6 +24,7 @@ which is `shadow/bootstrap.py`'s own module's job to test - see
 
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 
@@ -444,6 +445,212 @@ def test_one_new_candle_advances_the_high_water_mark_by_exactly_one(tmp_path):
         assert state.last_processed_close_time_ms == next_candle.close_time_ms
         equity = store.get_equity_curve()
         assert equity[-1].timestamp_ms == next_candle.close_time_ms
+
+
+# --- Telegram notifications wired into run_shadow_cycle --------------------
+
+
+@responses.activate
+def test_new_open_position_enqueues_and_sends_an_entry_notification(tmp_path, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "444444:AAEntryWiringTestToken")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "55")
+    config = _shadow_config(tmp_path, telegram={"enabled": True})
+
+    kick_at = BOUNDARY_IDX + 3
+    n_total = OFFICIAL_EVAL_IDX + 5
+    all_candles = _full_candles(n_total, kick_at=kick_at)
+    warmup_candles = all_candles[:WARMUP_CANDLE_COUNT]
+    forward_candles = all_candles[WARMUP_CANDLE_COUNT:]
+    _direct_bootstrap(config, warmup_candles)
+    with CandleStore(config.paths.db_path) as candle_store:
+        candle_store.upsert_candles(forward_candles)
+
+    responses.add(
+        responses.GET, f"{PROD_HOST}/api/v3/time", json={"serverTime": all_candles[-1].close_time_ms + 1}, status=200
+    )
+    responses.add(responses.GET, f"{PROD_HOST}/api/v3/klines", json=[], status=200)
+    responses.add(responses.GET, f"{PROD_HOST}/api/v3/exchangeInfo", json=make_exchange_info(min_notional="0.01"), status=200)
+    responses.add(
+        responses.POST, "https://api.telegram.org/bot444444:AAEntryWiringTestToken/sendMessage",
+        json={"ok": True}, status=200,
+    )
+
+    result = run_shadow_cycle(config)
+    assert result.status == SHADOW_STATUS_OK
+
+    with ShadowStore(config.paths.db_path) as store:
+        state = store.get_run_state()
+        notifications = store.list_notifications()
+    assert state.open_position is not None
+    entry_events = [n for n in notifications if n.event_type == "entry"]
+    assert len(entry_events) == 1
+    assert entry_events[0].event_id == f"entry:{state.open_position.entry_time_ms}"
+    assert entry_events[0].status == "SENT"
+    assert "SHADOW ENTRY" in entry_events[0].payload_text
+    assert "NO REAL OR TESTNET ORDER WAS PLACED" in entry_events[0].payload_text
+    assert "444444:AAEntryWiringTestToken" not in entry_events[0].payload_text
+
+
+@responses.activate
+def test_notifications_disabled_by_default_makes_zero_telegram_calls(tmp_path, monkeypatch):
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    config = _shadow_config(tmp_path)  # telegram.enabled defaults to False
+    assert config.telegram.enabled is False
+
+    kick_at = BOUNDARY_IDX + 3
+    n_total = OFFICIAL_EVAL_IDX + 5
+    all_candles = _full_candles(n_total, kick_at=kick_at)
+    warmup_candles = all_candles[:WARMUP_CANDLE_COUNT]
+    forward_candles = all_candles[WARMUP_CANDLE_COUNT:]
+    _direct_bootstrap(config, warmup_candles)
+    with CandleStore(config.paths.db_path) as candle_store:
+        candle_store.upsert_candles(forward_candles)
+
+    responses.add(
+        responses.GET, f"{PROD_HOST}/api/v3/time", json={"serverTime": all_candles[-1].close_time_ms + 1}, status=200
+    )
+    responses.add(responses.GET, f"{PROD_HOST}/api/v3/klines", json=[], status=200)
+    responses.add(responses.GET, f"{PROD_HOST}/api/v3/exchangeInfo", json=make_exchange_info(min_notional="0.01"), status=200)
+    # Deliberately NO Telegram mock registered - any attempt fails loudly.
+
+    result = run_shadow_cycle(config)
+    assert result.status == SHADOW_STATUS_OK
+
+    with ShadowStore(config.paths.db_path) as store:
+        notifications = store.list_notifications()
+    entry_events = [n for n in notifications if n.event_type == "entry"]
+    assert len(entry_events) == 1
+    assert entry_events[0].status == "PENDING"  # enqueued, but never sent while disabled
+    assert not any(call.request.url.startswith("https://api.telegram.org") for call in responses.calls)
+
+
+@responses.activate
+def test_an_entry_and_its_own_exit_within_one_cycle_both_send_notifications(tmp_path, monkeypatch):
+    """`run_shadow_cycle` recomputes the ENTIRE latest segment every time
+    it runs - so a hypothetical position can both open AND close within a
+    single cycle's evaluation window (e.g. after a long kill-switch pause,
+    or simply a fast-moving take-profit). Both the entry and the exit must
+    still get their own notification - the entry is never silently
+    skipped just because the position is no longer open by the time the
+    cycle finishes."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "555555:AASameCycleTestToken")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "66")
+    config = _shadow_config(tmp_path, telegram={"enabled": True})
+
+    kick_at = BOUNDARY_IDX + 3
+    entry_idx = OFFICIAL_EVAL_IDX + 1
+    target_hit_idx = entry_idx + 5
+    n_total = target_hit_idx + 3
+    all_candles = _full_candles(n_total, kick_at=kick_at)
+    # Blow well past any plausible take-profit target on one later candle,
+    # guaranteeing the freshly-opened position closes within this SAME
+    # cycle's segment (never touching risk/reward math itself - just
+    # engineering a price path that reliably crosses whatever target that
+    # unmodified math already computed).
+    inflated = replace(all_candles[target_hit_idx], high=all_candles[target_hit_idx].high * 2)
+    all_candles[target_hit_idx] = inflated
+
+    warmup_candles = all_candles[:WARMUP_CANDLE_COUNT]
+    forward_candles = all_candles[WARMUP_CANDLE_COUNT:]
+    _direct_bootstrap(config, warmup_candles)
+    with CandleStore(config.paths.db_path) as candle_store:
+        candle_store.upsert_candles(forward_candles)
+
+    responses.add(
+        responses.GET, f"{PROD_HOST}/api/v3/time", json={"serverTime": all_candles[-1].close_time_ms + 1}, status=200
+    )
+    responses.add(responses.GET, f"{PROD_HOST}/api/v3/klines", json=[], status=200)
+    responses.add(responses.GET, f"{PROD_HOST}/api/v3/exchangeInfo", json=make_exchange_info(min_notional="0.01"), status=200)
+    responses.add(
+        responses.POST, "https://api.telegram.org/bot555555:AASameCycleTestToken/sendMessage",
+        json={"ok": True}, status=200,
+    )
+
+    result = run_shadow_cycle(config)
+    assert result.status == SHADOW_STATUS_OK
+
+    with ShadowStore(config.paths.db_path) as store:
+        trades = store.get_all_trades()
+        state = store.get_run_state()
+        notifications = store.list_notifications()
+    assert len(trades) == 1  # opened AND closed within this one cycle
+    assert state.open_position is None
+
+    entry_events = [n for n in notifications if n.event_type == "entry"]
+    exit_events = [n for n in notifications if n.event_type == "exit"]
+    assert len(entry_events) == 1
+    assert len(exit_events) == 1
+    assert entry_events[0].event_id == f"entry:{trades[0].trade.entry_time_ms}"
+    assert exit_events[0].event_id == f"exit:{trades[0].trade.exit_time_ms}"
+    assert entry_events[0].status == "SENT"
+    assert exit_events[0].status == "SENT"
+    assert "SHADOW EXIT" in exit_events[0].payload_text
+    assert "Closed trade count (to date): 1" in exit_events[0].payload_text
+
+
+@responses.activate
+def test_a_trade_opened_in_an_earlier_cycle_gets_only_one_entry_notification(tmp_path, monkeypatch):
+    """An entry notified when the position first opened (cycle 1) must
+    NEVER be re-sent when that same position closes in a LATER cycle
+    (cycle 2) - only the exit is new at that point."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "666666:AATwoCycleTestToken")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "77")
+    config = _shadow_config(tmp_path, telegram={"enabled": True})
+
+    kick_at = BOUNDARY_IDX + 3
+    n_total = OFFICIAL_EVAL_IDX + 5
+    all_candles = _full_candles(n_total, kick_at=kick_at)
+    warmup_candles = all_candles[:WARMUP_CANDLE_COUNT]
+    forward_candles = all_candles[WARMUP_CANDLE_COUNT:]
+    _direct_bootstrap(config, warmup_candles)
+    with CandleStore(config.paths.db_path) as candle_store:
+        candle_store.upsert_candles(forward_candles)
+
+    telegram_url = "https://api.telegram.org/bot666666:AATwoCycleTestToken/sendMessage"
+    responses.add(
+        responses.GET, f"{PROD_HOST}/api/v3/time", json={"serverTime": all_candles[-1].close_time_ms + 1}, status=200
+    )
+    responses.add(responses.GET, f"{PROD_HOST}/api/v3/klines", json=[], status=200)
+    responses.add(responses.GET, f"{PROD_HOST}/api/v3/exchangeInfo", json=make_exchange_info(min_notional="0.01"), status=200)
+    responses.add(responses.POST, telegram_url, json={"ok": True}, status=200)
+
+    first = run_shadow_cycle(config)
+    assert first.status == SHADOW_STATUS_OK
+    with ShadowStore(config.paths.db_path) as store:
+        assert store.get_run_state().open_position is not None
+        # Filtered by event_type since a real daily summary may ALSO have
+        # fired this cycle, depending on the actual wall-clock Melbourne
+        # time the test happens to run at - irrelevant to what this test
+        # is proving (entry de-duplication across cycles).
+        first_cycle_entries = [n for n in store.list_notifications() if n.event_type == "entry"]
+        assert len(first_cycle_entries) == 1
+
+    # A second cycle with one more candle that blows through the target,
+    # closing the SAME position that was already notified as an entry.
+    # `_candle(n_total, ...)` continues exactly where `all_candles` left
+    # off (index n_total is the very next hour after `all_candles[-1]`).
+    next_candle = _candle(n_total, close=float(all_candles[-1].close) * 3)
+    with CandleStore(config.paths.db_path) as candle_store:
+        candle_store.upsert_candles([next_candle])
+
+    responses.add(
+        responses.GET, f"{PROD_HOST}/api/v3/time", json={"serverTime": next_candle.close_time_ms + 1}, status=200
+    )
+    responses.add(responses.GET, f"{PROD_HOST}/api/v3/klines", json=[], status=200)
+    responses.add(responses.GET, f"{PROD_HOST}/api/v3/exchangeInfo", json=make_exchange_info(min_notional="0.01"), status=200)
+    responses.add(responses.POST, telegram_url, json={"ok": True}, status=200)
+
+    second = run_shadow_cycle(config)
+    assert second.status == SHADOW_STATUS_OK
+    with ShadowStore(config.paths.db_path) as store:
+        trades = store.get_all_trades()
+        notifications = store.list_notifications()
+    assert len(trades) == 1
+    entry_events = [n for n in notifications if n.event_type == "entry"]
+    exit_events = [n for n in notifications if n.event_type == "exit"]
+    assert len(entry_events) == 1  # NOT duplicated on the closing cycle
+    assert len(exit_events) == 1
 
 
 # --- Source-level regression lock: shadow/ can never reach order placement. ---

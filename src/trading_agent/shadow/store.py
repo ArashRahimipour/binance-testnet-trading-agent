@@ -102,7 +102,29 @@ CREATE TABLE IF NOT EXISTS shadow_warmup_candles (
     fetched_at_ms INTEGER NOT NULL,
     source TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS shadow_notification_outbox (
+    event_id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    payload_text TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at_ms INTEGER,
+    last_error TEXT,
+    sent_at_ms INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS shadow_notification_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    last_daily_summary_melbourne_date TEXT
+);
 """
+
+NOTIFICATION_STATUS_PENDING = "PENDING"
+NOTIFICATION_STATUS_SENT = "SENT"
+NOTIFICATION_STATUS_AMBIGUOUS = "AMBIGUOUS"
+NOTIFICATION_STATUS_FAILED = "FAILED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +166,29 @@ class ShadowRunState:
     open_position: OpenPositionInfo | None
 
 
+@dataclass(frozen=True, slots=True)
+class NotificationEvent:
+    """One durable outbox row - see `shadow/notifications/` for how these
+    are built and sent. `event_id` MUST be deterministic (derived from the
+    trading fact it describes - an entry/exit timestamp, or a Melbourne
+    calendar date for a daily summary) so re-enqueuing the same logical
+    event across repeated/retried shadow cycles is a harmless no-op
+    (`ON CONFLICT(event_id) DO NOTHING`) rather than a duplicate row.
+    `payload_text` is the fully rendered message text - see `shadow/
+    notifications/builder.py` - and never contains a secret of any kind.
+    """
+
+    event_id: str
+    event_type: str
+    created_at_ms: int
+    payload_text: str
+    status: str = NOTIFICATION_STATUS_PENDING
+    attempt_count: int = 0
+    last_attempt_at_ms: int | None = None
+    last_error: str | None = None
+    sent_at_ms: int | None = None
+
+
 class _InjectedTestFault(Exception):
     """Raised only when a test has set `_raise_fault_at` - proves the
     atomic cycle transaction rolls back completely regardless of where the
@@ -158,9 +203,10 @@ class ShadowStore:
         self._conn.executescript(_SCHEMA)
         # Test-only fault injection seam - see tests/unit/test_shadow_store.py.
         # Never set outside tests. Valid values: "after_trades",
-        # "after_equity", "after_journal", "before_commit" (all in
-        # `record_cycle_atomically`), and "after_warmup_candles",
-        # "before_commit" (in `record_bootstrap_atomically`).
+        # "after_equity", "after_journal", "after_notifications",
+        # "before_commit" (all in `record_cycle_atomically`), and
+        # "after_warmup_candles", "before_commit" (in
+        # `record_bootstrap_atomically`).
         self._raise_fault_at: str | None = None
 
     def close(self) -> None:
@@ -244,6 +290,7 @@ class ShadowStore:
         segment_length: int,
         status: str,
         detail: str,
+        notification_events: list[NotificationEvent] | None = None,
     ) -> None:
         """Insert every new row this cycle produced, update the current
         open-position snapshot, and advance the high-water mark - all in
@@ -252,6 +299,14 @@ class ShadowStore:
         already-persisted row is a no-op), so retrying this exact call
         after a crash (with the same, or a superset, of `new_trades` etc.)
         leaves the database in the same state as if it had succeeded once.
+
+        `notification_events` (optional - see `shadow/notifications/`) is
+        enqueued in this SAME transaction, so a hypothetical trade and the
+        durable record of its notification either both commit or neither
+        does - a Telegram-side failure can never lose, and a crash can
+        never duplicate, the underlying trading event. Sending the
+        notification itself always happens AFTER this call returns (see
+        `shadow/notifications/sender.py`), never inside it.
         """
         self._conn.execute("BEGIN IMMEDIATE")
         try:
@@ -268,6 +323,10 @@ class ShadowStore:
             for entry in new_journal_entries:
                 self._insert_journal_entry_no_commit(entry)
             self._maybe_raise_fault("after_journal")
+
+            for event in notification_events or []:
+                self._insert_notification_event_no_commit(event)
+            self._maybe_raise_fault("after_notifications")
 
             self._upsert_run_state(
                 last_processed_close_time_ms=new_last_processed_close_time_ms,
@@ -334,6 +393,113 @@ class ShadowStore:
     def get_warmup_candle_count(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) FROM shadow_warmup_candles").fetchone()
         return int(row[0])
+
+    # --- Notification outbox (see shadow/notifications/) -----------------
+
+    def enqueue_notifications_atomically(self, events: list[NotificationEvent]) -> None:
+        """Enqueue notification events on their own (e.g. a daily summary,
+        which is not tied to a specific trade-persisting cycle write).
+        Idempotent exactly like the events enqueued inside
+        `record_cycle_atomically` - a duplicate `event_id` is a no-op."""
+        if not events:
+            return
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            for event in events:
+                self._insert_notification_event_no_commit(event)
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+
+    def get_notification(self, event_id: str) -> NotificationEvent | None:
+        row = self._conn.execute(
+            """
+            SELECT event_id, event_type, created_at_ms, payload_text, status, attempt_count,
+                   last_attempt_at_ms, last_error, sent_at_ms
+            FROM shadow_notification_outbox WHERE event_id = ?
+            """,
+            (event_id,),
+        ).fetchone()
+        return self._row_to_notification_event(row) if row is not None else None
+
+    def list_notifications(self, status: str | None = None) -> list[NotificationEvent]:
+        if status is None:
+            rows = self._conn.execute(
+                """
+                SELECT event_id, event_type, created_at_ms, payload_text, status, attempt_count,
+                       last_attempt_at_ms, last_error, sent_at_ms
+                FROM shadow_notification_outbox ORDER BY created_at_ms ASC
+                """
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """
+                SELECT event_id, event_type, created_at_ms, payload_text, status, attempt_count,
+                       last_attempt_at_ms, last_error, sent_at_ms
+                FROM shadow_notification_outbox WHERE status = ? ORDER BY created_at_ms ASC
+                """,
+                (status,),
+            ).fetchall()
+        return [self._row_to_notification_event(row) for row in rows]
+
+    def update_notification_status(
+        self,
+        event_id: str,
+        status: str,
+        attempt_count: int,
+        last_attempt_at_ms: int | None,
+        last_error: str | None,
+        sent_at_ms: int | None,
+    ) -> None:
+        """A standalone, independent write - deliberately NOT bundled with
+        `record_cycle_atomically`'s transaction, since delivery always
+        happens strictly after that transaction has already committed (see
+        `shadow/notifications/sender.py`). `last_error`, when given, must
+        already be a SAFE, secret-redacted string - this method trusts its
+        caller on that (see `shadow/notifications/telegram_client.py`)."""
+        self._conn.execute(
+            """
+            UPDATE shadow_notification_outbox
+            SET status = ?, attempt_count = ?, last_attempt_at_ms = ?, last_error = ?, sent_at_ms = ?
+            WHERE event_id = ?
+            """,
+            (status, attempt_count, last_attempt_at_ms, last_error, sent_at_ms, event_id),
+        )
+        self._conn.commit()
+
+    def get_last_daily_summary_melbourne_date(self) -> str | None:
+        row = self._conn.execute(
+            "SELECT last_daily_summary_melbourne_date FROM shadow_notification_state WHERE id = 1"
+        ).fetchone()
+        return row[0] if row is not None else None
+
+    def record_daily_summary_sent(self, melbourne_date_iso: str) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO shadow_notification_state (id, last_daily_summary_melbourne_date)
+            VALUES (1, ?)
+            ON CONFLICT(id) DO UPDATE SET last_daily_summary_melbourne_date = excluded.last_daily_summary_melbourne_date
+            """,
+            (melbourne_date_iso,),
+        )
+        self._conn.commit()
+
+    @staticmethod
+    def _row_to_notification_event(row: tuple) -> NotificationEvent:
+        (event_id, event_type, created_at_ms, payload_text, status, attempt_count,
+         last_attempt_at_ms, last_error, sent_at_ms) = row
+        return NotificationEvent(
+            event_id=event_id,
+            event_type=event_type,
+            created_at_ms=created_at_ms,
+            payload_text=payload_text,
+            status=status,
+            attempt_count=attempt_count,
+            last_attempt_at_ms=last_attempt_at_ms,
+            last_error=last_error,
+            sent_at_ms=sent_at_ms,
+        )
 
     def record_bootstrap_atomically(
         self,
@@ -417,6 +583,21 @@ class ShadowStore:
             ON CONFLICT(timestamp_ms) DO NOTHING
             """,
             (point.timestamp_ms, str(point.equity), int(point.in_position)),
+        )
+
+    def _insert_notification_event_no_commit(self, event: NotificationEvent) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO shadow_notification_outbox
+                (event_id, event_type, created_at_ms, payload_text, status, attempt_count,
+                 last_attempt_at_ms, last_error, sent_at_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(event_id) DO NOTHING
+            """,
+            (
+                event.event_id, event.event_type, event.created_at_ms, event.payload_text, event.status,
+                event.attempt_count, event.last_attempt_at_ms, event.last_error, event.sent_at_ms,
+            ),
         )
 
     def _insert_journal_entry_no_commit(self, entry: dict[str, Any]) -> None:

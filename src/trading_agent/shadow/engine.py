@@ -79,8 +79,10 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from trading_agent.backtest.engine import run_segment
 from trading_agent.config.models import AppConfig
@@ -93,6 +95,7 @@ from trading_agent.data.market_data_public import (
 from trading_agent.data.storage import CandleStore
 from trading_agent.execution.backtest_broker import BacktestBroker
 from trading_agent.journal.journal import Journal
+from trading_agent.metrics.performance import EquityPoint
 from trading_agent.research.candidates.multitimeframe_breakout import (
     MultiTimeframeBreakoutStrategy,
 )
@@ -108,7 +111,16 @@ from trading_agent.shadow.boundary import (
     filter_from_boundary,
 )
 from trading_agent.shadow.lock import ShadowLock
-from trading_agent.shadow.store import ShadowStore, ShadowTradeRecord
+from trading_agent.shadow.notifications.builder import (
+    build_daily_summary_message,
+    build_entry_message,
+    build_exit_message,
+    compute_realized_plan_for_display,
+    compute_trade_stats_to_date,
+)
+from trading_agent.shadow.notifications.sender import flush_pending_notifications
+from trading_agent.shadow.report import build_shadow_report
+from trading_agent.shadow.store import NotificationEvent, ShadowStore, ShadowTradeRecord
 from trading_agent.sizing.exchange_filters import SymbolFilters
 
 __all__ = [
@@ -137,6 +149,164 @@ def shadow_kill_switch_path(config: AppConfig) -> Path:
 
 def shadow_lock_path(config: AppConfig) -> Path:
     return config.paths.data_dir / SHADOW_LOCK_FILENAME
+
+
+def _equity_before(equity_curve: list[EquityPoint], time_ms: int, fallback: Decimal) -> Decimal:
+    """The last equity-curve point strictly before `time_ms` - for an
+    entry fill at `time_ms`, this is the PRE-fill equity (the prior
+    candle's close, appended the iteration before the fill happened) - see
+    `backtest/engine.py::run_segment`'s per-candle equity-curve append.
+    Falls back to `fallback` (the segment's starting equity) when the
+    entry occurred at the very first evaluated candle, before which no
+    equity-curve point exists."""
+    candidate = fallback
+    for point in equity_curve:
+        if point.timestamp_ms >= time_ms:
+            break
+        candidate = point.equity
+    return candidate
+
+
+def _equity_at_or_after(equity_curve: list[EquityPoint], time_ms: int, fallback: Decimal) -> Decimal:
+    """The first equity-curve point at or after `time_ms` - for an exit
+    filled at `time_ms` (always a candle's `open_time_ms`), this is the
+    POST-exit equity for that same candle (its `close_time_ms` point,
+    appended in the same loop iteration after the exit was applied)."""
+    for point in equity_curve:
+        if point.timestamp_ms >= time_ms:
+            return point.equity
+    return fallback
+
+
+def _find_buy_signal(journal: Journal, entry_time_ms: int) -> tuple[int, str, dict]:
+    """The `SIGNAL` journal entry that produced this entry fill. Candles
+    are contiguous, so the signal candle's `close_time_ms` always equals
+    `entry_time_ms - 1` (the fill happens at the very next candle's
+    `open_time_ms` - see `backtest/engine.py`'s next-open fill design).
+    Falls back to a placeholder rather than raising - a notification is
+    never allowed to fail the shadow cycle that produced the real trade."""
+    signal_time_ms = entry_time_ms - 1
+    for entry in journal.entries_by_type("SIGNAL"):
+        if entry["timestamp_ms"] == signal_time_ms and entry["payload"].get("type") == "buy":
+            payload = entry["payload"]
+            return signal_time_ms, str(payload.get("reason_code", "UNKNOWN")), payload
+    return signal_time_ms, "UNKNOWN", {}
+
+
+def _build_entry_notification_event(
+    config: AppConfig,
+    filters: SymbolFilters,
+    journal: Journal,
+    *,
+    entry_time_ms: int,
+    entry_price: Decimal,
+    entry_reference_price: Decimal,
+    quantity: Decimal,
+    entry_fee_quote: Decimal,
+    equity_curve: list[EquityPoint],
+    starting_equity: Decimal,
+    symbol: str,
+    now_ms: int,
+) -> NotificationEvent:
+    """Builds the ENTRY notification for one newly-created hypothetical
+    position - called once per genuinely NEW entry this cycle, whether
+    that position is still open at the end of the cycle (`result.
+    open_position`) or already closed again within this SAME recompute
+    (a `Trade`, since `run_segment` recomputes the whole latest segment
+    every cycle, an entry and its own exit can both land in one cycle) -
+    see the two call sites below.
+    """
+    equity_before_entry = _equity_before(equity_curve, entry_time_ms, starting_equity)
+    realized_plan = compute_realized_plan_for_display(
+        entry_price, quantity, equity_before_entry, config, filters,
+    )
+    signal_time_ms, reason_code, signal_inputs = _find_buy_signal(journal, entry_time_ms)
+    message = build_entry_message(
+        event_id=f"entry:{entry_time_ms}",
+        symbol=symbol,
+        signal_time_ms=signal_time_ms,
+        entry_time_ms=entry_time_ms,
+        entry_price=entry_price,
+        entry_reference_price=entry_reference_price,
+        quantity=quantity,
+        entry_fee_quote=entry_fee_quote,
+        equity_before_entry=equity_before_entry,
+        realized_plan=realized_plan,
+        signal_reason_code=reason_code,
+        signal_inputs=signal_inputs,
+        config=config,
+    )
+    return NotificationEvent(
+        event_id=f"entry:{entry_time_ms}",
+        event_type="entry",
+        created_at_ms=now_ms,
+        payload_text=message,
+    )
+
+
+def _build_exit_notification_event(
+    symbol: str,
+    record: ShadowTradeRecord,
+    trade_records_to_date: list[ShadowTradeRecord],
+    equity_curve: list[EquityPoint],
+    starting_equity: Decimal,
+    now_ms: int,
+) -> NotificationEvent:
+    updated_equity = _equity_at_or_after(equity_curve, record.trade.exit_time_ms, starting_equity)
+    closed_trade_count, win_rate_pct, expectancy_quote, expectancy_r = compute_trade_stats_to_date(
+        trade_records_to_date
+    )
+    message = build_exit_message(
+        event_id=f"exit:{record.trade.exit_time_ms}",
+        symbol=symbol,
+        trade=record.trade,
+        planned_risk_quote=record.planned_risk_quote,
+        updated_equity=updated_equity,
+        closed_trade_count=closed_trade_count,
+        win_rate_pct=win_rate_pct,
+        expectancy_quote=expectancy_quote,
+        expectancy_r=expectancy_r,
+    )
+    return NotificationEvent(
+        event_id=f"exit:{record.trade.exit_time_ms}",
+        event_type="exit",
+        created_at_ms=now_ms,
+        payload_text=message,
+    )
+
+
+def _maybe_send_daily_summary(config: AppConfig) -> None:
+    """Enqueue at most one SHADOW daily-summary notification per Melbourne
+    calendar date (`Australia/Melbourne`, DST-aware via `zoneinfo`), on the
+    first successful cycle at or after 08:00 local time - if the machine
+    was asleep through 08:00, the first later successful cycle still sends
+    it (this is only ever called from a successful-cycle return path, and
+    is checked every such cycle, not scheduled separately). Never raises -
+    a failure here must never affect a shadow cycle's own result.
+    """
+    try:
+        melbourne_now = datetime.now(ZoneInfo("Australia/Melbourne"))
+        if melbourne_now.hour < 8:
+            return
+        today_iso = melbourne_now.date().isoformat()
+        with ShadowStore(config.paths.db_path) as shadow_store:
+            if shadow_store.get_last_daily_summary_melbourne_date() == today_iso:
+                return
+
+        report = build_shadow_report(config)
+        message = build_daily_summary_message(today_iso, report)
+        event = NotificationEvent(
+            event_id=f"daily_summary:{today_iso}",
+            event_type="daily_summary",
+            created_at_ms=int(time.time() * 1000),
+            payload_text=message,
+        )
+        with ShadowStore(config.paths.db_path) as shadow_store:
+            shadow_store.enqueue_notifications_atomically([event])
+            shadow_store.record_daily_summary_sent(today_iso)
+            flush_pending_notifications(config, shadow_store)
+    except Exception:  # noqa: BLE001 - must never affect the shadow cycle that called this
+        return
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,6 +396,8 @@ def _run_shadow_cycle_locked(config: AppConfig, raw_min_required_candles: int) -
         if not all_candles:  # pragma: no cover - bootstrap guarantees this is non-empty
             detail = "no shadow candles available yet."
             shadow_store.touch_cycle(now_ms, SHADOW_STATUS_NO_NEW_CANDLES, detail, None)
+            flush_pending_notifications(config, shadow_store)
+            _maybe_send_daily_summary(config)
             return ShadowCycleResult(
                 SHADOW_STATUS_NO_NEW_CANDLES, detail, len(new_candles), None, raw_min_required_candles, 0, 0, 0
             )
@@ -238,6 +410,8 @@ def _run_shadow_cycle_locked(config: AppConfig, raw_min_required_candles: int) -
         ):
             detail = "no new completed candle since the last processed cycle."
             shadow_store.touch_cycle(now_ms, SHADOW_STATUS_NO_NEW_CANDLES, detail, run_state.last_segment_length)
+            flush_pending_notifications(config, shadow_store)
+            _maybe_send_daily_summary(config)
             return ShadowCycleResult(
                 SHADOW_STATUS_NO_NEW_CANDLES, detail, len(new_candles), run_state.last_segment_length,
                 raw_min_required_candles, 0, 0, 0,
@@ -263,6 +437,8 @@ def _run_shadow_cycle_locked(config: AppConfig, raw_min_required_candles: int) -
                 "candles in the current gap-free segment - E1 cannot generate an eligible decision yet."
             )
             shadow_store.touch_cycle(now_ms, SHADOW_STATUS_INSUFFICIENT_DATA, detail, len(latest_segment))
+            flush_pending_notifications(config, shadow_store)
+            _maybe_send_daily_summary(config)
             return ShadowCycleResult(
                 SHADOW_STATUS_INSUFFICIENT_DATA, detail, len(new_candles), len(latest_segment),
                 required_len, 0, 0, 0,
@@ -308,10 +484,68 @@ def _run_shadow_cycle_locked(config: AppConfig, raw_min_required_candles: int) -
             f"processed {len(latest_segment)} candles in the current segment; "
             f"{len(new_trade_records)} new closed trade(s)."
         )
+
+        # Building notification content is never allowed to fail this
+        # cycle - the underlying trading state (already computed above)
+        # must always persist regardless of any bug or edge case in
+        # message rendering. See `shadow/notifications/`'s module docstring.
+        #
+        # An entry notification is built for a genuinely NEW entry -
+        # `entry_time_ms > threshold` - whether that position is still
+        # open at the end of this cycle (`result.open_position`) or has
+        # ALREADY closed again within this SAME recompute (one of
+        # `new_trade_records`, since a full "recompute everything" cycle
+        # can span an entry and its own exit together). A trade whose
+        # entry_time_ms is <= threshold already had its entry notified in
+        # an earlier cycle (as that cycle's `open_position`) - only its
+        # exit is new here.
+        notification_events: list[NotificationEvent] = []
+        try:
+            if result.open_position is not None and result.open_position.entry_time_ms > threshold:
+                pos = result.open_position
+                notification_events.append(
+                    _build_entry_notification_event(
+                        config, filters, journal,
+                        entry_time_ms=pos.entry_time_ms, entry_price=pos.entry_price,
+                        entry_reference_price=pos.entry_reference_price, quantity=pos.quantity,
+                        entry_fee_quote=pos.entry_fee_quote, equity_curve=result.equity_curve,
+                        starting_equity=starting_equity, symbol=symbol, now_ms=now_ms,
+                    )
+                )
+            for record in new_trade_records:
+                if record.trade.entry_time_ms > threshold:
+                    trade = record.trade
+                    notification_events.append(
+                        _build_entry_notification_event(
+                            config, filters, journal,
+                            entry_time_ms=trade.entry_time_ms, entry_price=trade.entry_price,
+                            entry_reference_price=trade.entry_reference_price, quantity=trade.quantity,
+                            entry_fee_quote=trade.entry_fee_quote, equity_curve=result.equity_curve,
+                            starting_equity=starting_equity, symbol=symbol, now_ms=now_ms,
+                        )
+                    )
+        except Exception:  # noqa: BLE001, S110 - see comment above
+            pass
+        try:
+            if new_trade_records:
+                trade_records_to_date = list(shadow_store.get_all_trades())
+                for record in new_trade_records:
+                    trade_records_to_date.append(record)
+                    notification_events.append(
+                        _build_exit_notification_event(
+                            symbol, record, trade_records_to_date, result.equity_curve, starting_equity, now_ms,
+                        )
+                    )
+        except Exception:  # noqa: BLE001, S110 - see comment above
+            pass
+
         shadow_store.record_cycle_atomically(
             new_trade_records, new_equity_points, new_journal_entries, new_last_processed,
             result.open_position, now_ms, len(latest_segment), SHADOW_STATUS_OK, detail,
+            notification_events,
         )
+        flush_pending_notifications(config, shadow_store)
+        _maybe_send_daily_summary(config)
         return ShadowCycleResult(
             SHADOW_STATUS_OK, detail, len(new_candles), len(latest_segment), required_len,
             len(new_trade_records), len(new_equity_points), len(new_journal_entries),

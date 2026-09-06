@@ -151,6 +151,23 @@ class PathsConfig(BaseModel):
     db_path: Path = Path("data/trading_agent.db")
 
 
+class TelegramConfig(BaseModel):
+    """Optional shadow-mode-only Telegram notifications - see `shadow/
+    notifications/`. Disabled by default. This model NEVER carries the bot
+    token or chat ID - those are secrets, read only from the environment
+    (`TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`, see `config/loader.py::
+    load_telegram_secrets`) and never written to, or read from, any YAML
+    config file. Setting `enabled: true` here without both environment
+    variables present simply means no notification is ever sent - shadow
+    trading itself is never affected either way (see `shadow/notifications/
+    sender.py`).
+    """
+
+    enabled: bool = False
+
+    model_config = {"extra": "forbid"}
+
+
 class AppConfig(BaseModel):
     mode: Mode
     market: MarketConfig = MarketConfig()
@@ -161,6 +178,7 @@ class AppConfig(BaseModel):
     stop_loss: StopLossConfig = StopLossConfig()
     backtest: BacktestConfig = BacktestConfig()
     paths: PathsConfig = PathsConfig()
+    telegram: TelegramConfig = TelegramConfig()
 
     model_config = {"extra": "forbid"}
 
@@ -179,6 +197,29 @@ class Secrets(BaseModel):
 
     def __repr__(self) -> str:  # pragma: no cover - trivial
         return "Secrets(testnet_api_key=***redacted***, testnet_api_secret=***redacted***)"
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return self.__repr__()
+
+
+class TelegramSecrets(BaseModel):
+    """A Telegram bot token and chat ID, loaded from the environment only
+    (`config/loader.py::load_telegram_secrets`) - never from a YAML config
+    file, never persisted to any database, never logged. `__repr__`/
+    `__str__` are overridden so these values can never be accidentally
+    printed or logged in full; `shadow/notifications/telegram_client.py`
+    additionally redacts the bot token from every exception/error string
+    it could ever produce, since Telegram's own Bot API embeds the token
+    in the request URL itself.
+    """
+
+    bot_token: str = Field(min_length=1)
+    chat_id: str = Field(min_length=1)
+
+    model_config = {"extra": "forbid"}
+
+    def __repr__(self) -> str:  # pragma: no cover - trivial
+        return "TelegramSecrets(bot_token=***redacted***, chat_id=***redacted***)"
 
     def __str__(self) -> str:  # pragma: no cover - trivial
         return self.__repr__()

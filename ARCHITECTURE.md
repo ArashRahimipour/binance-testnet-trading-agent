@@ -630,6 +630,90 @@ sequential and never interleaved: a cycle upserts fetched candles
 `ShadowStore`'s own transaction - and `shadow/lock.py` guarantees only one
 process ever runs a cycle at a time.
 
+### Optional Telegram notifications (`shadow/notifications/`)
+
+An entirely optional, SHADOW-mode-only layer on top of everything above -
+disabled by default, and shadow trading is completely unaffected by
+Telegram's availability either way. **Design constraint, honored
+throughout:** nothing here ever modifies E1's parameters, signals,
+timeframe rules, risk policy, R/R, fees, slippage, sizing, or execution,
+and nothing here ever adds Testnet or production order access.
+
+**Durable outbox, delivery attempted only after commit.** A notification
+event (`shadow/store.py::NotificationEvent`) is enqueued in the SAME
+atomic transaction as the trading state it describes
+(`ShadowStore.record_cycle_atomically`'s new `notification_events`
+parameter) - so a hypothetical entry/exit is always durably persisted
+BEFORE any attempt to actually reach Telegram, and a Telegram-side failure
+of any kind can never roll back, delay, or corrupt the underlying trading
+fact. `event_id` is deterministic and content-derived (`entry:<entry_time_
+ms>`, `exit:<exit_time_ms>`, `daily_summary:<melbourne_date_iso>`) and
+inserted with `ON CONFLICT(event_id) DO NOTHING`, so re-persisting the same
+logical event across a retried/recomputed cycle is a harmless no-op rather
+than a duplicate row - the same idempotency pattern this project already
+uses for trades/equity/journal entries.
+
+**Honest delivery-status tracking, not a false exactly-once claim.**
+`shadow/notifications/telegram_client.py::TelegramClient.send_message`
+classifies every outcome: a confirmed HTTP 200 with `{"ok": true}` is
+`SENT`; any other definitive response (non-200, `{"ok": false}`, a
+malformed body) is `FAILED` and never auto-retried (Telegram is known NOT
+to have delivered it); a safe pre-transmission failure (DNS, connection
+refused, connect timeout - `requests.exceptions.ConnectionError` and its
+`ConnectTimeout` subclass) is retried with bounded linear backoff before
+becoming `FAILED`; a read timeout AFTER the request was already
+transmitted (`requests.exceptions.ReadTimeout`, deliberately NOT a
+`ConnectionError` subclass) is `AMBIGUOUS` and NEVER auto-retried, since
+Telegram's Bot API has no client-supplied idempotency key and a retry
+could genuinely duplicate an already-delivered message. `notification-
+retry --confirm` is the one deliberate, manual, warned code path that may
+resend an `AMBIGUOUS` or `FAILED` event.
+
+**Secret handling.** The bot token and chat ID are read from the
+environment only (`config/loader.py::load_telegram_secrets`, opposite
+fail-mode from the Testnet `load_secrets`: missing/blank just means no
+notification is ever sent, never a fail-closed error) - never written to
+or read from any YAML config, never persisted to the database, never
+logged. Telegram's Bot API embeds the bot token in the request URL path
+itself (no header-based alternative), so `telegram_client.py::_redact`
+strips it out of every string this module could ever surface (a
+`requests` exception, an HTTP response body) BEFORE that string is ever
+returned, persisted as `shadow_notification_outbox.last_error`, or shown
+by the CLI.
+
+**Message content without touching forbidden files.** The entry
+notification's planned stop-loss/take-profit prices are reproduced EXACTLY
+by calling the same public, unmodified `backtest/risk_reward.py::
+build_realized_plan` function `run_segment` already called internally,
+fed the identical fill price, config-derived stop/fee/slippage rates,
+exchange filters, and pre-entry equity - never approximated, never a
+second implementation of that math (`shadow/notifications/builder.py::
+compute_realized_plan_for_display`). Because `run_shadow_cycle` recomputes
+the ENTIRE latest segment every cycle, an entry and its own exit can both
+land in a single cycle (e.g. after a paused kill switch, or simply a
+fast-moving take-profit) - `shadow/engine.py` builds an entry notification
+for every genuinely new entry (`entry_time_ms` past the prior high-water
+mark), whether that position is still open at the end of the cycle or has
+already closed again within the same recompute, so neither event is ever
+silently skipped or duplicated across cycles.
+
+**Daily summary timing.** `shadow/engine.py::_maybe_send_daily_summary`
+uses Python's stdlib `zoneinfo.ZoneInfo("Australia/Melbourne")` (DST-aware
+automatically, no hand-rolled offset table) to send at most one
+SHADOW-labelled summary per Melbourne calendar date, on the first
+successful cycle at or after 08:00 local time - if the machine was
+asleep/offline through 08:00, the first later successful cycle still sends
+it, since there is no separate schedule to have "missed".
+
+**Structurally incapable of order placement**, exactly like the rest of
+`shadow/`: nothing under `shadow/notifications/` imports
+`execution/testnet_adapter.py`, `execution/live_runner.py`,
+`execution/binance_signing.py`, or any other order-placement-capable
+module, and the only HTTP host it can ever construct a client for is
+`https://api.telegram.org` - proven at the source level (AST-inspected,
+not just grepped) by `tests/unit/
+test_shadow_notifications_no_order_placement.py`.
+
 ## Crash recovery, the pending-order state machine, and the atomic transaction boundary
 
 A process can die at any point: before sending an order, mid-HTTP-call, after

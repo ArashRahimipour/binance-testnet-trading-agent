@@ -736,7 +736,7 @@ git clone <this repository> && cd binance-testnet-trading-agent
 git checkout claude/binance-testnet-trading-agent-h9lx17   # or your merged main branch
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-python -m pytest -q            # 745 tests should pass
+python -m pytest -q            # 840 tests should pass
 ruff check .                   # should report no issues
 mypy src                       # should report no issues
 ```
@@ -802,6 +802,100 @@ this on every run) and is, in any case, a separate manual decision this
 tool does not make. **No output of this tool is ever a claim of
 profitability, and nothing it produces authorizes Testnet or live
 trading.**
+
+### Telegram notifications (optional, SHADOW mode only)
+
+Shadow mode can optionally send Telegram messages for hypothetical entries,
+exits, and a once-daily summary - **disabled by default**, and shadow
+trading itself is completely unaffected by Telegram's availability either
+way (see `shadow/notifications/`'s module docstring and SECURITY.md).
+**No real or Testnet order is ever placed by this feature, or by anything
+in shadow mode.**
+
+**1. Create a Telegram bot and find your chat ID** (one-time, in the
+Telegram app):
+
+```text
+1. Message @BotFather -> /newbot -> follow the prompts.
+   BotFather replies with a bot token that looks like
+   123456789:AAHFq...redacted...xyz - copy it, you'll need it below.
+2. Start a chat with your new bot (search its @username, tap Start) so it
+   is allowed to message you.
+3. Message @userinfobot (or @RawDataBot) to get YOUR numeric chat ID -
+   it replies with your Telegram user ID, a number like 123456789.
+   (For a group chat instead, add the bot to the group and use the
+   group's own negative chat ID.)
+```
+
+**2. Put both values in `.env` ONLY - never in a config file, never
+committed:**
+
+```bash
+# in .env (already gitignored - see .env.example for the exact keys)
+TELEGRAM_BOT_TOKEN=123456789:AAHFq...redacted...xyz
+TELEGRAM_CHAT_ID=123456789
+```
+
+**3. Enable it in `config/shadow.yaml`:**
+
+```yaml
+telegram:
+  enabled: true
+```
+
+**4. Validate the configuration - never reveals the token/chat ID, only
+whether each is present:**
+
+```bash
+trading-agent --config config/shadow.yaml telegram-config-check
+```
+
+**5. Send one clearly-labelled test message (the exact command; requires
+`--confirm` since it is the one command in this project that deliberately
+performs a real network send):**
+
+```bash
+trading-agent --config config/shadow.yaml telegram-test --confirm
+```
+
+From here, `shadow-run` (run by hand or on its existing cron schedule -
+**that command is completely unchanged**) automatically sends an entry
+message the moment a new hypothetical position opens, an exit message the
+moment one closes, and at most one SHADOW-labelled daily summary per
+Melbourne calendar date (`Australia/Melbourne`, DST-aware), on the first
+successful cycle at or after 08:00 local time.
+
+**Notification management commands:**
+
+```bash
+trading-agent --config config/shadow.yaml notification-status                                   # list the outbox
+trading-agent --config config/shadow.yaml notification-status --status AMBIGUOUS                 # filter by status
+trading-agent --config config/shadow.yaml notification-retry --event-id entry:1234567890 --confirm  # manual retry
+trading-agent --config config/shadow.yaml notification-disable --reason "pausing for maintenance"   # pause delivery only
+trading-agent --config config/shadow.yaml notification-enable                                       # resume delivery
+```
+
+**Security guarantees:**
+- The bot token/chat ID are read from the environment ONLY
+  (`TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`) - never written to, or read
+  from, any YAML config file, never persisted to the database, never
+  logged. The bot token is additionally redacted from every possible
+  exception/error string before it is ever stored or printed, since
+  Telegram's own Bot API embeds it in the request URL itself.
+- A hypothetical trading event is always durably persisted (the same
+  atomic database transaction as the trade it describes) BEFORE any
+  attempt to deliver it - a Telegram outage, rate limit, or
+  misconfiguration can never lose, delay, or corrupt shadow trading.
+- Delivery status is honestly tracked as `PENDING` / `SENT` / `AMBIGUOUS`
+  (a timeout after the request may already have reached Telegram) /
+  `FAILED` - this project makes no claim of mathematically guaranteed
+  exactly-once delivery (Telegram's Bot API has no client idempotency
+  key). An `AMBIGUOUS` notification is never auto-retried; `notification-retry
+  --confirm` is a deliberate manual action that warns of a possible
+  duplicate before resending.
+- Nothing under `shadow/notifications/` can import, or construct a client
+  for, anything order-placement-capable - proven at the source level by
+  `tests/unit/test_shadow_notifications_no_order_placement.py`.
 
 ## Documentation index
 

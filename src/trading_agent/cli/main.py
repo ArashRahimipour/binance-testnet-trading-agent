@@ -21,7 +21,7 @@ from trading_agent.backtest.engine import (
     run_independent_holdout_evaluation,
 )
 from trading_agent.config import AppConfig, Mode, load_config
-from trading_agent.config.loader import load_secrets
+from trading_agent.config.loader import load_secrets, load_telegram_secrets
 from trading_agent.data.gap_recovery import (
     CHECKPOINT_FILENAME,
     DEFAULT_CONNECT_TIMEOUT_SECONDS,
@@ -83,7 +83,16 @@ from trading_agent.shadow.engine import (
     shadow_kill_switch_path,
 )
 from trading_agent.shadow.lock import ShadowLockError
+from trading_agent.shadow.notifications.builder import build_test_message
+from trading_agent.shadow.notifications.sender import (
+    RetryResult,
+    is_telegram_active,
+    notifications_kill_switch_path,
+    retry_notification,
+)
+from trading_agent.shadow.notifications.telegram_client import SEND_OUTCOME_SENT, TelegramClient
 from trading_agent.shadow.report import ShadowReport, build_shadow_report
+from trading_agent.shadow.store import ShadowStore
 from trading_agent.sizing.exchange_filters import SymbolFilters
 
 
@@ -1694,6 +1703,152 @@ def shadow_kill_switch_status(ctx: click.Context) -> None:
     config: AppConfig = ctx.obj["config"]
     switch = KillSwitch(shadow_kill_switch_path(config))
     click.echo(f"ENGAGED: {switch.reason()}" if switch.is_engaged() else "disengaged")
+
+
+def _require_shadow_mode(ctx: click.Context, command_name: str) -> AppConfig:
+    config: AppConfig = ctx.obj["config"]
+    if config.mode != Mode.SHADOW:
+        click.echo(f"The {command_name} command requires --mode shadow.", err=True)
+        sys.exit(1)
+    return config
+
+
+@cli.command("telegram-config-check")
+@click.pass_context
+def telegram_config_check_cmd(ctx: click.Context) -> None:
+    """Validate shadow-mode Telegram notification configuration - NEVER
+    prints the bot token or chat ID, only whether each is present. See
+    shadow/notifications/sender.py::is_telegram_active.
+    """
+    config = _require_shadow_mode(ctx, "telegram-config-check")
+    click.echo(f"telegram.enabled (config/shadow.yaml): {config.telegram.enabled}")
+    switch = KillSwitch(notifications_kill_switch_path(config))
+    click.echo(
+        f"notification kill switch: {'ENGAGED (' + (switch.reason() or '') + ')' if switch.is_engaged() else 'disengaged'}"
+    )
+    secrets = load_telegram_secrets()
+    click.echo(f"TELEGRAM_BOT_TOKEN: {'set (redacted)' if secrets is not None else 'NOT SET'}")
+    click.echo(f"TELEGRAM_CHAT_ID: {'set (redacted)' if secrets is not None else 'NOT SET'}")
+    active, reason = is_telegram_active(config)
+    if active and secrets is not None:
+        click.echo("status: ACTIVE - notifications will be sent for new shadow entries/exits/daily summaries.")
+    elif not active:
+        click.echo(f"status: INACTIVE - {reason}")
+    else:
+        click.echo(
+            "status: INACTIVE - telegram.enabled is true and the kill switch is disengaged, but "
+            "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID are missing or blank in the environment."
+        )
+
+
+@cli.command("telegram-test")
+@click.option("--confirm", is_flag=True, help="Required - this command performs a real Telegram send.")
+@click.pass_context
+def telegram_test_cmd(ctx: click.Context, confirm: bool) -> None:
+    """Send ONE clearly-labelled test message via Telegram to prove
+    configuration works end to end. Never describes a real trading event
+    and is never sent automatically - requires --confirm.
+    """
+    config = _require_shadow_mode(ctx, "telegram-test")
+    if not confirm:
+        click.echo("Refusing to send without --confirm - this performs a real Telegram send.", err=True)
+        sys.exit(1)
+    active, reason = is_telegram_active(config)
+    if not active:
+        click.echo(f"Telegram is not active: {reason}", err=True)
+        sys.exit(1)
+    secrets = load_telegram_secrets()
+    if secrets is None:
+        click.echo("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are not set in the environment.", err=True)
+        sys.exit(1)
+    client = TelegramClient(secrets.bot_token)
+    result = client.send_message(secrets.chat_id, build_test_message())
+    click.echo(f"outcome={result.outcome} attempts={result.attempts}")
+    if result.safe_error is not None:
+        click.echo(result.safe_error, err=True)
+    if result.outcome != SEND_OUTCOME_SENT:
+        sys.exit(1)
+
+
+@cli.command("notification-status")
+@click.option(
+    "--status", "status_filter", default=None,
+    type=click.Choice(["PENDING", "SENT", "AMBIGUOUS", "FAILED"]),
+    help="Filter by delivery status.",
+)
+@click.pass_context
+def notification_status_cmd(ctx: click.Context, status_filter: str | None) -> None:
+    """List the shadow notification outbox - event id, type, status,
+    attempt count, and any last (already secret-redacted) error. Strictly
+    local/read-only - no Binance or Telegram call is ever made.
+    """
+    config = _require_shadow_mode(ctx, "notification-status")
+    with ShadowStore(config.paths.db_path) as store:
+        notifications = store.list_notifications(status=status_filter)
+    if not notifications:
+        click.echo("no notifications in the outbox.")
+        return
+    for event in notifications:
+        click.echo(
+            f"{event.event_id}  type={event.event_type}  status={event.status}  "
+            f"attempts={event.attempt_count}  created_at_ms={event.created_at_ms}  "
+            f"sent_at_ms={event.sent_at_ms}"
+        )
+        if event.last_error:
+            click.echo(f"    last_error: {event.last_error}")
+
+
+@cli.command("notification-retry")
+@click.option("--event-id", required=True, help="The event_id to retry (see notification-status).")
+@click.option(
+    "--confirm", is_flag=True,
+    help="Required - Telegram has no client idempotency key, so retrying an AMBIGUOUS event may duplicate it.",
+)
+@click.pass_context
+def notification_retry_cmd(ctx: click.Context, event_id: str, confirm: bool) -> None:
+    """Manually resend one AMBIGUOUS or FAILED notification.
+
+    WARNING: this project makes no claim of exactly-once delivery. If the
+    original attempt was AMBIGUOUS (a read timeout after transmission may
+    already have occurred), retrying it may send a DUPLICATE Telegram
+    message. Never retried automatically - requires --confirm.
+    """
+    config = _require_shadow_mode(ctx, "notification-retry")
+    if not confirm:
+        click.echo(
+            "Refusing to retry without --confirm - retrying an AMBIGUOUS notification may send a DUPLICATE "
+            "message (Telegram has no client idempotency key).",
+            err=True,
+        )
+        sys.exit(1)
+    with ShadowStore(config.paths.db_path) as store:
+        result: RetryResult = retry_notification(config, store, event_id)
+    click.echo(result.detail)
+    if not result.ok:
+        sys.exit(1)
+
+
+@cli.command("notification-disable")
+@click.option("--reason", default="", help="Why shadow notifications are being disabled.")
+@click.pass_context
+def notification_disable_cmd(ctx: click.Context, reason: str) -> None:
+    """Engage the notifications-only kill switch - shadow trading itself
+    is entirely unaffected; only Telegram delivery is paused (new events
+    keep accumulating in the outbox, PENDING, until re-enabled).
+    """
+    config = _require_shadow_mode(ctx, "notification-disable")
+    switch = KillSwitch(notifications_kill_switch_path(config))
+    switch.engage(reason)
+    click.echo(f"Shadow notifications DISABLED: {switch.reason()}")
+
+
+@cli.command("notification-enable")
+@click.pass_context
+def notification_enable_cmd(ctx: click.Context) -> None:
+    """Disengage the notifications-only kill switch."""
+    config = _require_shadow_mode(ctx, "notification-enable")
+    KillSwitch(notifications_kill_switch_path(config)).disengage()
+    click.echo("Shadow notifications ENABLED.")
 
 
 if __name__ == "__main__":

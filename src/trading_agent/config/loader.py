@@ -14,7 +14,7 @@ from typing import Any
 import yaml
 from dotenv import load_dotenv
 
-from trading_agent.config.models import AppConfig, Secrets
+from trading_agent.config.models import AppConfig, Secrets, TelegramSecrets
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[3] / "config" / "default.yaml"
 
@@ -48,6 +48,25 @@ def load_secrets(env_file: str | Path | None = None) -> Secrets:
         testnet_api_key=os.environ.get("BINANCE_TESTNET_API_KEY", ""),
         testnet_api_secret=os.environ.get("BINANCE_TESTNET_API_SECRET", ""),
     )
+
+
+def load_telegram_secrets(env_file: str | Path | None = None) -> TelegramSecrets | None:
+    """Load optional Telegram bot credentials from the environment.
+
+    Returns `None` (never raises) if `TELEGRAM_BOT_TOKEN` or
+    `TELEGRAM_CHAT_ID` is missing or blank - shadow-mode notifications are
+    entirely optional, and their absence must never fail config loading or
+    a shadow-run cycle (see `shadow/notifications/sender.py`). This is
+    deliberately the opposite fail-mode from `load_secrets` (which fails
+    closed for Testnet trading credentials): a missing Telegram secret
+    just means no notification is ever sent.
+    """
+    load_dotenv(dotenv_path=env_file, override=False)
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    if not bot_token or not chat_id:
+        return None
+    return TelegramSecrets(bot_token=bot_token, chat_id=chat_id)
 
 
 def _deep_merge(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:

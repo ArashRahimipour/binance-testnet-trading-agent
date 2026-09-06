@@ -2,6 +2,110 @@
 
 All notable changes to this project are documented here.
 
+## [0.8.0] - Optional Telegram notifications for shadow mode
+
+**Additive only, same "do not touch E1" constraint as every shadow-mode
+change before it.** Nothing about E1's parameters, signals, timeframe
+rules, risk policy, R/R, fees, slippage, sizing, execution, or any
+historical result was touched, and nothing adds Testnet or production
+order access. Shadow mode can now optionally send Telegram messages for
+hypothetical entries, exits, and a once-daily summary - **disabled by
+default**, and shadow trading is completely unaffected by Telegram's
+availability either way: a hypothetical trading event is always durably
+persisted, in the same atomic transaction as the trading state it
+describes, strictly BEFORE any attempt to deliver it. Developed entirely
+against mocked HTTP (`responses`); no real Telegram or Binance network
+call was made during development. Adds 95 new tests (840 total).
+
+### Added
+
+- **`config/models.py`**: `TelegramConfig` (`enabled: bool = False`,
+  `extra="forbid"`) added to `AppConfig.telegram` - never carries the bot
+  token or chat ID. `TelegramSecrets` (redacted `repr`/`str`, mirrors the
+  existing `Secrets` class) holds those two values instead.
+- **`config/loader.py::load_telegram_secrets`**: reads
+  `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` from the environment only -
+  returns `None` (never raises) if either is missing or blank, the
+  opposite fail-mode from `load_secrets` (Testnet credentials fail
+  closed; a missing Telegram credential just means no notification is
+  ever sent).
+- **`shadow/store.py`**: two new tables - `shadow_notification_outbox`
+  (`NotificationEvent`: event id, type, payload, status
+  `PENDING`/`SENT`/`AMBIGUOUS`/`FAILED`, attempt count, last safe error)
+  and `shadow_notification_state` (the last Melbourne calendar date a
+  daily summary was sent). `record_cycle_atomically` gained an optional
+  `notification_events` parameter, enqueued in the SAME transaction as
+  the trading state it describes (idempotent via `event_id` + `ON
+  CONFLICT DO NOTHING`, exactly like the existing trades/equity/journal
+  tables) - plus a new `after_notifications` fault-injection point
+  proving that transaction still rolls back completely. Standalone
+  `enqueue_notifications_atomically`/`get_notification`/
+  `list_notifications`/`update_notification_status`/daily-summary-date
+  getter/setter round out the outbox API.
+- **`shadow/notifications/` (new package)**:
+  - `telegram_client.py`: a minimal client restricted to
+    `https://api.telegram.org` with no signing and no order-placement
+    method of any kind. Classifies every send outcome honestly - a
+    confirmed 200 is `SENT`; any other definitive response is `FAILED`
+    (never auto-retried); a safe pre-transmission failure
+    (`ConnectionError`/`ConnectTimeout`) retries with bounded linear
+    backoff; a read timeout after transmission may have occurred is
+    `AMBIGUOUS` and NEVER auto-retried (Telegram has no client
+    idempotency key - this project makes no exactly-once delivery
+    claim). The bot token is redacted from every possible
+    exception/response string before it is ever returned, since
+    Telegram's Bot API embeds it in the request URL itself.
+  - `builder.py`: pure, I/O-free message builders for entry/exit/daily-
+    summary/test messages. `compute_realized_plan_for_display` reproduces
+    the entry's exact planned stop-loss/take-profit prices by calling the
+    same public, unmodified `backtest/risk_reward.py::build_realized_plan`
+    `run_segment` already used internally - never approximated, never a
+    second implementation of that math. Every entry/exit message ends
+    with a prominent "NO REAL OR TESTNET ORDER WAS PLACED" statement.
+  - `sender.py`: `flush_pending_notifications` (called once per
+    `shadow-run` cycle, after the trading-state transaction has already
+    committed) attempts every `PENDING` notification and is wrapped in an
+    absolute never-raises safety net - any exception it could ever
+    produce is caught and reported back as a skip reason, never
+    propagated into a shadow cycle. `retry_notification` is the one
+    manual, `--confirm`-gated code path allowed to raise.
+- **`shadow/engine.py`**: wired notifications into `run_shadow_cycle` -
+  builds an entry notification for every genuinely new entry (whether
+  still open at cycle end, or already closed again within the SAME
+  recompute cycle - a full "recompute everything" cycle can span both an
+  entry and its own exit) and an exit notification for every newly closed
+  trade, enqueues them atomically alongside the trading state, then
+  flushes pending notifications and checks the Melbourne daily-summary
+  trigger (`zoneinfo.ZoneInfo("Australia/Melbourne")`, DST-aware, at most
+  once per calendar date, first successful cycle at/after 08:00 local -
+  fires on the first later cycle if the machine slept through 08:00).
+- **CLI**: `telegram-config-check` (validates configuration, never
+  reveals secret values), `telegram-test --confirm` (sends one clearly-
+  labelled test message), `notification-status [--status ...]`,
+  `notification-retry --event-id ... --confirm` (warns of possible
+  duplicate delivery before resending an `AMBIGUOUS`/`FAILED` event),
+  `notification-disable [--reason ...]`/`notification-enable` (a
+  dedicated kill switch that only pauses Telegram delivery - shadow
+  trading itself is unaffected). The existing `shadow-run` cron command
+  is completely unchanged.
+- **`config/shadow.yaml`**/**`.env.example`**: a disabled-by-default
+  `telegram:` section and commented `TELEGRAM_BOT_TOKEN`/
+  `TELEGRAM_CHAT_ID` entries, with setup instructions pointing at
+  README.md.
+- Comprehensive tests: source-level (text AND AST) proof that
+  `shadow/notifications/` can never import an order-placement-capable
+  module or contact any host but Telegram's; full outcome-classification
+  coverage of the Telegram client; pure message-builder content checks;
+  outbox atomicity/dedup/crash-recovery (a notification enqueued by one
+  connection is still there, `PENDING`, after a simulated process
+  restart against a fresh connection); sender-level disabled/inactive
+  zero-network-call proofs and full send/ambiguous/failed/retry
+  coverage; Melbourne daily-summary timing including the actual 2026
+  DST start/end transitions; full `run_shadow_cycle` wiring including the
+  same-cycle entry+exit case and cross-cycle entry de-duplication; and
+  CLI coverage for every new command including a real shadow-run ->
+  AMBIGUOUS -> manual-retry round trip.
+
 ## [0.7.1] - Fix shadow-mode warm-up: bootstrap E1's causal pre-boundary history before its first real run
 
 **Correction to 0.7.0, additive only - same "do not touch E1" constraint.**
