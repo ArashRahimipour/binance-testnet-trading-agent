@@ -736,7 +736,7 @@ git clone <this repository> && cd binance-testnet-trading-agent
 git checkout claude/binance-testnet-trading-agent-h9lx17   # or your merged main branch
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-python -m pytest -q            # 727 tests should pass
+python -m pytest -q            # 745 tests should pass
 ruff check .                   # should report no issues
 mypy src                       # should report no issues
 ```
@@ -747,38 +747,56 @@ mypy src                       # should report no issues
 # 1. Sanity-check the config and confirm the store is empty (fully local, no network call):
 trading-agent --config config/shadow.yaml shadow-status
 
-# 2. Run one cycle by hand to confirm connectivity (reads Binance's public,
+# 2. Bootstrap E1's causal pre-boundary warm-up history ONCE - required
+#    before shadow-run will do anything. Fetches ~7,600 real, completed
+#    Binance BTCUSDT 1h candles STRICTLY BEFORE the boundary (read-only,
+#    no API key) and stores them as warm-up-only - they can never
+#    generate a trade or move simulated equity (see "How warm-up works"
+#    below). Takes a few seconds; safe to re-run (reports
+#    ALREADY_BOOTSTRAPPED and touches nothing the second time):
+trading-agent --config config/shadow.yaml shadow-bootstrap
+
+# 3. Run one cycle by hand to confirm connectivity (reads Binance's public,
 #    unauthenticated market-data endpoint only - no API key is used or needed):
 trading-agent --config config/shadow.yaml shadow-run
 
-# 3. Schedule it to run once per completed 1h candle (5 minutes after each
+# 4. Schedule it to run once per completed 1h candle (5 minutes after each
 #    hour, server time is UTC) - e.g. via cron:
 crontab -e
 # 5 * * * * cd /path/to/binance-testnet-trading-agent && .venv/bin/trading-agent --config config/shadow.yaml shadow-run >> logs/shadow_cron.log 2>&1
 
-# 4. Check progress at any time (both are fully local/read-only, no network call):
+# 5. Check progress at any time (both are fully local/read-only, no network call):
 trading-agent --config config/shadow.yaml shadow-status
 trading-agent --config config/shadow.yaml shadow-report
 
-# 5. Pause shadow observation at any time without losing any state:
+# 6. Pause shadow observation at any time without losing any state:
 trading-agent --config config/shadow.yaml shadow-kill-switch engage --reason "..."
 trading-agent --config config/shadow.yaml shadow-kill-switch status
 trading-agent --config config/shadow.yaml shadow-kill-switch disengage
 ```
 
-`shadow-run` is idempotent and crash-recoverable: it re-derives its entire
-result from the immutable candle history plus the frozen E1 strategy on
-every invocation and persists only what is new since the last successful
-cycle, in one atomic transaction, keyed so a completed candle can never be
-scored twice - running it twice in the same hour, or resuming after a
-crash mid-cycle, is always safe. A file-based lock
-(`data/shadow.lock`) additionally refuses to let two `shadow-run`
-processes execute at the same time.
+`shadow-run` refuses to do anything - including any Binance call - until
+`shadow-bootstrap` has succeeded (`shadow-status` shows `bootstrapped: NO`
+until then). Once bootstrapped, `shadow-run` is idempotent and
+crash-recoverable: it re-derives its entire result from the immutable
+candle history plus the frozen E1 strategy on every invocation and
+persists only what is new since the last successful cycle, in one atomic
+transaction, keyed so a completed candle can never be scored twice -
+running it twice in the same hour, or resuming after a crash mid-cycle, is
+always safe. A file-based lock (`data/shadow.lock`) additionally refuses
+to let two `shadow-run` processes execute at the same time.
 
-**E1 requires ~7,564 completed 1h candles (~315 days) of warm-up before it
-can generate its first signal.** Every `shadow-run` cycle before then
-correctly reports `INSUFFICIENT_DATA` and simply keeps accumulating
-history - this is expected, not an error. A promotion review requires at
+**How warm-up works (why this does NOT take ~315 days):** E1 needs
+~7,564 completed 1h candles (~315 days) of history to compute its
+indicators (weekly EMA40, 4h EMA200/ATR/Donchian) - that is a warm-up
+requirement for the MATH, not a claim that trading can only start on day
+315. `shadow-bootstrap` fetches that history up front, strictly before
+the boundary, so real evaluation begins within hours of the boundary
+instead. Warm-up candles themselves can never generate a trade, move
+equity, or affect drawdown/reports - see ARCHITECTURE.md's "Shadow mode"
+section for exactly how this, and the boundary-crossing edge case it
+closes (a 4h setup that armed in the last warm-up hour), are guaranteed
+structurally rather than merely disclosed. A promotion review requires at
 least 30 CLOSED forward trades (`shadow-report` discloses progress toward
 this on every run) and is, in any case, a separate manual decision this
 tool does not make. **No output of this tool is ever a claim of

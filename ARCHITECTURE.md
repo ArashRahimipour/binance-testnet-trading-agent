@@ -547,6 +547,54 @@ strategy. This is a completely different, independent boundary from
 pre-cutoff research/development boundary) - shadow mode never reads,
 writes, or otherwise interacts with the research cutoff module.
 
+**Bootstrap and the settling buffer (`shadow/bootstrap.py`) - why
+`shadow-run` does not need to wait ~315 days.** E1's own
+`min_required_candles` (~7,564 1h candles) is a warm-up requirement for
+its INDICATORS (weekly EMA40+slope, 4h EMA200+slope+ATR+Donchian), not a
+claim that trading can only start on day 315. `shadow-bootstrap` fetches
+that much causal history (plus a small, fixed safety margin) STRICTLY
+BEFORE the boundary, via the same paginated `data/historical_fetch.py::
+fetch_historical_range` the `fetch-data --start --end` CLI command already
+uses, and stores it as warm-up-only candles (`shadow/store.py`'s
+`shadow_warmup_candles` provenance table) - candles E1's own aggregation
+machinery reads for indicator context exactly like any other historical
+candle, but which `shadow/engine.py` never lets `run_segment`'s loop treat
+as a decision point (see below), so they can structurally never produce a
+trade, move equity, or affect drawdown.
+
+That alone is not quite sufficient: a 4h Donchian setup can arm on the
+VERY LAST warm-up candle and still have up to `CONFIRMATION_WINDOW_1H_
+CANDLES` (4, E1's own frozen constant) hours left to confirm - hours that
+fall AFTER the boundary. Left unguarded, this would let a setup that
+closed strictly BEFORE the boundary produce a trade strictly AFTER it,
+violating "the first eligible 4h setup must close at or after the
+boundary". The fix costs nothing and is exact, not probabilistic, because
+`SHADOW_START_BOUNDARY_MS` (midnight UTC) always lands exactly on a
+4h-candle grid boundary (every midnight does - 24h is an exact multiple of
+4h): `shadow/bootstrap.py::compute_effective_min_required_candles` sets
+the `min_required` value passed to the UNMODIFIED `run_segment` to
+`warmup_candle_count + CONFIRMATION_WINDOW_1H_CANDLES + 1`, a
+`CONFIRMATION_WINDOW_1H_CANDLES`-hour "settling buffer" past the boundary.
+By the time `run_segment`'s loop reaches its first real, trade-affecting
+iteration, ANY setup that closed before the boundary has had its entire
+confirmation window fully elapse (it is provably `HOLD_SETUP_ALREADY_
+CONSUMED`/expired by then), while the first genuinely POST-boundary setup
+(whose own 4h bucket cannot close any earlier than
+`boundary + CONFIRMATION_WINDOW_1H_CANDLES - 1`, again by grid alignment)
+is caught at the very first hour it could possibly confirm - zero lost
+eligibility, zero pre-boundary leakage. See `shadow/bootstrap.py`'s own
+docstring for the full derivation and `tests/unit/test_shadow_engine.py`
+for the proof in both directions.
+
+`shadow-run` refuses to operate (`NOT_BOOTSTRAPPED`/`BOOTSTRAP_INVALID`,
+zero network calls either way) until `shadow/bootstrap.py::
+verify_bootstrap_complete` passes - a REAL re-derivation from the candles
+actually present in `CandleStore` right now (exact count, exact range,
+zero gaps), never a cached boolean. Bootstrap itself fails closed and
+writes nothing to either database if the fetched warm-up range contains a
+confirmed gap or turns out short/misaligned - a gap would mean E1's own
+weekly/4h aggregation cannot honestly back an evaluation at the boundary.
+
 **Structurally incapable of placing an order.** `shadow/` only ever
 constructs `data/market_data_public.py::BinancePublicMarketDataClient`
 against the read-only public market-data host - the same class every

@@ -76,9 +76,9 @@ from trading_agent.research.sensitivity_comparison import (
     build_candidate_sensitivity_comparison,
 )
 from trading_agent.risk.kill_switch import KillSwitch
-from trading_agent.shadow.boundary import SHADOW_START_BOUNDARY_ISO
+from trading_agent.shadow.bootstrap import BootstrapResult, run_shadow_bootstrap
+from trading_agent.shadow.boundary import SHADOW_START_BOUNDARY_ISO, ShadowConfigError
 from trading_agent.shadow.engine import (
-    ShadowConfigError,
     run_shadow_cycle,
     shadow_kill_switch_path,
 )
@@ -1487,18 +1487,59 @@ def kill_switch_status(ctx: click.Context) -> None:
     click.echo(f"ENGAGED: {switch.reason()}" if switch.is_engaged() else "disengaged")
 
 
+@cli.command("shadow-bootstrap")
+@click.pass_context
+def shadow_bootstrap_cmd(ctx: click.Context) -> None:
+    """Fetch and store the minimum causal pre-boundary warm-up history E1
+    needs (plus a small, documented safety margin) so shadow-run can begin
+    producing real, trade-affecting evaluations IMMEDIATELY at the fixed
+    shadow start boundary, instead of waiting ~315 days for organic
+    forward-only accumulation. See shadow/bootstrap.py.
+
+    Fetches real, completed Binance BTCUSDT history (read-only, no API
+    key) STRICTLY BEFORE the boundary - warm-up candles are used only to
+    compute E1's own weekly/4h indicators; they can never generate a
+    trade, move simulated equity, or affect drawdown/reports (see
+    ARCHITECTURE.md). Safe to run more than once: reports
+    ALREADY_BOOTSTRAPPED and changes nothing if already done. `shadow-run`
+    refuses to operate until this command has succeeded.
+    """
+    config: AppConfig = ctx.obj["config"]
+    if config.mode != Mode.SHADOW:
+        click.echo("The shadow-bootstrap command requires --mode shadow.", err=True)
+        sys.exit(1)
+    try:
+        result: BootstrapResult = run_shadow_bootstrap(config)
+    except ShadowConfigError as exc:
+        click.echo(str(exc), err=True)
+        sys.exit(1)
+    click.echo(f"status={result.status}")
+    click.echo(result.detail)
+    if result.warmup_start_time_ms is not None:
+        click.echo(
+            f"warmup_candle_count={result.warmup_candle_count} "
+            f"warmup_start_time_ms={result.warmup_start_time_ms} "
+            f"warmup_end_time_ms={result.warmup_end_time_ms} "
+            f"effective_min_required_candles={result.effective_min_required_candles}"
+        )
+    if result.status not in ("OK", "ALREADY_BOOTSTRAPPED"):
+        sys.exit(1)
+
+
 @cli.command("shadow-run")
 @click.pass_context
 def shadow_run_cmd(ctx: click.Context) -> None:
     """Run one forward-only shadow cycle for the frozen
     multitimeframe_breakout_E1_round3 candidate (see shadow/engine.py).
 
-    Fetches only completed Binance BTCUSDT candles (read-only, no API key),
-    never before SHADOW_START_BOUNDARY_ISO, simulates entries/stops/targets
-    against E1's own already-evaluated rules, and persists everything to
-    data/shadow_agent.db. NEVER submits a Testnet or live order of any kind.
-    Intended to be invoked once per completed 1h candle (e.g. by an
-    external scheduler/cron) - see README.md for exact setup.
+    Requires `shadow-bootstrap` to have already succeeded - refuses to run
+    otherwise. Fetches only completed Binance BTCUSDT candles (read-only,
+    no API key), never before SHADOW_START_BOUNDARY_ISO, simulates
+    entries/stops/targets against E1's own already-evaluated rules, and
+    persists everything to data/shadow_agent.db. NEVER submits a Testnet
+    or live order of any kind. Intended to be invoked once per completed
+    1h candle (e.g. by an external scheduler/cron) - see README.md for
+    exact setup.
     """
     config: AppConfig = ctx.obj["config"]
     if config.mode != Mode.SHADOW:
@@ -1537,14 +1578,21 @@ def shadow_status_cmd(ctx: click.Context) -> None:
     click.echo(f"shadow kill_switch: {'ENGAGED (' + (switch.reason() or '') + ')' if switch.is_engaged() else 'disengaged'}")
     report = build_shadow_report(config)
     state = report.run_state
+    if report.bootstrap is not None:
+        click.echo(
+            f"bootstrapped: yes - {report.bootstrap.warmup_candle_count} warm-up candle(s), "
+            f"effective_min_required_candles={report.bootstrap.effective_min_required_candles}"
+        )
+    else:
+        click.echo("bootstrapped: NO - run `shadow-bootstrap` before `shadow-run`.")
     click.echo(f"total_cycles: {state.total_cycles}")
     click.echo(f"last_run_at_ms: {state.last_run_at_ms}")
     click.echo(f"last_processed_close_time_ms: {state.last_processed_close_time_ms}")
     click.echo(f"last_cycle_status: {state.last_cycle_status}  detail: {state.last_cycle_detail}")
     click.echo(
         f"data: {report.data_gaps.stored_candle_count} stored candle(s), "
-        f"{report.data_gaps.latest_segment_length}/{report.data_gaps.min_required_candles} in current segment, "
-        f"{report.data_gaps.gap_count} confirmed gap(s)"
+        f"{report.data_gaps.latest_segment_length}/{report.data_gaps.effective_min_required_candles} "
+        f"in current segment, {report.data_gaps.gap_count} confirmed gap(s)"
     )
     click.echo(f"closed_trades: {report.performance.trade_count}")
     if report.open_position is not None:
@@ -1574,6 +1622,14 @@ def shadow_report_cmd(ctx: click.Context) -> None:
     perf = report.performance
 
     click.echo(f"=== Shadow report: multitimeframe_breakout_E1_round3 (since {SHADOW_START_BOUNDARY_ISO}) ===")
+    if report.bootstrap is not None:
+        click.echo(
+            f"bootstrapped: yes - {report.bootstrap.warmup_candle_count} warm-up candle(s) from "
+            f"{report.bootstrap.warmup_start_time_ms} through {report.bootstrap.warmup_last_open_time_ms} "
+            f"(open time), effective_min_required_candles={report.bootstrap.effective_min_required_candles}"
+        )
+    else:
+        click.echo("bootstrapped: NO - run `shadow-bootstrap` before `shadow-run`.")
     click.echo(f"closed_trades: {perf.trade_count}")
     click.echo(f"win_rate_pct: {perf.win_rate}")
     click.echo(f"expectancy_r: {report.expectancy_r}")
@@ -1592,7 +1648,7 @@ def shadow_report_cmd(ctx: click.Context) -> None:
         f"data_gaps: {report.data_gaps.gap_count} confirmed gap(s), "
         f"{report.data_gaps.total_missing_intervals} missing interval(s) total, "
         f"{report.data_gaps.stored_candle_count} stored candle(s), "
-        f"current segment {report.data_gaps.latest_segment_length}/{report.data_gaps.min_required_candles}"
+        f"current segment {report.data_gaps.latest_segment_length}/{report.data_gaps.effective_min_required_candles}"
     )
     if report.open_position is not None:
         pos = report.open_position

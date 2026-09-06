@@ -158,3 +158,41 @@ def test_report_data_gaps_reflects_confirmed_gap_between_two_stored_segments(tmp
     assert report.data_gaps.gap_count == 1
     assert report.data_gaps.total_missing_intervals == 1
     assert report.data_gaps.latest_segment_length == 2
+
+
+def test_report_bootstrap_field_is_none_before_bootstrap(tmp_path):
+    config = _shadow_config(tmp_path)
+    report = build_shadow_report(config)
+    assert report.bootstrap is None
+    # No bootstrap yet -> effective requirement falls back to E1's own raw minimum.
+    assert report.data_gaps.effective_min_required_candles == report.data_gaps.min_required_candles
+
+
+def test_report_effective_min_required_reflects_bootstrap_settling_buffer(tmp_path):
+    config = _shadow_config(tmp_path)
+    warmup_start_ms = START - 10 * STEP_MS
+    warmup_candles = [
+        Candle(
+            symbol="BTCUSDT", interval=INTERVAL, open_time_ms=warmup_start_ms + i * STEP_MS,
+            close_time_ms=warmup_start_ms + i * STEP_MS + STEP_MS - 1,
+            open=Decimal(100), high=Decimal(101), low=Decimal(99), close=Decimal(100), volume=Decimal(1),
+        )
+        for i in range(10)
+    ]
+    with CandleStore(config.paths.db_path) as candle_store:
+        candle_store.upsert_candles(warmup_candles)
+    with ShadowStore(config.paths.db_path) as shadow_store:
+        shadow_store.record_bootstrap_atomically(
+            warmup_candles, warmup_start_ms, warmup_candles[-1].open_time_ms, 10, 20,
+            bootstrapped_at_ms=1, source="test",
+        )
+
+    report = build_shadow_report(config)
+    assert report.bootstrap is not None
+    assert report.bootstrap.warmup_candle_count == 10
+    assert report.bootstrap.effective_min_required_candles == 20
+    # The only stored segment IS the bootstrap-anchored one (starts exactly
+    # at warmup_start_ms) -> the report's effective requirement must be the
+    # settling-buffer-adjusted value, not E1's raw minimum.
+    assert report.data_gaps.effective_min_required_candles == 20
+    assert report.data_gaps.min_required_candles != 20

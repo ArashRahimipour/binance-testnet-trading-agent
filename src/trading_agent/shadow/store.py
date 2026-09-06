@@ -36,6 +36,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Self
 
+from trading_agent.data.models import Candle
 from trading_agent.metrics.diagnostics import OpenPositionInfo
 from trading_agent.metrics.performance import EquityPoint, Trade
 
@@ -84,6 +85,23 @@ CREATE TABLE IF NOT EXISTS shadow_journal_entries (
     payload_json TEXT NOT NULL,
     PRIMARY KEY (entry_type, timestamp_ms)
 );
+
+CREATE TABLE IF NOT EXISTS shadow_bootstrap_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    warmup_start_time_ms INTEGER NOT NULL,
+    warmup_last_open_time_ms INTEGER NOT NULL,
+    warmup_candle_count INTEGER NOT NULL,
+    effective_min_required_candles INTEGER NOT NULL,
+    bootstrapped_at_ms INTEGER NOT NULL,
+    source TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS shadow_warmup_candles (
+    open_time_ms INTEGER PRIMARY KEY,
+    close_time_ms INTEGER NOT NULL,
+    fetched_at_ms INTEGER NOT NULL,
+    source TEXT NOT NULL
+);
 """
 
 
@@ -98,6 +116,21 @@ class ShadowTradeRecord:
     trade: Trade
     planned_risk_quote: Decimal | None
     net_reward_to_risk: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class ShadowBootstrapState:
+    """Metadata for the ONE-TIME warm-up fetch `shadow/bootstrap.py::
+    run_shadow_bootstrap` performs - see that module for what each field
+    means and why `effective_min_required_candles` is larger than
+    `warmup_candle_count + 1` (the settling-buffer design)."""
+
+    warmup_start_time_ms: int
+    warmup_last_open_time_ms: int
+    warmup_candle_count: int
+    effective_min_required_candles: int
+    bootstrapped_at_ms: int
+    source: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,7 +158,9 @@ class ShadowStore:
         self._conn.executescript(_SCHEMA)
         # Test-only fault injection seam - see tests/unit/test_shadow_store.py.
         # Never set outside tests. Valid values: "after_trades",
-        # "after_equity", "after_journal", "before_commit".
+        # "after_equity", "after_journal", "before_commit" (all in
+        # `record_cycle_atomically`), and "after_warmup_candles",
+        # "before_commit" (in `record_bootstrap_atomically`).
         self._raise_fault_at: str | None = None
 
     def close(self) -> None:
@@ -276,6 +311,80 @@ class ShadowStore:
         return [
             {"entry_type": row[0], "timestamp_ms": row[1], "payload": json.loads(row[2])} for row in rows
         ]
+
+    def get_bootstrap_state(self) -> ShadowBootstrapState | None:
+        row = self._conn.execute(
+            """
+            SELECT warmup_start_time_ms, warmup_last_open_time_ms, warmup_candle_count,
+                   effective_min_required_candles, bootstrapped_at_ms, source
+            FROM shadow_bootstrap_state WHERE id = 1
+            """
+        ).fetchone()
+        if row is None:
+            return None
+        return ShadowBootstrapState(
+            warmup_start_time_ms=row[0],
+            warmup_last_open_time_ms=row[1],
+            warmup_candle_count=row[2],
+            effective_min_required_candles=row[3],
+            bootstrapped_at_ms=row[4],
+            source=row[5],
+        )
+
+    def get_warmup_candle_count(self) -> int:
+        row = self._conn.execute("SELECT COUNT(*) FROM shadow_warmup_candles").fetchone()
+        return int(row[0])
+
+    def record_bootstrap_atomically(
+        self,
+        warmup_candles: list[Candle],
+        warmup_start_time_ms: int,
+        warmup_last_open_time_ms: int,
+        warmup_candle_count: int,
+        effective_min_required_candles: int,
+        bootstrapped_at_ms: int,
+        source: str,
+    ) -> None:
+        """Persist every warm-up candle's provenance row plus the singleton
+        bootstrap-state row, atomically. Idempotent: re-inserting an
+        already-recorded provenance row is a no-op
+        (`ON CONFLICT ... DO NOTHING`), and the singleton state row is only
+        ever inserted once (`ON CONFLICT(id) DO NOTHING`) - a caller that
+        finds `get_bootstrap_state()` already populated must never call
+        this again to silently overwrite it with a different range; see
+        `shadow/bootstrap.py::run_shadow_bootstrap`, which checks that
+        BEFORE ever calling this.
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            for candle in warmup_candles:
+                self._conn.execute(
+                    """
+                    INSERT INTO shadow_warmup_candles (open_time_ms, close_time_ms, fetched_at_ms, source)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(open_time_ms) DO NOTHING
+                    """,
+                    (candle.open_time_ms, candle.close_time_ms, bootstrapped_at_ms, source),
+                )
+            self._maybe_raise_fault("after_warmup_candles")
+            self._conn.execute(
+                """
+                INSERT INTO shadow_bootstrap_state
+                    (id, warmup_start_time_ms, warmup_last_open_time_ms, warmup_candle_count,
+                     effective_min_required_candles, bootstrapped_at_ms, source)
+                VALUES (1, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO NOTHING
+                """,
+                (
+                    warmup_start_time_ms, warmup_last_open_time_ms, warmup_candle_count,
+                    effective_min_required_candles, bootstrapped_at_ms, source,
+                ),
+            )
+            self._maybe_raise_fault("before_commit")
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
     def _maybe_raise_fault(self, point: str) -> None:
         if self._raise_fault_at == point:

@@ -29,6 +29,18 @@ SHADOW_START_BOUNDARY_MS: int = int(datetime(2026, 9, 6, tzinfo=UTC).timestamp()
 
 SHADOW_START_BOUNDARY_ISO = "2026-09-06T00:00:00Z"
 
+#: E1 is fixed at 1h - shadow mode has no other valid interval. Lives here
+#: (a dependency-free module) rather than in `shadow/engine.py` or
+#: `shadow/bootstrap.py` so both can import it without a circular import.
+REQUIRED_SHADOW_INTERVAL = "1h"
+
+
+class ShadowConfigError(Exception):
+    """Raised when a shadow-mode entry point (`shadow/engine.py::
+    run_shadow_cycle`, `shadow/bootstrap.py::run_shadow_bootstrap`) is
+    called with a config that is not valid for shadow mode (wrong `mode`,
+    or a `market.interval` other than the fixed "1h" E1 itself requires)."""
+
 
 class ShadowBoundaryViolation(Exception):
     """Raised when a shadow-mode code path would touch a candle strictly
@@ -58,3 +70,22 @@ def filter_from_boundary(candles: list[Candle]) -> list[Candle]:
     boundary in the first place, so this should never actually remove
     anything."""
     return [c for c in candles if c.open_time_ms >= SHADOW_START_BOUNDARY_MS]
+
+
+def assert_valid_shadow_config(config: object) -> None:
+    """Shared entry-point guard for `run_shadow_cycle` and
+    `run_shadow_bootstrap` - raises `ShadowConfigError` unless
+    `config.mode == Mode.SHADOW` and `config.market.interval ==
+    REQUIRED_SHADOW_INTERVAL`. Takes `config: object` (not `AppConfig`) to
+    avoid this dependency-free module importing `config.models` - the
+    attributes are duck-typed, exactly like the config object every other
+    shadow entry point already receives.
+    """
+    mode = getattr(config, "mode", None)
+    if mode is None or getattr(mode, "value", mode) != "shadow":
+        raise ShadowConfigError("this shadow-mode command requires config.mode == Mode.SHADOW")
+    interval = getattr(getattr(config, "market", None), "interval", None)
+    if interval != REQUIRED_SHADOW_INTERVAL:
+        raise ShadowConfigError(
+            f"shadow mode requires market.interval == {REQUIRED_SHADOW_INTERVAL!r}, got {interval!r}"
+        )

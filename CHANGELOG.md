@@ -2,6 +2,87 @@
 
 All notable changes to this project are documented here.
 
+## [0.7.1] - Fix shadow-mode warm-up: bootstrap E1's causal pre-boundary history before its first real run
+
+**Correction to 0.7.0, additive only - same "do not touch E1" constraint.**
+Nothing about E1 itself, its 2R-net risk/reward policy, its weekly/4h/1h
+rules, `backtest/engine.py::run_segment`, `backtest/risk_reward.py`,
+`risk/engine.py`, `SHADOW_START_BOUNDARY_MS`, or any historical result was
+touched. The problem: shadow mode's own database starts empty at the
+boundary, so E1's ~7,564-candle (~315-day) warm-up requirement meant
+`shadow-run` reported `INSUFFICIENT_DATA` for the first ~315 days after
+the boundary before it could ever generate a first signal. This adds a
+one-time `shadow-bootstrap` step that fetches E1's own causal pre-boundary
+history (plus a small, documented safety margin) as **warm-up-only**
+candles - indicator context only, never eligible to produce a trade,
+never affecting simulated equity/drawdown/reports, and never carrying a
+pending setup or position across the boundary - so `shadow-run` can begin
+producing real, trade-affecting evaluations within hours of the boundary
+instead of waiting ~315 days. Developed entirely against synthetic
+fixtures; no real network call was made during development. Adds 18 new
+tests (745 total).
+
+### Added
+
+- **`shadow/bootstrap.py`** (new module): `run_shadow_bootstrap` fetches
+  exactly `E1.min_required_candles - 1 + WARMUP_SAFETY_MARGIN_CANDLES`
+  (48, ~2 extra days) warm-up-only 1h candles ending strictly before
+  `SHADOW_START_BOUNDARY_MS`, via `data/historical_fetch.py::
+  fetch_historical_range` (unmodified - the same paginated/gap-confirming
+  fetch `fetch-data --start --end` already uses). **Fails closed and
+  writes nothing to either database** if the fetched range contains a
+  confirmed gap (`GAP_IN_WARMUP_DATA`) or is short/misaligned
+  (`INSUFFICIENT_HISTORY_AVAILABLE`) - E1's own weekly/4h aggregation
+  cannot honestly back a boundary evaluation across a gap. Idempotent:
+  a second call reports `ALREADY_BOOTSTRAPPED` and makes no network call
+  at all.
+- **THE SETTLING BUFFER** (the actual fix for "the first eligible 4h
+  setup must close at or after the boundary"): `shadow/bootstrap.py::
+  compute_effective_min_required_candles` sets the `min_required` value
+  `shadow/engine.py` passes to the UNMODIFIED `run_segment` to
+  `warmup_candle_count + CONFIRMATION_WINDOW_1H_CANDLES + 1` (E1's own
+  frozen confirmation-window constant, imported and never redefined)
+  rather than `warmup_candle_count + 1`. Because
+  `SHADOW_START_BOUNDARY_MS` (midnight UTC) always lands exactly on a
+  4h-candle grid boundary, this extra margin is EXACT, not probabilistic:
+  by the time `run_segment`'s loop reaches its first real (trade-
+  affecting) iteration, any 4h setup that closed strictly before the
+  boundary has had its ENTIRE confirmation window elapse, while the
+  first genuinely post-boundary setup's own window has not yet started -
+  so it is caught at the earliest possible opportunity, at zero cost in
+  lost eligibility. See that module's own docstring for the full
+  derivation and `tests/unit/test_shadow_engine.py::
+  test_a_setup_that_closed_in_the_last_warmup_hour_never_produces_a_trade`
+  / `::test_immediate_post_boundary_eligibility_no_315_day_wait` for the
+  proof, both directions.
+- **`shadow/store.py`**: two new tables - `shadow_bootstrap_state`
+  (singleton: warm-up range, candle count, the settling-buffer-adjusted
+  `effective_min_required_candles`, provenance) and
+  `shadow_warmup_candles` (one provenance row per warm-up candle:
+  open/close time, fetch time, source) - `warmup_only=true` is simply
+  "this open_time_ms has a row here". `record_bootstrap_atomically`
+  persists both together, atomically, with the same fault-injection-
+  tested rollback guarantee as `record_cycle_atomically`.
+  `verify_bootstrap_complete` (in `shadow/bootstrap.py`) is a REAL
+  re-derivation from the candles actually in `data/storage.py::
+  CandleStore` right now - never a cached flag - checking exact count,
+  exact range, and zero gaps.
+- **`shadow/engine.py`**: `run_shadow_cycle` now calls
+  `verify_bootstrap_complete` FIRST, before any network access - a
+  non-bootstrapped or corrupted-bootstrap store returns `NOT_BOOTSTRAPPED`
+  / `BOOTSTRAP_INVALID` with ZERO Binance calls (proven in tests by
+  registering no HTTP mocks at all). Warm-up and forward candles are now
+  read together as one contiguous list (from the verified warm-up start,
+  not the boundary) so `run_segment` sees uninterrupted history across
+  the boundary. A later segment born from a genuine gap in FORWARD data
+  has no warm-up context of its own and correctly falls back to E1's own
+  plain `min_required_candles` - the settling-buffer machinery applies
+  only to the one segment still anchored at the bootstrapped warm-up start.
+- **CLI**: `shadow-bootstrap` (fetches and stores the warm-up range;
+  `shadow-run` refuses to operate until it has succeeded). `shadow-status`
+  / `shadow-report` now show bootstrap state (warm-up candle count,
+  effective requirement) and the true current-segment progress against it.
+
 ## [0.7.0] - Add shadow mode: forward-only observation of the frozen `multitimeframe_breakout_E1_round3` candidate
 
 **New capability, additive only.** Nothing about E1 itself (`research/

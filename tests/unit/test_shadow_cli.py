@@ -4,9 +4,18 @@ import responses
 import yaml
 from click.testing import CliRunner
 
+from tests.fixtures.klines import make_kline_series, make_stateful_klines_callback
 from trading_agent.cli.main import cli
+from trading_agent.data.models import interval_to_ms
+from trading_agent.research.candidates.multitimeframe_breakout import MultiTimeframeBreakoutStrategy
+from trading_agent.shadow.bootstrap import compute_warmup_candle_count
+from trading_agent.shadow.boundary import SHADOW_START_BOUNDARY_MS
 
+PROD_HOST = "https://api.binance.com"
 INTERVAL = "1h"
+STEP = interval_to_ms(INTERVAL)
+WARMUP_CANDLE_COUNT = compute_warmup_candle_count(MultiTimeframeBreakoutStrategy().min_required_candles)
+WARMUP_START_MS = SHADOW_START_BOUNDARY_MS - WARMUP_CANDLE_COUNT * STEP
 
 
 def _write_shadow_config(tmp_path) -> str:
@@ -110,10 +119,53 @@ def test_shadow_status_and_report_work_on_a_fresh_empty_store(tmp_path):
     status = runner.invoke(cli, ["--config", config_path, "shadow-status"])
     assert status.exit_code == 0, status.output
     assert "shadow_start_boundary: 2026-09-06T00:00:00Z" in status.output
+    assert "bootstrapped: NO" in status.output
     assert "closed_trades: 0" in status.output
     assert "open_position: none" in status.output
 
     report = runner.invoke(cli, ["--config", config_path, "shadow-report"])
     assert report.exit_code == 0, report.output
+    assert "bootstrapped: NO" in report.output
     assert "SHADOW SIMULATION" in report.output
     assert "NOT yet eligible: 0 of 30" in report.output
+
+
+def test_shadow_bootstrap_requires_shadow_mode():
+    result = CliRunner().invoke(cli, ["--mode", "backtest", "shadow-bootstrap"])
+    assert result.exit_code != 0
+    assert "requires --mode shadow" in result.output
+
+
+@responses.activate
+def test_shadow_run_refuses_before_bootstrap_with_no_network_call(tmp_path):
+    config_path = _write_shadow_config(tmp_path)
+    result = CliRunner().invoke(cli, ["--config", config_path, "shadow-run"])
+    assert result.exit_code == 0, result.output
+    assert "status=NOT_BOOTSTRAPPED" in result.output
+    assert "shadow-bootstrap" in result.output
+
+
+@responses.activate
+def test_shadow_bootstrap_cli_happy_path_and_status_report_reflect_it(tmp_path):
+    config_path = _write_shadow_config(tmp_path)
+    rows = make_kline_series(WARMUP_START_MS, INTERVAL, WARMUP_CANDLE_COUNT)
+    responses.add_callback(responses.GET, f"{PROD_HOST}/api/v3/klines", callback=make_stateful_klines_callback(rows))
+    runner = CliRunner()
+
+    first = runner.invoke(cli, ["--config", config_path, "shadow-bootstrap"])
+    assert first.exit_code == 0, first.output
+    assert "status=OK" in first.output
+    assert f"warmup_candle_count={WARMUP_CANDLE_COUNT}" in first.output
+
+    second = runner.invoke(cli, ["--config", config_path, "shadow-bootstrap"])
+    assert second.exit_code == 0, second.output
+    assert "status=ALREADY_BOOTSTRAPPED" in second.output
+
+    status = runner.invoke(cli, ["--config", config_path, "shadow-status"])
+    assert status.exit_code == 0, status.output
+    assert "bootstrapped: yes" in status.output
+    assert f"{WARMUP_CANDLE_COUNT} warm-up candle(s)" in status.output
+
+    report = runner.invoke(cli, ["--config", config_path, "shadow-report"])
+    assert report.exit_code == 0, report.output
+    assert "bootstrapped: yes" in report.output

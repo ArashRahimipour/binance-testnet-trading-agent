@@ -30,7 +30,7 @@ from trading_agent.research.candidates.multitimeframe_breakout import (
     MultiTimeframeBreakoutStrategy,
 )
 from trading_agent.shadow.boundary import SHADOW_START_BOUNDARY_MS
-from trading_agent.shadow.store import ShadowRunState, ShadowStore
+from trading_agent.shadow.store import ShadowBootstrapState, ShadowRunState, ShadowStore
 
 #: A user-mandated, fixed gate - never lowered, never read from config.
 #: Deliberately independent of `config.backtest.min_trades_for_significance`
@@ -54,7 +54,16 @@ class ShadowDataGapSummary:
     gap_count: int
     total_missing_intervals: int
     latest_segment_length: int
+    #: E1's own raw, unmodified `min_required_candles` - always this value,
+    #: regardless of bootstrap state.
     min_required_candles: int
+    #: The ACTUAL requirement `shadow/engine.py` applies to the current
+    #: latest segment: `bootstrap.effective_min_required_candles` (larger,
+    #: settling-buffer-adjusted) when that segment is still the one
+    #: anchored at the bootstrapped warm-up start, else identical to
+    #: `min_required_candles` (a later, organic post-gap segment has no
+    #: warm-up context of its own) - see `shadow/bootstrap.py`.
+    effective_min_required_candles: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +80,7 @@ class ShadowOpenPositionSummary:
 @dataclass(frozen=True, slots=True)
 class ShadowReport:
     run_state: ShadowRunState
+    bootstrap: ShadowBootstrapState | None
     performance: PerformanceReport
     expectancy_r: float | None
     expectancy_quote: float | None
@@ -94,9 +104,18 @@ def build_shadow_report(config: AppConfig) -> ShadowReport:
         CandleStore(config.paths.db_path) as candle_store,
     ):
         run_state = shadow_store.get_run_state()
+        bootstrap_state = shadow_store.get_bootstrap_state()
         trade_records = shadow_store.get_all_trades()
         equity_curve = shadow_store.get_equity_curve()
-        stored_candles = candle_store.get_candles(symbol, interval, start_time_ms=SHADOW_START_BOUNDARY_MS)
+        # Include warm-up candles in the gap/segment summary when
+        # bootstrapped, so a report can disclose the TRUE current segment
+        # length against its own operative requirement - see
+        # `shadow/bootstrap.py` for why that requirement is larger than
+        # E1's own raw minimum for the bootstrap-anchored segment.
+        gap_summary_start_ms = (
+            bootstrap_state.warmup_start_time_ms if bootstrap_state is not None else SHADOW_START_BOUNDARY_MS
+        )
+        stored_candles = candle_store.get_candles(symbol, interval, start_time_ms=gap_summary_start_ms)
 
     trades: list[Trade] = [r.trade for r in trade_records]
     performance = compute_performance_report(
@@ -151,17 +170,28 @@ def build_shadow_report(config: AppConfig) -> ShadowReport:
         segmentation = partition_into_segments(stored_candles, interval)
         gap_count = len(segmentation.gaps)
         total_missing_intervals = sum(g.missing_intervals for g in segmentation.gaps)
-        latest_segment_length = len(segmentation.segments[-1])
+        latest_segment = segmentation.segments[-1]
+        latest_segment_length = len(latest_segment)
+        is_bootstrap_anchored_segment = (
+            bootstrap_state is not None and latest_segment[0].open_time_ms == bootstrap_state.warmup_start_time_ms
+        )
     else:
         gap_count = 0
         total_missing_intervals = 0
         latest_segment_length = 0
+        is_bootstrap_anchored_segment = False
+    effective_min_required_candles = (
+        bootstrap_state.effective_min_required_candles
+        if bootstrap_state is not None and is_bootstrap_anchored_segment
+        else min_required_candles
+    )
     data_gaps = ShadowDataGapSummary(
         stored_candle_count=len(stored_candles),
         gap_count=gap_count,
         total_missing_intervals=total_missing_intervals,
         latest_segment_length=latest_segment_length,
         min_required_candles=min_required_candles,
+        effective_min_required_candles=effective_min_required_candles,
     )
 
     closed_trade_count = len(trades)
@@ -179,6 +209,7 @@ def build_shadow_report(config: AppConfig) -> ShadowReport:
 
     return ShadowReport(
         run_state=run_state,
+        bootstrap=bootstrap_state,
         performance=performance,
         expectancy_r=expectancy_r,
         expectancy_quote=expectancy_quote,
